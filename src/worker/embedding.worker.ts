@@ -101,9 +101,9 @@ function maxSimilarity(
   qvec: Float32Array,
   index: { content: string; vector: Float32Array }[],
 ): number {
-  let max = -Infinity;
+  let max = -Infinity; //max === -Infinity 是防御（空索引时返回 0）
   for (const item of index) {
-    const s = dotProduct(qvec, item.vector);
+    const s = dotProduct(qvec, item.vector); //用 dotProduct（归一化向量 = 余弦）
     if (s > max) max = s;
   }
   return max === -Infinity ? 0 : max;
@@ -230,7 +230,7 @@ self.onmessage = async (e: MessageEvent) => {
           self.postMessage({ type: "verify-result", id, results: [] });
           break;
         }
-        const svecs = await embedBatch(sentences, "query");
+        const svecs = await embedBatch(sentences, "query"); //用 "query:" 前缀：因为待校验的句子相当于"查询"
         const results = sentences.map((text, i) => ({
           text,
           score: maxSimilarity(svecs[i], index),
