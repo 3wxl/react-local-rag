@@ -12,3 +12,8 @@ export interface TextChunk {
   docId: string;
   content: string;
 }
+
+/** 带向量的分片块（向量持久化到 IndexedDB，检索在 embedding worker 内进行） */
+export interface VectorChunk extends TextChunk {
+  vector: number[];
+}

@@ -2,6 +2,76 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ========== 主题：白天（默认） ========== */
+:root,
+.theme-light {
+  --bg: #f8fafc; /* slate-50 */
+  --bg-elevated: #ffffff; /* white */
+  --bg-hover: #f1f5f9; /* slate-100 */
+  --bg-active: #eff6ff; /* blue-50 */
+  --border: #e2e8f0; /* slate-200 */
+  --text: #1e293b; /* slate-800 */
+  --text-muted: #475569; /* slate-600 */
+  --text-faint: #94a3b8; /* slate-400 */
+  --accent: #2563eb; /* blue-600 */
+  --accent-hover: #1d4ed8; /* blue-700 */
+  --accent-soft: #eff6ff; /* blue-50 */
+  --accent-text: #1d4ed8; /* blue-700 */
+  /* 头像专用：渐变底 + 图标色，三模式均保证高对比 + 美观 */
+  --avatar-ai-bg: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+  --avatar-ai-fg: #ffffff;
+  --avatar-user-bg: linear-gradient(135deg, #64748b 0%, #475569 100%);
+  --avatar-user-fg: #ffffff;
+  color-scheme: light;
+}
+
+/* ========== 主题：夜晚（柔和深色，不用纯黑） ========== */
+.theme-dark {
+  --bg: #1a1d29; /* 深蓝灰，比 slate-900 柔和 */
+  --bg-elevated: #252938; /* 略亮的卡片底 */
+  --bg-hover: #323749; /* 悬浮态 */
+  --bg-active: rgba(96, 165, 250, 0.16); /* 选中态带蓝调 */
+  --border: #353a4d; /* 边框，比底色略亮 */
+  --text: #e8ecf3; /* 主文字，柔和的浅灰白 */
+  --text-muted: #a8b0c0; /* 次要文字 */
+  --text-faint: #6b7185; /* 辅助文字 */
+  --accent: #60a5fa; /* blue-400，深底上更亮 */
+  --accent-hover: #93c5fd; /* blue-300 */
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --accent-text: #93c5fd; /* blue-300 */
+  /* 头像：夜晚用亮渐变底 + 深图标，对比清晰 */
+  --avatar-ai-bg: linear-gradient(135deg, #60a5fa 0%, #818cf8 100%);
+  --avatar-ai-fg: #0f172a;
+  --avatar-user-bg: linear-gradient(135deg, #cbd5e1 0%, #94a3b8 100%);
+  --avatar-user-fg: #1e293b;
+  color-scheme: dark;
+}
+
+/* ========== 主题：护眼（米黄+棕调，降低蓝光） ========== */
+.theme-sepia {
+  --bg: #f4ecd8; /* 温暖米色 */
+  --bg-elevated: #faf4e6; /* 略亮的米白 */
+  --bg-hover: #ebe0c6; /* 米黄悬浮 */
+  --bg-active: #e6dcc0; /* 选中态 */
+  --border: #d6caac; /* 米色边框 */
+  --text: #5b4636; /* 豆沙棕，主文字 */
+  --text-muted: #7a6a55; /* 次要文字 */
+  --text-faint: #a89b80; /* 辅助文字 */
+  --accent: #8b6f47; /* 棕色主色 */
+  --accent-hover: #6f5634; /* 深棕 hover */
+  --accent-soft: #ece2c8;
+  --accent-text: #6f5634;
+  /* 头像：护眼模式用青绿+暖灰渐变，与米黄底协调又不沉闷 */
+  --avatar-ai-bg: linear-gradient(135deg, #5b9c8f 0%, #3d7a6e 100%);
+  --avatar-ai-fg: #faf4e6;
+  --avatar-user-bg: linear-gradient(135deg, #c9a9a0 0%, #a8857b 100%);
+  --avatar-user-fg: #faf4e6;
+  color-scheme: light;
+}
+
 body {
-  @apply bg-slate-50 text-slate-800 min-h-screen;
+  background-color: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }

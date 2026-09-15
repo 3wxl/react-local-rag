@@ -19,13 +19,13 @@ export function WelcomeState({
   return (
     <div className="h-full flex items-center justify-center p-6">
       <div className="text-center max-w-lg w-full">
-        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white">
+        <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-accent to-indigo-600 flex items-center justify-center text-white">
           <DocIcon className="w-7 h-7" />
         </div>
-        <h2 className="text-lg font-bold text-slate-800 mb-2">
+        <h2 className="text-lg font-bold text-ink mb-2">
           {hasDoc ? "可以开始提问了" : "上传文档开启问答"}
         </h2>
-        <p className="text-sm text-slate-500 mb-6">
+        <p className="text-sm text-ink-muted mb-6">
           {hasDoc
             ? `已加载《${conv.docName}》，共 ${conv.vectorChunks.length} 个文本块，请直接在下方输入框提问`
             : "支持 PDF 或 TXT 格式，上传后即可基于文档内容进行问答"}
@@ -35,7 +35,7 @@ export function WelcomeState({
           <button
             onClick={onUploadClick}
             disabled={!!docLoading}
-            className="inline-flex items-center gap-2 px-6 py-3 rounded-xl border-2 border-dashed border-blue-300 bg-blue-50/40 hover:bg-blue-50 text-blue-700 text-sm font-medium transition disabled:opacity-60"
+            className="inline-flex items-center gap-2 px-6 py-3 rounded-xl border-2 border-dashed border-accent bg-accent-soft/40 hover:bg-accent-soft text-accent-text text-sm font-medium transition disabled:opacity-60"
           >
             {docLoading ? (
               <>

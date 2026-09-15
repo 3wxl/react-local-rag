@@ -1,4 +1,5 @@
-import type { VectorChunk } from "../utils/search";
+import type { VectorChunk } from "./doc";
+import type { VerificationResult } from "../utils/verifyAnswer";
 
 /** 消息角色 */
 export type Role = "user" | "assistant";
@@ -10,6 +11,7 @@ export type MessageStatus =
   | "retrieving" // 检索文档中
   | "thinking" // 思考过程中
   | "generating" // 答案生成中
+  | "verifying" // 答案生成后，JS 后处理校验文档依据中
   | "done" // 完成
   | "error"; // 出错
 
@@ -22,6 +24,8 @@ export interface ChatMessage {
   thinking?: string;
   /** 检索到的原文片段（仅 assistant 消息，可折叠查看） */
   context?: string;
+  /** 幻觉后处理校验结果（仅 assistant 消息，生成完成后填充） */
+  verification?: VerificationResult;
   /** 当前运行状态 */
   status: MessageStatus;
   /** 出错时的提示 */

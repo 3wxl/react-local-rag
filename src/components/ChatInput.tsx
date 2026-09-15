@@ -51,17 +51,17 @@ export function ChatInput({
   };
 
   return (
-    <div className="shrink-0 border-t border-slate-200 bg-white/90 backdrop-blur-sm px-4 py-3">
+    <div className="shrink-0 border-t border-line bg-bg-elevated/90 backdrop-blur-sm px-4 py-3">
       <div className="max-w-3xl mx-auto">
         {/* 文档处理进度条 */}
         {docLoading && (
-          <div className="mb-2 flex items-center gap-2 text-xs text-blue-600 px-3 py-2 rounded-lg bg-blue-50">
+          <div className="mb-2 flex items-center gap-2 text-xs text-accent px-3 py-2 rounded-lg bg-accent-soft">
             <Spinner className="w-3.5 h-3.5" />
             {docLoading}
           </div>
         )}
 
-        <div className="relative flex items-end gap-2 rounded-2xl border border-slate-200 bg-white shadow-sm focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100 transition">
+        <div className="relative flex items-end gap-2 rounded-2xl border border-line bg-bg-elevated shadow-sm focus-within:border-accent focus-within:ring-2 focus-within:ring-accent-soft transition">
           <textarea
             ref={textareaRef}
             value={value}
@@ -73,12 +73,12 @@ export function ChatInput({
                 ? "输入问题，Enter 发送，Shift+Enter 换行"
                 : "请先上传文档后提问"
             }
-            className="flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-6 outline-none placeholder:text-slate-400 max-h-[200px]"
+            className="flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-6 outline-none placeholder:text-ink-faint max-h-[200px]"
           />
           {busy ? (
             <button
               onClick={onStop}
-              className="m-1 inline-flex items-center justify-center w-9 h-9 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700"
+              className="m-1 inline-flex items-center justify-center w-9 h-9 rounded-xl bg-bg-hover hover:bg-bg-active text-ink-muted"
               title="停止生成"
             >
               <StopIcon className="w-4 h-4" />
@@ -87,14 +87,14 @@ export function ChatInput({
             <button
               onClick={onSend}
               disabled={!value.trim() || !canSend}
-              className="m-1 inline-flex items-center justify-center w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white transition"
+              className="m-1 inline-flex items-center justify-center w-9 h-9 rounded-xl bg-accent hover:bg-accent-hover disabled:bg-bg-hover disabled:text-ink-faint text-white transition"
               title="发送"
             >
               <SendIcon className="w-4 h-4" />
             </button>
           )}
         </div>
-        <p className="mt-1.5 text-center text-[11px] text-slate-400">
+        <p className="mt-1.5 text-center text-[11px] text-ink-faint">
           全部计算在浏览器本地完成，文档不会上传到任何服务器
         </p>
       </div>

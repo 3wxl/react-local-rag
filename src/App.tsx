@@ -1,13 +1,15 @@
 import { useCallback, useRef, useState } from "react";
 import { parseFile } from "./utils/pdfParse";
 import { createTextChunks } from "./utils/chunk";
-import { embedPassageTexts } from "./utils/embedding";
-import { searchRelevant } from "./utils/search";
+import { embedPassages, searchTopK } from "./utils/embeddingClient";
 import { generateAnswer, type GenerateHandle } from "./utils/generateAnswer";
-import type { VectorChunk } from "./utils/search";
+import { stripThinkTags, verifyAnswer } from "./utils/verifyAnswer";
+import type { VectorChunk } from "./types/doc";
 import type { ChatMessage } from "./types/chat";
 import { uid } from "./utils/chat";
+import { BackupError } from "./utils/backup";
 import { useConversations } from "./hooks/useConversations";
+import { useTheme } from "./hooks/useTheme";
 import { Sidebar } from "./components/Sidebar";
 import { ChatHeader } from "./components/ChatHeader";
 import { MessageList } from "./components/MessageList";
@@ -31,7 +33,11 @@ function App() {
     attachDocument,
     addMessages,
     finishStreaming,
+    exportBackup,
+    importBackup,
   } = useConversations();
+
+  const { theme, setTheme } = useTheme();
 
   /* 仅容器层保留的运行态 */
   const [input, setInput] = useState("");
@@ -69,7 +75,14 @@ function App() {
 
         setDocLoading("正在向量化（本地模型计算）...");
         const texts = chunks.map((c) => c.content);
-        const vectors = await embedPassageTexts(texts);
+        const vectors = await embedPassages(convId, texts, {
+          // 向量模型首次加载进度（worker 内触发）
+          onLoadProgress: (p) =>
+            setDocLoading(`正在加载向量模型 ${Math.round(p)}% ...`),
+          // 分批向量化进度
+          onBatchProgress: (done, total) =>
+            setDocLoading(`正在向量化（本地模型计算） ${done}/${total} ...`),
+        });
         const vecChunks: VectorChunk[] = chunks.map((chunk, idx) => ({
           ...chunk,
           vector: vectors[idx],
@@ -142,13 +155,9 @@ function App() {
     setLoadProgress(0);
 
     try {
-      // 1. 检索相关片段
+      // 1. 检索相关片段（embedding worker 内完成：query 向量化 + 余弦相似度 + topK）
       patchMessage(convId, assistantMsg.id, { status: "retrieving" });
-      const resultChunks = await searchRelevant(
-        text,
-        activeConv.vectorChunks,
-        3,
-      );
+      const resultChunks = await searchTopK(activeConv.id, text, 3);
       const ctx = resultChunks.map((item) => item.content).join("\n\n");
 
       // 2. 调用 worker 流式生成
@@ -180,12 +189,27 @@ function App() {
       );
       currentHandleRef.current = handle;
 
-      const finalText = await handle.promise;
+      const rawFinal = await handle.promise;
+      // 清洗最终文本中可能残留的 think 块
+      const finalText = stripThinkTags(rawFinal || "");
       patchMessage(convId, assistantMsg.id, {
-        status: "done",
-        content: finalText || "",
+        status: "verifying",
+        content: finalText,
         context: ctx,
       });
+
+      // 幻觉后处理：纯 JS/向量数学校验每句话能否在文档中找到依据（不调用大模型）
+      try {
+        const verification = await verifyAnswer(convId, finalText, ctx);
+        patchMessage(convId, assistantMsg.id, {
+          status: "done",
+          verification,
+        });
+      } catch (verifyErr) {
+        // 校验本身异常不影响答案展示
+        console.error("答案依据校验失败", verifyErr);
+        patchMessage(convId, assistantMsg.id, { status: "done" });
+      }
     } catch (err: any) {
       console.error(err);
       patchMessage(convId, assistantMsg.id, {
@@ -214,9 +238,38 @@ function App() {
     if (activeId) finishStreaming(activeId);
   }, [activeId, finishStreaming]);
 
+  /* ---------- 备份导出 / 导入恢复 ---------- */
+  const handleExport = useCallback(async () => {
+    try {
+      const { convCount } = await exportBackup();
+      alert(`已导出 ${convCount} 个会话的备份文件（含向量索引）`);
+    } catch (err) {
+      console.error(err);
+      alert(err instanceof BackupError ? err.message : "导出失败，请重试");
+    }
+  }, [exportBackup]);
+
+  const handleImportFile = useCallback(
+    async (file: File) => {
+      try {
+        const result = await importBackup(file);
+        if (result.status === "cancelled") return;
+        alert(
+          result.overwritten > 0
+            ? `导入成功：共 ${result.total} 个会话，其中 ${result.overwritten} 个覆盖了本地同名会话`
+            : `导入成功：恢复了 ${result.total} 个会话`,
+        );
+      } catch (err) {
+        console.error(err);
+        alert(err instanceof BackupError ? err.message : "导入失败，请检查备份文件");
+      }
+    },
+    [importBackup],
+  );
+
   /* ---------- 渲染：仅做布局与编排 ---------- */
   return (
-    <div className="h-screen flex bg-slate-50 text-slate-800 overflow-hidden">
+    <div className="h-screen flex bg-bg text-ink overflow-hidden">
       <Sidebar
         conversations={conversations}
         activeId={activeId}
@@ -225,6 +278,10 @@ function App() {
         onSelect={handleSelectConversation}
         onNew={handleNewConversation}
         onDelete={deleteConversation}
+        onExport={handleExport}
+        onImportFile={handleImportFile}
+        theme={theme}
+        onThemeChange={setTheme}
       />
 
       <div className="flex-1 flex flex-col min-w-0">

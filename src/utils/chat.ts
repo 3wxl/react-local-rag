@@ -14,13 +14,15 @@ export const uid = (): string =>
 export function statusToTip(status: MessageStatus, loadProgress = 0): string {
   switch (status) {
     case "loading-model":
-      return `正在加载本地大模型 ${Math.round(loadProgress * 100)}%...`;
+      return `正在加载本地大模型 ${Math.round(loadProgress)}%...`;
     case "retrieving":
       return "正在检索文档片段...";
     case "thinking":
       return "正在思考...";
     case "generating":
       return "正在生成回答...";
+    case "verifying":
+      return "正在校验回答是否有文档依据...";
     case "pending":
       return "排队中...";
     case "error":
