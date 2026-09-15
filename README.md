@@ -6,9 +6,11 @@
 
 - 完全离线运行，文档数据不上传任何服务器，隐私友好，不依赖后端接口
 - 双 WebWorker 隔离 AI 计算任务（LLM 推理 + Embedding 向量化），不阻塞 UI 主线程
+- **会话级隔离**：每个会话的文档、向量索引、检索、校验互不串扰，上传的 PDF 只在对应会话生效
 - IndexedDB 持久化存储文档块、向量索引与对话记录，突破 localStorage 存储容量限制
 - 滑动窗口重叠分块 + 余弦相似度向量检索，RAG 核心逻辑自主实现
 - **幻觉后处理校验**：模型输出完成后，由纯 JS + 向量数学逐句校验答案是否有文档依据，不依赖模型自觉
+- **完整异常捕获体系**：全局 ErrorBoundary + Worker 崩溃兜底 + 内存预判 + 请求超时 + 分类错误提示，任何异常都不会白屏
 - 备份 / 恢复：一键导出全部会话与向量索引为 JSON 文件，换浏览器或清缓存后可完整恢复
 - 三套主题（白天 / 夜晚 / 护眼），CSS 变量驱动，切换平滑
 - 豆包式对话 UI：历史会话侧边栏、思考过程折叠、流式回答、引用片段展开、加载状态提示
@@ -19,8 +21,10 @@
 
 前端直接读取 PDF / TXT 文件，无需后端中转
 
-- 逐页解析 PDF 文本内容
+- 逐页解析 PDF 文本内容，单页解析失败不中断整体流程
 - 文本清洗：去除多余换行、空白、无效特殊字符
+- 大文件保护：超过 50MB 上限直接拒绝，防止内存溢出
+- PDF 损坏/加密/空文档等异常转为分类错误提示
 
 ### 模块 2：文本分块算法（chunk.ts）
 
@@ -36,6 +40,10 @@
 - 用户提问时 Worker 内部生成 query 向量 + 计算余弦相似度 + 筛选 Top-K 片段
 - 只返回 Top-K 文本，不传输全部向量，减少跨线程数据搬运
 - 主线程通过 `embeddingClient.ts` 以 Promise 化请求/响应协议与 Worker 通信
+- **会话级索引隔离**：Worker 内 `Map<indexId, chunks>` 按会话 id 缓存，检索/校验只在对应索引内计算
+- **请求超时兜底**：默认 120s 超时，模型首次加载 300s，超时后拒绝并提示刷新
+- **Worker 崩溃保护**：`unhandledrejection` 监听 + onerror 双重兜底，崩溃后拒绝新请求
+- **内存预算**：加载前 `performance.memory` 检查可用堆，不足 200MB 直接拒绝并给出提示
 
 ### 模块 4：本地大模型推理问答（llm.worker.ts / generateAnswer.ts）
 
@@ -43,6 +51,11 @@
 - 流式输出思考过程 + 最终答案（思考标签解析拆分为两路流）
 - 检索片段 + 用户问题拼接构造 Prompt，本地模型逐 token 生成
 - 支持中途停止生成
+- **内存预算**：加载前检查 `performance.memory`，不足 450MB 直接拒绝并提示关闭标签页
+- **加载失败可重试**：Promise 缓存失败后清空，下次请求重新加载，不卡死
+- **超时兜底**：5 分钟超时定时器，模型加载卡死/推理无响应自动终止 Worker
+- **错误分类**：按错误内容自动分类为 model-load / model-inference，展示对应提示
+- **unhandledrejection 兜底**：第三方库内部异常不会让 Worker 静默崩溃
 
 ### 模块 5：幻觉后处理校验（verifyAnswer.ts）
 
@@ -60,6 +73,8 @@
 - 启动时并行读取两表恢复会话与向量，自动同步向量索引到 Embedding Worker
 - 增量写库：仅持久化发生变化的会话，避免流式 token 触发全量重写
 - 旧 localStorage 数据首次启动自动迁移到 IndexedDB
+- **异常分层**：所有原始 IDB 错误转为 AppError，识别存储空间满（quota exceeded）给独立提示
+- **降级运行**：IndexedDB 打开失败（隐私模式/无痕模式）后设 `dbAvailable=false`，后续读写静默跳过，UI 正常运行不白屏
 
 ### 模块 7：备份与恢复（backup.ts）
 
@@ -74,6 +89,25 @@
 - CSS 变量驱动全 App 配色，Tailwind 语义化令牌映射
 - 首次访问跟随系统 `prefers-color-scheme`，选择后持久化到 localStorage
 - 侧边栏切换器，选中态有 accent 色 ring 描边
+- 头像渐变 + 主题跟随：AI/用户头像各模式都有独立渐变底色，三主题下始终清晰可辨
+
+### 模块 9：异常捕获与容错体系（errors.ts / ErrorBoundary.tsx）
+
+面试常问"浏览器内存不足模型加载崩了怎么处理"的系统性答案，本项目通过分层防御确保任何异常都不白屏：
+
+- **分类错误体系（errors.ts）**：10 类错误码（model-load / model-inference / embedding / worker-crash / worker-timeout / indexeddb / storage-full / pdf-parse / file-too-large / backup），每类带 `userMessage`（可直接展示）+ `hint`（恢复建议）
+- **全局 ErrorBoundary**：包裹 App，捕获组件渲染期未处理异常，展示友好错误页 + 刷新按钮
+- **Worker 内三层防御**：
+  1. 加载前 `checkMemoryBudget()` 预判内存（LLM 阈值 450MB，Embedding 200MB）
+  2. try/catch 把异常转 error 消息回传主线程
+  3. `unhandledrejection` 监听器捕获第三方库内部未 catch 的 Promise rejection
+- **主线程超时兜底**：
+  - Embedding Worker 请求带 120s/300s 超时定时器，收到响应才清除
+  - LLM Worker 5 分钟超时，超时自动 terminate 并分类报错
+  - Worker 崩溃后设 `crashed=true`，拒绝新请求直到刷新页面
+- **IndexedDB 降级**：打开失败设 `dbAvailable=false`，后续读写静默跳过，UI 以内存模式继续运行
+- **UI 友好提示**：AppError 的 userMessage + hint 直接展示在消息气泡/加载状态里，而非白屏或控制台报错
+- **加载失败可重试**：模型 Promise 缓存失败后清空，用户重试不会卡在 rejected Promise 上
 
 ## 技术栈
 
@@ -97,7 +131,7 @@ react-local-rag
 │   │   ├── ChatHeader.tsx               # 顶栏：标题/文档状态/上传按钮
 │   │   ├── ChatInput.tsx                # 输入栏：自动撑高/Enter发送/停止
 │   │   ├── EmptyState.tsx               # 无会话空态
-│   │   ├── FileUpload/FileUpload.tsx    # 文件上传组件
+│   │   ├── ErrorBoundary.tsx            # 全局错误边界，捕获渲染异常
 │   │   ├── MessageBubble.tsx            # 单条气泡+思考折叠+引用折叠+幻觉高亮
 │   │   ├── MessageList.tsx              # 消息列表+自动滚底+拖拽上传
 │   │   ├── Sidebar.tsx                  # 侧边栏：会话列表/备份恢复/主题切换
@@ -115,10 +149,11 @@ react-local-rag
 │   │   ├── backup.ts                    # 备份导出/导入恢复
 │   │   ├── chat.ts                      # uid/statusToTip/makeTitle
 │   │   ├── chunk.ts                     # 滑动窗口分块
-│   │   ├── db.ts                        # IndexedDB 封装
-│   │   ├── embeddingClient.ts           # Embedding Worker 主线程客户端
-│   │   ├── generateAnswer.ts            # LLM 流式生成封装
-│   │   ├── pdfParse.ts                  # PDF 文本解析
+│   │   ├── db.ts                        # IndexedDB 封装+异常分层+降级
+│   │   ├── embeddingClient.ts           # Embedding Worker 客户端+超时+崩溃保护
+│   │   ├── errors.ts                    # 分类错误体系（10 类错误码）
+│   │   ├── generateAnswer.ts            # LLM 流式生成+超时+错误分类
+│   │   ├── pdfParse.ts                  # PDF 解析+大文件保护+损坏捕获
 │   │   └── verifyAnswer.ts             # 幻觉后处理校验
 │   ├── worker/
 │   │   ├── embedding.worker.ts          # Embedding+检索 Worker

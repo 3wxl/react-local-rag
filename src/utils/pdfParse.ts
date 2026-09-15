@@ -1,50 +1,88 @@
 import * as pdfjsLib from "pdfjs-dist";
+import { fileTooLargeError, pdfParseError } from "./errors";
 
 // CDN Worker，彻底规避本地路径问题
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 
+/** 建议上传上限（MB），超过给友好提示而非直接崩 */
+const MAX_FILE_MB = 50;
+
 /**
- * 读取File对象，解析PDF/TXT返回纯文本
+ * 读取File对象，解析PDF/TXT返回纯文本。
+ * 包含大文件保护、格式校验、损坏捕获，全部转为 AppError。
  */
 export async function parseFile(file: File): Promise<string> {
-  // TXT文件处理
-  if (file.type === "text/plain") {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const text = reader.result as string;
-        resolve(cleanText(text));
-      };
-      reader.onerror = reject;
-      reader.readAsText(file);
-    });
+  // 大文件保护
+  const sizeMB = file.size / (1024 * 1024);
+  if (sizeMB > MAX_FILE_MB) {
+    throw fileTooLargeError(sizeMB, MAX_FILE_MB);
   }
 
-  // PDF文件处理（修复传参格式！必须包成 {data: buffer}）
-  if (file.type === "application/pdf") {
-    const arrayBuffer = await file.arrayBuffer();
-    // ✅ 修复关键点：getDocument接收配置对象，data传入二进制
-    const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    let fullText = "";
-
-    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-      const page = await pdfDoc.getPage(pageNum);
-      const content = await page.getTextContent(); //获取页面上所有文字元素
-      const pageText = content.items.map((item: any) => item.str).join(" "); //取出每一段文字拼接成一整页文本
-      fullText += pageText + "\n";
+  try {
+    // TXT 文件处理
+    if (file.type === "text/plain" || file.name.toLowerCase().endsWith(".txt")) {
+      return await parseTxt(file);
     }
-    return cleanText(fullText);
+
+    // PDF 文件处理
+    if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+      return await parsePdf(file);
+    }
+
+    throw pdfParseError(new Error("仅支持 .pdf / .txt 文件"));
+  } catch (err) {
+    // 已经是 AppError 直接透传
+    if (err instanceof Error && err.name === "AppError") throw err;
+    throw pdfParseError(err);
+  }
+}
+
+async function parseTxt(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(cleanText(reader.result as string));
+    reader.onerror = () =>
+      reject(pdfParseError(new Error("文本文件读取失败")));
+    reader.readAsText(file);
+  });
+}
+
+async function parsePdf(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+
+  let pdfDoc;
+  try {
+    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  } catch (err) {
+    // PDF 文件损坏/加密/格式错误
+    throw pdfParseError(
+      new Error(`无法打开 PDF 文件${err instanceof Error ? `：${err.message}` : ""}`),
+    );
   }
 
-  throw new Error("仅支持 .pdf / .txt 文件");
+  let fullText = "";
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    try {
+      const page = await pdfDoc.getPage(pageNum);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((item: any) => item.str).join(" ");
+      fullText += pageText + "\n";
+    } catch (err) {
+      // 单页解析失败不中断整体流程，记录警告继续
+      console.warn(`PDF 第 ${pageNum} 页解析失败`, err);
+      fullText += "\n";
+    }
+  }
+
+  const cleaned = cleanText(fullText);
+  if (!cleaned) {
+    throw pdfParseError(new Error("PDF 文件未提取到任何文本内容，可能是扫描件或空文档"));
+  }
+  return cleaned;
 }
 
 /** 清洗脏文本 */
 function cleanText(text: string): string {
-  // 先移除所有HTML标签
   const noHtml = text.replace(/<[^>]*>/g, "");
-  // 再合并空白、首尾去空格（保留你原来的逻辑）
   return noHtml.replace(/\s+/g, " ").trim();
 }
-
-//全部计算在浏览器客户端完成，没有发起任何网络请求，实现离线文档解析，保障用户文档隐私

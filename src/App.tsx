@@ -4,6 +4,7 @@ import { createTextChunks } from "./utils/chunk";
 import { embedPassages, searchTopK } from "./utils/embeddingClient";
 import { generateAnswer, type GenerateHandle } from "./utils/generateAnswer";
 import { stripThinkTags, verifyAnswer } from "./utils/verifyAnswer";
+import type { AppError } from "./utils/errors";
 import type { VectorChunk } from "./types/doc";
 import type { ChatMessage } from "./types/chat";
 import { uid } from "./utils/chat";
@@ -91,8 +92,11 @@ function App() {
         attachDocument(convId, file.name, vecChunks);
       } catch (err) {
         console.error(err);
-        setDocLoading("文档解析失败");
-        setTimeout(() => setDocLoading(""), 2500);
+        // AppError 有 userMessage + hint，直接展示友好提示
+        const appErr = err as Partial<AppError>;
+        const hint = appErr?.hint ? `\n${appErr.hint}` : "";
+        setDocLoading(appErr?.userMessage || "文档处理失败" + hint);
+        setTimeout(() => setDocLoading(""), 4000);
       } finally {
         setDocLoading("");
       }
@@ -212,9 +216,12 @@ function App() {
       }
     } catch (err: any) {
       console.error(err);
+      // AppError 带 userMessage + hint，展示更友好的错误信息
+      const appErr = err as Partial<AppError>;
+      const hint = appErr?.hint ? `\n${appErr.hint}` : "";
       patchMessage(convId, assistantMsg.id, {
         status: "error",
-        error: err?.message || String(err),
+        error: appErr?.userMessage || err?.message || "生成失败" + hint,
       });
     } finally {
       currentHandleRef.current = null;

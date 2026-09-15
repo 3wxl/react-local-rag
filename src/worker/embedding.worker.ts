@@ -56,12 +56,18 @@ let embedderPromise: Promise<any> | null = null;
 
 function getEmbedder(): Promise<any> {
   if (!embedderPromise) {
+    // 内存预算检查（bge-small 约 100~150MB）
+    if (!checkMemoryBudget()) {
+      return Promise.reject(
+        new Error("浏览器内存不足，无法加载向量模型。请关闭其他标签页后重试。"),
+      );
+    }
     console.log("开始加载本地模型 bge-small-zh-v1.5");
     embedderPromise = pipeline(
-      "feature-extraction", // 任务类型：特征提取（即 embedding）
-      "Xenova/bge-small-zh-v1.5", // 模型名（中文优化的 BGE 小模型）
+      "feature-extraction",
+      "Xenova/bge-small-zh-v1.5",
       {
-        quantized: true, // 量化：体积更小、推理更快
+        quantized: true,
         progress_callback: (info: any) => {
           if (info.status === "progress" && typeof info.progress === "number") {
             self.postMessage({
@@ -71,13 +77,20 @@ function getEmbedder(): Promise<any> {
           }
         },
       } as any,
-      // 加载失败时清空缓存，允许下次请求重新尝试，避免永久卡死在失败的 Promise 上
     ).catch((err) => {
       embedderPromise = null;
       throw err;
     });
   }
   return embedderPromise;
+}
+
+/** 检查浏览器内存预算（Chrome 非标准 API，无则放行） */
+function checkMemoryBudget(): boolean {
+  const mem = (performance as any).memory;
+  if (!mem) return true;
+  const available = mem.jsHeapSizeLimit - mem.usedJSHeapSize;
+  return available > 200 * 1024 * 1024;
 }
 
 /* ================= 向量索引缓存：存在 worker 内存，检索不搬运向量 ================= */
@@ -249,3 +262,16 @@ self.onmessage = async (e: MessageEvent) => {
     self.postMessage({ type: "error", id, error: err?.message || String(err) });
   }
 };
+
+// 兜底：Worker 内未捕获的 Promise rejection
+self.addEventListener("unhandledrejection", (event) => {
+  const msg = event.reason instanceof Error
+    ? event.reason.message
+    : String(event.reason);
+  self.postMessage({
+    type: "error",
+    id: undefined,
+    error: `向量模型线程发生未捕获异常：${msg}`,
+  });
+  event.preventDefault();
+});

@@ -12,12 +12,18 @@ async function getGenerator(
   onProgress: (progress: number) => void,
 ): Promise<any> {
   if (!generatorPromise) {
+    // 加载前检查内存（WASM 模型可能需数百 MB，提前预判）
+    if (!checkMemoryBudget()) {
+      throw new Error(
+        "浏览器内存不足，无法加载模型。请关闭其他标签页后重试。",
+      );
+    }
+
     generatorPromise = pipeline(
-      //`pipeline` 来自 `@xenova/transformers`，用来创建推理流水线：
-      "text-generation", //第一个参数 `"text-generation"`：任务类型，文本生成（大模型对话）
-      "onnx-community/Qwen2.5-0.5B-Instruct", //第二个参数：模型 ID，对应你放在 `public/models` 下的本地模型文件夹名称
+      "text-generation",
+      "onnx-community/Qwen2.5-0.5B-Instruct",
       {
-        dtype: "q4", //加载**4bit 量化版本的 onnx 权重文件 `model_q4.onnx`**，体积更小，适合 WASM CPU 运行
+        dtype: "q4",
         progress_callback: (info: any) => {
           if (info.status === "progress" && typeof info.progress === "number") {
             onProgress(info.progress);
@@ -25,8 +31,25 @@ async function getGenerator(
         },
       } as any,
     );
+    // 加载失败清空缓存，允许下次重试，避免永久卡死在 rejected Promise 上
+    generatorPromise.catch(() => {
+      generatorPromise = null;
+    });
   }
-  return generatorPromise; //pipeline 一旦开始执行，就算还没加载完成，generatorPromise 也不再是 null。并发调用 getGenerator 都会复用这同一个 Promise，不会重复加载模型。
+  return generatorPromise;
+}
+
+/**
+ * 检查浏览器是否有足够内存加载模型。
+ * performance.memory 是 Chrome 非标准 API，有则用，无则跳过（不阻塞）。
+ */
+function checkMemoryBudget(): boolean {
+  const mem = (performance as any).memory;
+  if (!mem) return true; // 无法检测，放行
+  // jsHeapSizeLimit：浏览器分配给 JS 堆的上限；usedJSHeapSize：当前已用
+  const available = mem.jsHeapSizeLimit - mem.usedJSHeapSize;
+  // Qwen 0.5B q4 约需 300~400MB，阈值设 450MB 给余量
+  return available > 450 * 1024 * 1024;
 }
 
 self.onmessage = async (e: MessageEvent) => {
@@ -86,3 +109,15 @@ ${question}<|im_end|>
     self.postMessage({ type: "error", error: err?.message || String(err) });
   }
 };
+
+// 兜底：Worker 内未捕获的 Promise rejection（第三方库内部抛出但没 catch）
+self.addEventListener("unhandledrejection", (event) => {
+  const msg = event.reason instanceof Error
+    ? event.reason.message
+    : String(event.reason);
+  self.postMessage({
+    type: "error",
+    error: `模型线程发生未捕获异常：${msg}`,
+  });
+  event.preventDefault();
+});

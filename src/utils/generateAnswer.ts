@@ -1,5 +1,10 @@
 import LlmWorker from "../worker/llm.worker?worker";
-//?worker 是 Vite 语法，把该文件打包成 Web Worker
+import {
+  modelInferenceError,
+  modelLoadError,
+  workerCrashError,
+  workerTimeoutError,
+} from "./errors";
 //导入后 LlmWorker 是构造函数，new LlmWorker() 创建实例
 export interface GenerateCallbacks {
   /** 模型加载进度 0~1 */
@@ -115,12 +120,15 @@ function createThinkTagSplitter(
   };
 }
 
+/** LLM 推理超时（含模型加载 5 分钟） */
+const LLM_TIMEOUT = 300_000;
+
 export function generateAnswer(
-  question: string, //用户提问文本
-  contextChunks: string[], //RAG 检索出来的文档切片数组，作为上下文塞给大模型
-  callbacks: GenerateCallbacks = {}, //回调函数集合（加载进度、开始生成、思考增量、答案增量）
+  question: string,
+  contextChunks: string[],
+  callbacks: GenerateCallbacks = {},
 ): GenerateHandle {
-  const worker = new LlmWorker(); //新建一个 WebWorker 实例，单独开一个线程跑大模型推理
+  const worker = new LlmWorker();
 
   let resolve: (text: string) => void;
   let reject: (err: Error) => void;
@@ -129,6 +137,12 @@ export function generateAnswer(
     resolve = res;
     reject = rej;
   });
+
+  // 超时兜底：模型加载卡死/推理无响应
+  const timeoutTimer = setTimeout(() => {
+    worker.terminate();
+    reject(workerTimeoutError("大模型", LLM_TIMEOUT));
+  }, LLM_TIMEOUT);
 
   const splitter = createThinkTagSplitter(
     (delta) => callbacks.onThinking?.(delta),
@@ -148,18 +162,27 @@ export function generateAnswer(
         splitter(msg.text as string);
         break;
       case "done":
+        clearTimeout(timeoutTimer);
         resolve(msg.text);
-        worker.terminate(); //销毁当前 worker 线程，释放内存
-        break;
-      case "error":
-        reject(new Error(msg.error));
         worker.terminate();
         break;
+      case "error": {
+        clearTimeout(timeoutTimer);
+        const msgStr = msg.error || "模型推理失败";
+        // 加载阶段失败 vs 生成阶段失败，分类不同
+        const err = msgStr.match(/加载|load|memory|内存|not found|404|fetch/i)
+          ? modelLoadError(new Error(msgStr))
+          : modelInferenceError(new Error(msgStr));
+        reject(err);
+        worker.terminate();
+        break;
+      }
     }
   };
 
   worker.onerror = (err) => {
-    reject(new Error(err.message));
+    clearTimeout(timeoutTimer);
+    reject(workerCrashError("大模型", err));
     worker.terminate();
   };
 
@@ -168,6 +191,7 @@ export function generateAnswer(
   return {
     promise,
     cancel: () => {
+      clearTimeout(timeoutTimer);
       worker.terminate();
     },
   };

@@ -1,6 +1,6 @@
 import EmbeddingWorker from "../worker/embedding.worker?worker";
-//?worker 是 Vite 语法，把该文件打包成 Web Worker
 import type { VectorChunk } from "../types/doc";
+import { embeddingError, workerCrashError, workerTimeoutError } from "./errors";
 
 /**
  * embedding worker 的主线程客户端（Promise 化请求/响应）：
@@ -36,11 +36,22 @@ export interface SentenceScore {
 /* ---------- 全局单例 worker ---------- */
 
 let worker: Worker | null = null;
-let nextId = 1; //自增请求 id
+let nextId = 1;
 const pending = new Map<number, PendingEntry>();
 
-/** 模型加载进度监听者（load-progress 消息无请求 id，按订阅期广播） */
+/** 请求超时定时器映射（id -> timer） */
+const timeouts = new Map<number, ReturnType<typeof setTimeout>>();
+
+/** 默认超时：向量化/检索/校验共用，模型首次加载时允许更久 */
+const DEFAULT_TIMEOUT = 120_000;
+/** 仅模型加载阶段的长超时 */
+const LOAD_TIMEOUT = 300_000;
+
+/** 模型加载进度监听者 */
 const loadListeners = new Set<(progress: number) => void>();
+
+/** Worker 是否已崩溃（崩溃后不再接受新请求，需刷新页面） */
+let crashed = false;
 
 function getWorker(): Worker {
   if (!worker) {
@@ -53,11 +64,30 @@ function getWorker(): Worker {
         return;
       }
       const entry = msg?.id != null ? pending.get(msg.id) : undefined;
+
+      // 无 id 的 error 是 unhandledrejection 兜底，广播给所有 pending
+      if (msg?.type === "error" && msg.id == null) {
+        const error = embeddingError(new Error(msg.error || "向量模型线程发生未捕获异常"));
+        pending.forEach((p) => p.reject(error));
+        pending.clear();
+        timeouts.forEach((t) => clearTimeout(t));
+        timeouts.clear();
+        crashed = true;
+        return;
+      }
+
       if (!entry) return;
+      // 收到任意响应都清除超时
+      const timer = timeouts.get(msg.id);
+      if (timer) {
+        clearTimeout(timer);
+        timeouts.delete(msg.id);
+      }
+
       switch (msg.type) {
         case "embed-progress":
           entry.onProgress?.(msg.done, msg.total);
-          break; // 进度事件后请求仍未完成，保留 entry
+          break;
         case "embed-result":
           entry.resolve(
             (msg.vectors as Float32Array[]).map((v) => Array.from(v)),
@@ -73,16 +103,19 @@ function getWorker(): Worker {
           pending.delete(msg.id);
           break;
         case "error":
-          entry.reject(new Error(msg.error || "向量模型线程出错"));
+          entry.reject(embeddingError(new Error(msg.error || "向量模型线程出错")));
           pending.delete(msg.id);
           break;
       }
     };
 
     worker.onerror = (err) => {
-      const error = new Error(err.message || "向量模型线程异常");
+      crashed = true;
+      const error = workerCrashError("向量模型", err);
       pending.forEach((p) => p.reject(error));
       pending.clear();
+      timeouts.forEach((t) => clearTimeout(t));
+      timeouts.clear();
     };
   }
   return worker;
@@ -91,11 +124,26 @@ function getWorker(): Worker {
 function request<T>(
   msg: Record<string, unknown>,
   entry?: Partial<PendingEntry>,
+  timeoutMs = DEFAULT_TIMEOUT,
 ): Promise<T> {
+  if (crashed) {
+    return Promise.reject(
+      workerCrashError("向量模型", new Error("线程已崩溃，请刷新页面后重试")),
+    );
+  }
   const w = getWorker();
   const id = nextId++;
   return new Promise<T>((resolve, reject) => {
     pending.set(id, { resolve, reject, ...entry });
+    // 超时兜底：模型加载卡死/消息丢失
+    const timer = setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        timeouts.delete(id);
+        reject(workerTimeoutError("向量模型", timeoutMs));
+      }
+    }, timeoutMs);
+    timeouts.set(id, timer);
     w.postMessage({ ...msg, id });
   });
 }
@@ -129,6 +177,7 @@ export function embedPassages(
     request<number[][]>(
       { type: "embed-passages", indexId, texts },
       { onProgress: options.onBatchProgress },
+      LOAD_TIMEOUT, // 首次加载模型可能很久
     ),
   );
 }
