@@ -102,6 +102,10 @@ function getWorker(): Worker {
           entry.resolve(msg.results as SentenceScore[]);
           pending.delete(msg.id);
           break;
+        case "unloaded":
+          entry.resolve(undefined);
+          pending.delete(msg.id);
+          break;
         case "error":
           entry.reject(embeddingError(new Error(msg.error || "向量模型线程出错")));
           pending.delete(msg.id);
@@ -232,4 +236,19 @@ export function verifySentences(
 ): Promise<SentenceScore[]> {
   if (sentences.length === 0) return Promise.resolve([]);
   return request<SentenceScore[]>({ type: "verify", indexId, sentences });
+}
+
+/**
+ * 手动/空闲释放向量模型，减少浏览器内存占用。
+ * - clearIndex=false：只释放模型权重，索引缓存保留（下次检索/校验无需重新向量化）
+ * - clearIndex=true：同时清空全部向量索引缓存（释放更多内存，但下次需要重新从 IndexedDB 同步）
+ * 释放后下次请求会自动重新加载模型。
+ */
+export function unloadEmbeddingModel(clearIndex = false): Promise<void> {
+  if (!worker || crashed) return Promise.resolve();
+  return request<void>(
+    { type: "unload-model", clearIndex },
+    undefined,
+    30_000,
+  );
 }

@@ -2,7 +2,9 @@ import { useRef, useState } from "react";
 import type { Conversation } from "../types/chat";
 import {
   AiIcon,
+  ChartIcon,
   DownloadIcon,
+  EjectIcon,
   PlusIcon,
   RestoreIcon,
   TrashIcon,
@@ -23,6 +25,12 @@ interface SidebarProps {
   onExport: () => Promise<void> | void;
   /** 选择备份文件后触发导入恢复 */
   onImportFile: (file: File) => Promise<void> | void;
+  /** 手动释放向量模型内存 */
+  onUnloadModel: () => Promise<void> | void;
+  /** 是否正在生成回答（生成中禁用释放按钮） */
+  busy: boolean;
+  /** 打开性能埋点面板 */
+  onOpenPerf: () => void;
   /** 主题 */
   theme: ThemeMode;
   onThemeChange: (theme: ThemeMode) => void;
@@ -39,11 +47,15 @@ export function Sidebar({
   onDelete,
   onExport,
   onImportFile,
+  onUnloadModel,
+  busy,
+  onOpenPerf,
   theme,
   onThemeChange,
 }: SidebarProps) {
   const backupInputRef = useRef<HTMLInputElement>(null);
   const [backupBusy, setBackupBusy] = useState<"" | "export" | "import">("");
+  const [unloading, setUnloading] = useState(false);
 
   const runBackupAction = async (
     kind: "export" | "import",
@@ -182,6 +194,35 @@ export function Sidebar({
             onChange={handleFileChange}
             className="hidden"
           />
+          <button
+            onClick={async () => {
+              if (unloading || busy) return;
+              setUnloading(true);
+              try {
+                await onUnloadModel();
+              } finally {
+                setUnloading(false);
+              }
+            }}
+            disabled={!!backupBusy || unloading || busy}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-ink-muted hover:bg-bg-hover disabled:opacity-50 transition"
+            title="释放向量模型占用的内存（下次提问自动重新加载）"
+          >
+            {unloading ? (
+              <Spinner className="w-3.5 h-3.5 text-accent" />
+            ) : (
+              <EjectIcon className="w-3.5 h-3.5 text-ink-faint" />
+            )}
+            {unloading ? "正在释放..." : "释放模型内存"}
+          </button>
+          <button
+            onClick={onOpenPerf}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-ink-muted hover:bg-bg-hover transition"
+            title="查看各阶段耗时统计（仅本地内存，不上传）"
+          >
+            <ChartIcon className="w-3.5 h-3.5 text-ink-faint" />
+            性能埋点
+          </button>
         </div>
 
         {/* 主题切换 */}

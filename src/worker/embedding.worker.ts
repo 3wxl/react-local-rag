@@ -40,7 +40,17 @@ interface RemoveIndexReq {
   type: "remove-index"; // 删除会话时清理 worker 缓存
   indexId: string;
 }
-type MainRequest = EmbedPassagesReq | SetIndexReq | SearchReq | VerifyReq;
+interface UnloadModelReq {
+  type: "unload-model"; // 手动/空闲释放向量模型 + 可选清空索引缓存
+  id: number;
+  clearIndex: boolean; // 是否同时清空全部向量索引缓存
+}
+type MainRequest =
+  | EmbedPassagesReq
+  | SetIndexReq
+  | SearchReq
+  | VerifyReq
+  | UnloadModelReq;
 
 /** worker -> 主线程响应 */
 // { type: "load-progress", progress }      向量模型加载进度（全局，无 id）
@@ -93,6 +103,38 @@ function checkMemoryBudget(): boolean {
   return available > 200 * 1024 * 1024;
 }
 
+/**
+ * 释放向量模型 + 可选清空索引缓存，减少浏览器内存占用。
+ * 立即置空 embedderPromise（新请求会触发重新加载），
+ * 后台异步 dispose 旧实例（transformers.js pipeline 可能有 dispose 方法）。
+ */
+async function unloadEmbedder(clearIndex: boolean): Promise<void> {
+  // 立即标记为已卸载，并发新请求会重新加载
+  const oldPromise = embedderPromise;
+  embedderPromise = null;
+  if (oldPromise) {
+    try {
+      const embedder = await oldPromise;
+      // transformers.js pipeline 实例可能暴露 dispose
+      if (embedder && typeof embedder.dispose === "function") {
+        await embedder.dispose();
+      } else if (
+        embedder?.model &&
+        typeof embedder.model.dispose === "function"
+      ) {
+        await embedder.model.dispose();
+      }
+    } catch {
+      // 旧实例加载中失败或 dispose 失败，忽略
+    }
+  }
+  if (clearIndex) {
+    indexCache.clear();
+    console.log("向量索引缓存已清空");
+  }
+  console.log("向量模型已卸载，内存释放");
+}
+
 /* ================= 向量索引缓存：存在 worker 内存，检索不搬运向量 ================= */
 
 /** indexId -> 该会话全部分块（文本 + 向量）。normalize:true，模长恒为 1 */
@@ -123,7 +165,8 @@ function maxSimilarity(
 }
 
 /**
- * 批量向量化：分批并发（每批 4 条），避免一次塞满 CPU
+ * 批量向量化：分批（每批最多 8 条），每批内部一次性传数组给 pipeline，
+ * 内部 batch padding 优化。兼顾速度 + 内存安全。
  * @param prefix BGE 约定前缀：文档用 "passage:"，查询用 "query:"
  */
 async function embedBatch(
@@ -133,31 +176,31 @@ async function embedBatch(
 ): Promise<Float32Array[]> {
   const embedder = await getEmbedder();
   const out: Float32Array[] = [];
-  /*分批并发（每批 4 条），避免一次塞满 CPU
-
-WASM 推理是 CPU 密集的，一次并发太多会：
-
-阻塞 Worker 事件循环太久（无法响应进度/新请求）。
-
-内存峰值过高。
-
-反而因调度开销降低总吞吐。*/
-  const batchSize = 4;
+  // 每批 8 条：既能利用 batch padding 减少调用开销，
+  // 又能控制单批内存峰值，避免 WASM 堆溢出
+  const batchSize = 8;
 
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
-    const results = await Promise.all(
-      batch.map(
-        (text) =>
-          embedder(`${prefix}: ${text}`, {
-            //：BGE 模型的前缀约定——文档要加 "passage: "，查询要加 "query: "。这是模型训练时的格式，加错会严重影响效果。
-            pooling: "mean", //把 token 级向量按平均池化成句向量
-            normalize: true, //输出即归一化（模长=1），这是前面点积能代替余弦的前提。
-          }) as Promise<any>,
-      ),
-    );
-    // slice() 复制出独立 buffer：张量底层数据可能被复用，不能直接持有
-    for (const r of results) out.push((r.data as Float32Array).slice());
+    // BGE 前缀约定：passage 给文档，query 给查询
+    const prefixed = batch.map((t) => `${prefix}: ${t}`);
+
+    // 一次性传数组给 pipeline，内部 batch padding 后批量推理
+    const result = (await embedder(prefixed, {
+      pooling: "mean",
+      normalize: true,
+    })) as any;
+
+    // result.data 是展平的 Float32Array：[batch_size × hidden_size]
+    // 按行切分，每行 dim 个浮点数
+    const data = result.data as Float32Array;
+    const dim = data.length / batch.length;
+
+    for (let j = 0; j < batch.length; j++) {
+      // slice() 复制出独立 buffer，避免张量底层内存被复用
+      out.push(data.slice(j * dim, (j + 1) * dim));
+    }
+
     onBatch?.(Math.min(i + batchSize, texts.length), texts.length);
   }
   return out;
@@ -255,6 +298,14 @@ self.onmessage = async (e: MessageEvent) => {
       /* 删除会话时清理对应缓存 */
       case "remove-index": {
         indexCache.delete((msg as RemoveIndexReq).indexId);
+        break;
+      }
+
+      /* 手动/空闲释放向量模型，减少内存占用 */
+      case "unload-model": {
+        const { clearIndex } = msg as UnloadModelReq;
+        await unloadEmbedder(clearIndex);
+        self.postMessage({ type: "unloaded", id });
         break;
       }
     }

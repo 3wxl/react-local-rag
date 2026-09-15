@@ -54,7 +54,34 @@ function checkMemoryBudget(): boolean {
 
 self.onmessage = async (e: MessageEvent) => {
   //`self` 在 Web Worker 里面代表 worker 全局对象，相当于主线程的 `window`。
-  const { question, contextChunks } = e.data as {
+  const data = e.data as {
+    question?: string;
+    contextChunks?: string[];
+    type?: string;
+  };
+
+  // 手动卸载模型（当前架构 LLM worker 是一次性的，done 时已 terminate；
+  // 此消息以备未来改为常驻 worker 时使用）
+  if (data.type === "unload-model") {
+    const oldPromise = generatorPromise;
+    generatorPromise = null;
+    if (oldPromise) {
+      try {
+        const gen = await oldPromise;
+        if (gen && typeof gen.dispose === "function") {
+          await gen.dispose();
+        } else if (gen?.model && typeof gen.model.dispose === "function") {
+          await gen.model.dispose();
+        }
+      } catch {
+        // 忽略
+      }
+    }
+    self.postMessage({ type: "unloaded" });
+    return;
+  }
+
+  const { question, contextChunks } = data as {
     question: string;
     contextChunks: string[];
   };
