@@ -24,15 +24,15 @@ export interface EmbedOptions {
 
 export interface SearchHit {
   content: string;
-  /** 混合检索最终分（向量 0.6 + BM25 0.4 加权，归一化到 0~1） */
+  /** RRF 融合分（最终排序依据，越大越相关） */
   score: number;
-  /** 归一化向量相似度（向量降级时为 null） */
-  vecScore?: number | null;
-  /** 归一化 BM25 关键词分 */
-  bm25Score?: number;
+  /** 向量路排名（1=最相关，null=向量降级或未上榜） */
+  vecRank?: number | null;
+  /** BM25 路排名（1=最相关，0=未上榜/零分） */
+  bm25Rank?: number;
 }
 
-/** 检索模式：hybrid=向量+BM25 混合；bm25=向量模型不可用时的降级模式 */
+/** 检索模式：hybrid=向量+BM25 RRF 融合；bm25=向量模型不可用时的降级模式 */
 export type SearchMode = "hybrid" | "bm25";
 
 export interface SearchResult {
@@ -228,7 +228,7 @@ export function removeVectorIndex(indexId: string): void {
 }
 
 /**
- * 混合检索：worker 内同时计算向量余弦 + BM25 关键词分，归一化加权后返回 topK。
+ * 混合检索：worker 内分别对向量余弦和 BM25 关键词分排名，用 RRF 倒数排名融合后返回 topK。
  * 向量模型不可用时自动降级为纯 BM25（mode="bm25"），不阻断问答。
  * 请求体不含任何向量，检索结果也不回传向量。
  */

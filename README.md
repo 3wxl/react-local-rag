@@ -8,7 +8,7 @@
 - 双 WebWorker 隔离 AI 计算任务（LLM 推理 + Embedding 向量化），不阻塞 UI 主线程
 - **会话级隔离**：每个会话的文档、向量索引、BM25 索引、检索、校验互不串扰，上传的 PDF 只在对应会话生效
 - IndexedDB 持久化存储文档块、向量索引与对话记录，突破 localStorage 存储容量限制
-- 滑动窗口重叠分块 + **混合检索（向量相似度 + BM25 关键词加权）**，RAG 核心逻辑自主实现
+- 滑动窗口重叠分块 + **混合检索（向量排名 + BM25 排名，RRF 倒数排名融合）**，RAG 核心逻辑自主实现
 - **幻觉后处理校验**：模型输出完成后，由纯 JS + 向量数学逐句校验答案是否有文档依据，不依赖模型自觉
 - **完整异常捕获体系**：全局 ErrorBoundary + Worker 崩溃兜底 + 内存预判 + 请求超时 + 分类错误提示，任何异常都不会白屏
 - **模型手动卸载**：LLM / Embedding 模型空闲时自动释放权重，减少浏览器内存占用；侧边栏支持手动一键释放
@@ -16,6 +16,42 @@
 - 备份 / 恢复：一键导出全部会话与向量索引为 JSON 文件，换浏览器或清缓存后可完整恢复
 - 三套主题（白天 / 夜晚 / 护眼），CSS 变量驱动，切换平滑
 - 豆包式对话 UI：历史会话侧边栏、思考过程折叠、流式回答、引用片段展开、加载状态提示
+
+## RAG 流程
+
+```
+用户上传 PDF/TXT
+    │
+    ▼
+[1] pdfParse.ts        逐页解析 + 文本清洗
+    │
+    ▼
+[2] chunk.ts           滑动窗口分块（固定长度 + 重叠）
+    │
+    ▼
+[3] embedding.worker   批量向量化（BGE-small-zh）+ 同步构建 BM25 倒排索引
+    │                  向量索引 + BM25 索引按会话 id 缓存在 Worker 内存
+    │                  向量同时持久化到 IndexedDB（Float32Array 原生存储）
+    ▼
+用户提问
+    │
+    ▼
+[4] embedding.worker   混合检索（RRF 融合）
+    │   ├─ 向量路：query 向量化 → 余弦相似度 → 排名
+    │   └─ BM25 路：关键词分 → 排名
+    │   融合公式：rrf = 1/(60+vecRank) + 1/(60+bm25Rank)
+    │   向量不可用时自动降级为纯 BM25
+    ▼
+[5] llm.worker         检索片段 + 用户问题拼接 Prompt → Qwen2.5-0.5B 流式生成
+    │                  思考标签解析拆分为「思考过程」+「最终答案」两路流
+    ▼
+[6] verifyAnswer.ts    幻觉后处理校验（不依赖模型自觉）
+    │   ├─ 语义证据：逐句向量化 → 与全文档索引算最大余弦
+    │   ├─ 词法证据：bigram + 英文/数字分词覆盖率
+    │   └─ 数字事实核查：答案数字必须在原文中能找到
+    ▼
+[7] UI 展示            逐句高亮（绿=有依据 / 琥珀=弱依据 / 红+波浪线=无依据）
+```
 
 ## 核心模块
 
@@ -40,10 +76,10 @@
 - Transformers.js 加载 BGE-small-zh 向量模型（惰性加载 + Promise 缓存，只加载一次）
 - **原生批量数组输入**：每批 8 条 chunk 一次性传 pipeline，内部 batch padding 后单次推理，减少循环开销
 - Worker 接收文档 chunk 批量生成向量，向量索引 + BM25 索引同步缓存在 Worker 内存
-- **混合检索打分**：query 向量化 + BM25 关键词分，两路各自归一化后加权融合（向量 0.6 + BM25 0.4）
-- 向量路径负责语义召回（同义、近义、跨表述）；BM25 负责精确关键词匹配（专有名词、数字、型号）
+- **混合检索打分（RRF 倒数排名融合）**：query 向量化 + BM25 关键词分，两路**分别排名**（不做归一化）后用 `1/(60+rank)` 融合，彻底规避分数量纲不一致的坑
+- 向量路负责语义召回（同义、近义、跨表述）；BM25 路负责精确关键词匹配（专有名词、数字、型号）
 - **向量降级保护**：query 向量化失败（模型加载失败/内存不足）时自动降级为纯 BM25，问答不中断
-- 只返回 Top-K 文本 + 混合分，不传输全部向量，减少跨线程数据搬运
+- 只返回 Top-K 文本 + RRF 分，不传输全部向量，减少跨线程数据搬运
 - 主线程通过 `embeddingClient.ts` 以 Promise 化请求/响应协议与 Worker 通信
 - **会话级索引隔离**：Worker 内 `Map<indexId, chunks>` + `Map<indexId, BM25>` 按会话 id 缓存，检索/校验只在对应索引内计算
 - **BM25 自主实现**：纯 JS Okapi BM25，中文 bigram + 英文/数字分词，与幻觉校验共用同一套分词口径；零依赖、零体积
@@ -141,6 +177,7 @@
 - PDF 解析：pdfjs-dist
 - 性能优化：双 Web Worker（LLM 推理 + Embedding 向量化）
 - 本地持久化：IndexedDB
+- 混合检索：自主实现 BM25（Okapi BM25，中文 bigram 分词）+ 向量余弦 + RRF 融合
 - UI：TailwindCSS（语义化颜色令牌 + CSS 变量主题系统）
 
 ## 项目目录结构
@@ -184,26 +221,47 @@ react-local-rag
 │   │   ├── perf.ts                      # 性能埋点工具（9 阶段计时+统计+导出）
 │   │   └── verifyAnswer.ts             # 幻觉后处理校验
 │   ├── worker/
-│   │   ├── embedding.worker.ts          # Embedding+混合检索 Worker（向量+BM25）
+│   │   ├── embedding.worker.ts          # Embedding+混合检索 Worker（向量+BM25+RRF 融合）
 │   │   └── llm.worker.ts                # LLM 推理 Worker
 │   ├── App.tsx                          # 编排层：RAG 流程+状态机+布局+埋点接入
 │   ├── index.css                        # 三套主题 CSS 变量
-│   └── main.tsx
-├── index.html
-├── package.json
-├── tailwind.config.js
-├── tsconfig.app.json
-├── tsconfig.json
-├── tsconfig.node.json
-└── vite.config.ts
+│   └── main.tsx                         # 入口：挂载 ErrorBoundary 包裹的 App
+├── index.html                           # HTML 模板
+├── package.json                         # 依赖与脚本
+├── tailwind.config.js                   # Tailwind 主题令牌扩展
+├── tsconfig.app.json                    # 应用 TS 配置
+├── tsconfig.json                        # TS 项目引用根
+├── tsconfig.node.json                   # Node 环境 TS 配置（vite.config）
+└── vite.config.ts                       # Vite 构建配置
 ```
 
 ## 快速启动
 
 ```bash
+# 1. 安装依赖
 npm install
+
+# 2. 下载模型权重（首次运行必须，见下方模型加载说明）
+#    放置到 public/models/ 对应目录
+
+# 3. 启动开发服务器
 npm run dev
 ```
+
+浏览器打开 `http://localhost:5173` 即可使用。
+
+## 使用流程
+
+1. **新建会话**：左侧栏点击"新建会话"
+2. **上传文档**：点击顶栏上传按钮，或直接拖拽 PDF/TXT 到消息区
+3. **等待处理**：状态显示"正在解析文档 → 正在向量化"（首次会触发模型加载，约 10~30s）
+4. **提问**：在输入框输入问题，Enter 发送
+5. **查看回答**：AI 流式输出思考过程 + 最终答案，下方可展开"引用文档片段"
+6. **幻觉校验**：回答完成后自动逐句校验，无依据句子红色高亮 + 波浪下划线
+7. **切换主题**：左下角选择白天/夜晚/护眼模式
+8. **性能查看**：左下角"性能埋点"查看各阶段耗时统计
+9. **释放内存**：左下角"释放模型内存"手动卸载模型权重
+10. **备份恢复**：左下角"导出全部备份"生成 JSON，换浏览器后"导入备份文件"恢复
 
 ## 模型加载说明
 
@@ -215,3 +273,21 @@ npm run dev
 | -------------- | --------------------- | --------------------------------------------------- | ---------------------------------- |
 | Embedding 向量 | bge-small-zh-v1.5     | public/models/Xenova/bge-small-zh-v1.5/             | 中文语义向量模型                   |
 | LLM 对话推理   | Qwen2.5-0.5B-Instruct | public/models/onnx-community/Qwen2.5-0.5B-Instruct/ | 轻量中文对话大模型，q4 量化        |
+
+### 模型下载方式
+
+从 [Hugging Face](https://huggingface.co) 下载对应模型的 ONNX 权重，放入上述目录。以 Git LFS 拉取为例：
+
+```bash
+# 安装 git-lfs（一次性）
+git lfs install
+
+# Embedding 模型
+git clone https://huggingface.co/Xenova/bge-small-zh-v1.5 public/models/Xenova/bge-small-zh-v1.5
+
+# LLM 模型（q4 量化版）
+git clone https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct public/models/onnx-community/Qwen2.5-0.5B-Instruct
+```
+
+> 两个模型总体积约 500MB~1GB，下载耗时取决于网络。放置完成后项目即完全离线可用。
+

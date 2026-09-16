@@ -158,40 +158,63 @@ function buildBm25(indexId: string, contents: string[]): BM25 {
   return bm25;
 }
 
-/* ---------------- 混合检索：向量余弦 + BM25 加权融合 ---------------- */
+/* ---------------- 混合检索：向量余弦 + BM25 倒数排名融合（RRF） ---------------- */
 
-/** 语义（向量）权重 / 关键词（BM25）权重：语义稍重，关键词做精确匹配补强 */
-const VECTOR_WEIGHT = 0.6;
-const BM25_WEIGHT = 0.4;
+/**
+ * RRF（Reciprocal Rank Fusion）常数 k：
+ * 平滑排名影响，k 越大对排名差距越不敏感，工业经验默认 60。
+ * 公式：rrf_score = Σ 1 / (k + rank)，rank 从 1 开始（0 表示未上榜）。
+ */
+const RRF_K = 60;
 
 interface HybridHit {
   content: string;
-  /** 混合分（最终排序依据，0~1） */
+  /** RRF 融合分（最终排序依据，0~1 区间，越大越相关） */
   score: number;
-  /** 归一化后的向量相似度 0~1（向量不可用时为 null） */
-  vecScore: number | null;
-  /** 归一化后的 BM25 分 0~1 */
-  bm25Score: number;
-}
-
-/** min-max 归一化到 0~1（所有值相同时退化为 0，避免除零） */
-function minMax(values: number[]): number[] {
-  if (values.length === 0) return [];
-  let min = Infinity;
-  let max = -Infinity;
-  for (const v of values) {
-    if (v < min) min = v;
-    if (v > max) max = v;
-  }
-  if (max - min < 1e-9) return values.map(() => 0);
-  return values.map((v) => (v - min) / (max - min));
+  /** 向量路排名（1 = 最相关，null = 向量降级或未上榜） */
+  vecRank: number | null;
+  /** BM25 路排名（1 = 最相关，0 = 未上榜/零分） */
+  bm25Rank: number;
 }
 
 /**
- * 混合检索打分：
- * - 向量相似度：语义召回（同义、近义、跨表述）
- * - BM25：精确关键词匹配（专有名词、数字、型号等向量容易丢失的硬信息）
- * 两路分别归一化后加权求和。向量模型不可用时自动降级为纯 BM25。
+ * 把原始分数数组转成按 docIndex 的排名（1-based，0 表示零分未上榜）。
+ * 返回 ranks：ranks[i] 表示第 i 篇文档在该路检索中的名次。
+ * 同分文档并列同排名（标准竞赛排名法）。
+ */
+function scoresToRanks(scores: number[], includeZero: boolean): number[] {
+  //scores: number[] 每个元素是文档分数（BM25 分数 / 向量相似度）；includeZero 是否把分数 = 0 的文档也纳入排名
+  const n = scores.length;
+  if (n === 0) return [];
+  const ranks = new Array<number>(n).fill(0);
+  // 只对分数 > 0（或 includeZero 时所有）的文档参与排名
+  const order = scores
+    .map((s, i) => ({ s, i }))
+    .filter((x) => (includeZero ? true : x.s > 0))
+    .sort((a, b) => b.s - a.s);
+  /*.map((s,i) => ({s,i}))：把分数和它原始下标绑定。记住原始位置，排序之后还能写回正确的 ranks 位置。
+.filter：过滤规则
+includeZero=true：全部保留，0 分文档也参与排名
+includeZero=false：只保留 s>0，0 分 / 负分文档直接剔除，不参与排名
+.sort((a,b)=>b.s-a.s)：降序排序，分数越高越靠前 */
+  for (let r = 0; r < order.length; r++) {
+    // 处理并列：跳过同分
+    if (r > 0 && order[r].s === order[r - 1].s) {
+      ranks[order[r].i] = ranks[order[r - 1].i];
+    } else {
+      ranks[order[r].i] = r + 1;
+    }
+  }
+  return ranks;
+}
+
+/**
+ * RRF 混合检索：
+ * - 向量路：余弦相似度排名（语义召回）
+ * - BM25 路：关键词分数排名（精确匹配补强）
+ * 两路独立排名后用 1/(k+rank) 融合，**不做任何归一化**，
+ * 彻底规避两路分数量纲不一致的坑。
+ * 向量模型不可用时自动降级为纯 BM25（仅按 BM25 排名取 topK）。
  */
 function hybridSearch(
   index: { content: string; vector: Float32Array }[], //index：文档库，数组。每一项存原文 content + 文档向量 vector（Float32）
@@ -199,28 +222,27 @@ function hybridSearch(
   query: string, //query：用户查询文本
   qvec: Float32Array | null,
 ): HybridHit[] {
-  // 路 1：BM25 原始分 -> 按全集最大值归一化
-  const bm25Raw = bm25.scoreAll(query);
-  let bm25Max = 0;
-  for (const s of bm25Raw) if (s > bm25Max) bm25Max = s;
-  const bm25Norm = bm25Max > 0 ? bm25Raw.map((s) => s / bm25Max) : bm25Raw;
+  // 路 1：BM25 原始分 -> 排名（零分文档不上榜，rank=0）
+  const bm25Raw = bm25.scoreAll(query); //对索引里全部文档，一次性算出每篇文档的 BM25 分数
+  const bm25Ranks = scoresToRanks(bm25Raw, false);
 
-  // 路 2：向量余弦 -> min-max 归一化（BGE 余弦通常挤在 0.2~0.8，拉开相对差距）
-  let vecNorm: number[] | null = null;
+  // 路 2：向量余弦 -> 排名（所有文档都参与，余弦恒 > 0）
+  let vecRanks: number[] | null = null;
   if (qvec) {
     const cosine = index.map((item) => dotProduct(qvec, item.vector));
-    vecNorm = minMax(cosine);
+    vecRanks = scoresToRanks(cosine, true);
   }
 
   return index.map((item, i) => {
-    const v = vecNorm ? vecNorm[i] : null;
-    const score =
-      v !== null ? VECTOR_WEIGHT * v + BM25_WEIGHT * bm25Norm[i] : bm25Norm[i]; // 向量降级：纯 BM25
+    const vr = vecRanks ? vecRanks[i] : null;
+    let rrf = 0;
+    if (vr && vr > 0) rrf += 1 / (RRF_K + vr);
+    if (bm25Ranks[i] > 0) rrf += 1 / (RRF_K + bm25Ranks[i]);
     return {
       content: item.content,
-      score,
-      vecScore: v,
-      bm25Score: bm25Norm[i],
+      score: rrf,
+      vecRank: vr && vr > 0 ? vr : null,
+      bm25Rank: bm25Ranks[i],
     };
   });
 }
