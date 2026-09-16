@@ -220,11 +220,15 @@ function App() {
     setLoadProgress(0);
 
     try {
-      // 1. 检索相关片段（embedding worker 内完成：query 向量化 + 余弦相似度 + topK）
+      // 1. 混合检索（向量相似度 + BM25 加权；向量不可用时自动降级纯 BM25）
       patchMessage(convId, assistantMsg.id, { status: "retrieving" });
       const tSearch = startTimer("search");
-      const resultChunks = await searchTopK(activeConv.id, text, 3);
-      tSearch.done({ topK: 3, hitCount: resultChunks.length });
+      const { mode: searchMode, hits: resultChunks } = await searchTopK(
+        activeConv.id,
+        text,
+        3,
+      );
+      tSearch.done({ topK: 3, hitCount: resultChunks.length, mode: searchMode });
       const ctx = resultChunks.map((item) => item.content).join("\n\n");
 
       // 2. 调用 worker 流式生成

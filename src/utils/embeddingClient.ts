@@ -24,7 +24,20 @@ export interface EmbedOptions {
 
 export interface SearchHit {
   content: string;
+  /** 混合检索最终分（向量 0.6 + BM25 0.4 加权，归一化到 0~1） */
   score: number;
+  /** 归一化向量相似度（向量降级时为 null） */
+  vecScore?: number | null;
+  /** 归一化 BM25 关键词分 */
+  bm25Score?: number;
+}
+
+/** 检索模式：hybrid=向量+BM25 混合；bm25=向量模型不可用时的降级模式 */
+export type SearchMode = "hybrid" | "bm25";
+
+export interface SearchResult {
+  mode: SearchMode;
+  hits: SearchHit[];
 }
 
 /** 幻觉校验：单个句子在文档索引中的最大余弦依据分 */
@@ -95,7 +108,10 @@ function getWorker(): Worker {
           pending.delete(msg.id);
           break;
         case "search-result":
-          entry.resolve(msg.results as SearchHit[]);
+          entry.resolve({
+            mode: (msg.mode as SearchMode) ?? "hybrid",
+            hits: msg.results as SearchHit[],
+          } as SearchResult);
           pending.delete(msg.id);
           break;
         case "verify-result":
@@ -212,7 +228,8 @@ export function removeVectorIndex(indexId: string): void {
 }
 
 /**
- * 检索：worker 内生成 query 向量并计算余弦相似度，只返回 topK 文本+分数。
+ * 混合检索：worker 内同时计算向量余弦 + BM25 关键词分，归一化加权后返回 topK。
+ * 向量模型不可用时自动降级为纯 BM25（mode="bm25"），不阻断问答。
  * 请求体不含任何向量，检索结果也不回传向量。
  */
 export function searchTopK(
@@ -220,9 +237,9 @@ export function searchTopK(
   query: string,
   topK = 3,
   options: EmbedOptions = {},
-): Promise<SearchHit[]> {
+): Promise<SearchResult> {
   return withLoadListener(options.onLoadProgress, () =>
-    request<SearchHit[]>({ type: "search", indexId, query, topK }),
+    request<SearchResult>({ type: "search", indexId, query, topK }),
   );
 }
 

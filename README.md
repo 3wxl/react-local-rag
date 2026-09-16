@@ -1,16 +1,18 @@
 # react-local-rag
 
-> 基于 React + TypeScript + Transformers.js 实现的**浏览器端离线 RAG 知识库问答系统**，全程无后端服务，文档解析、文本分块、向量 Embedding、检索、大模型推理、幻觉后处理校验全部在客户端浏览器内完成。
+> 基于 React + TypeScript + Transformers.js 实现的**浏览器端离线 RAG 知识库问答系统**，全程无后端服务，文档解析、文本分块、向量 Embedding、混合检索、大模型推理、幻觉后处理校验全部在客户端浏览器内完成。
 
 ## 项目亮点
 
 - 完全离线运行，文档数据不上传任何服务器，隐私友好，不依赖后端接口
 - 双 WebWorker 隔离 AI 计算任务（LLM 推理 + Embedding 向量化），不阻塞 UI 主线程
-- **会话级隔离**：每个会话的文档、向量索引、检索、校验互不串扰，上传的 PDF 只在对应会话生效
+- **会话级隔离**：每个会话的文档、向量索引、BM25 索引、检索、校验互不串扰，上传的 PDF 只在对应会话生效
 - IndexedDB 持久化存储文档块、向量索引与对话记录，突破 localStorage 存储容量限制
-- 滑动窗口重叠分块 + 余弦相似度向量检索，RAG 核心逻辑自主实现
+- 滑动窗口重叠分块 + **混合检索（向量相似度 + BM25 关键词加权）**，RAG 核心逻辑自主实现
 - **幻觉后处理校验**：模型输出完成后，由纯 JS + 向量数学逐句校验答案是否有文档依据，不依赖模型自觉
 - **完整异常捕获体系**：全局 ErrorBoundary + Worker 崩溃兜底 + 内存预判 + 请求超时 + 分类错误提示，任何异常都不会白屏
+- **模型手动卸载**：LLM / Embedding 模型空闲时自动释放权重，减少浏览器内存占用；侧边栏支持手动一键释放
+- **性能埋点**：记录模型加载、分块、检索、推理等各阶段耗时，本地内存存储不上传，侧边栏可查看统计
 - 备份 / 恢复：一键导出全部会话与向量索引为 JSON 文件，换浏览器或清缓存后可完整恢复
 - 三套主题（白天 / 夜晚 / 护眼），CSS 变量驱动，切换平滑
 - 豆包式对话 UI：历史会话侧边栏、思考过程折叠、流式回答、引用片段展开、加载状态提示
@@ -31,16 +33,20 @@
 - 固定长度滑动窗口分块 + 重叠切片策略
 - 解决 LLM 上下文窗口溢出问题，提升检索匹配精准度
 
-### 模块 3：Embedding 向量化 + 向量检索（embedding.worker.ts / embeddingClient.ts）
+### 模块 3：Embedding 向量化 + 混合检索（embedding.worker.ts / embeddingClient.ts / bm25.ts）
 
-项目核心亮点，向量化与检索全部在独立 Worker 线程完成
+项目核心亮点，向量化、向量检索、BM25 关键词检索全部在独立 Worker 线程完成
 
 - Transformers.js 加载 BGE-small-zh 向量模型（惰性加载 + Promise 缓存，只加载一次）
-- Worker 接收文档 chunk 批量生成向量，向量索引缓存在 Worker 内存
-- 用户提问时 Worker 内部生成 query 向量 + 计算余弦相似度 + 筛选 Top-K 片段
-- 只返回 Top-K 文本，不传输全部向量，减少跨线程数据搬运
+- **原生批量数组输入**：每批 8 条 chunk 一次性传 pipeline，内部 batch padding 后单次推理，减少循环开销
+- Worker 接收文档 chunk 批量生成向量，向量索引 + BM25 索引同步缓存在 Worker 内存
+- **混合检索打分**：query 向量化 + BM25 关键词分，两路各自归一化后加权融合（向量 0.6 + BM25 0.4）
+- 向量路径负责语义召回（同义、近义、跨表述）；BM25 负责精确关键词匹配（专有名词、数字、型号）
+- **向量降级保护**：query 向量化失败（模型加载失败/内存不足）时自动降级为纯 BM25，问答不中断
+- 只返回 Top-K 文本 + 混合分，不传输全部向量，减少跨线程数据搬运
 - 主线程通过 `embeddingClient.ts` 以 Promise 化请求/响应协议与 Worker 通信
-- **会话级索引隔离**：Worker 内 `Map<indexId, chunks>` 按会话 id 缓存，检索/校验只在对应索引内计算
+- **会话级索引隔离**：Worker 内 `Map<indexId, chunks>` + `Map<indexId, BM25>` 按会话 id 缓存，检索/校验只在对应索引内计算
+- **BM25 自主实现**：纯 JS Okapi BM25，中文 bigram + 英文/数字分词，与幻觉校验共用同一套分词口径；零依赖、零体积
 - **请求超时兜底**：默认 120s 超时，模型首次加载 300s，超时后拒绝并提示刷新
 - **Worker 崩溃保护**：`unhandledrejection` 监听 + onerror 双重兜底，崩溃后拒绝新请求
 - **内存预算**：加载前 `performance.memory` 检查可用堆，不足 200MB 直接拒绝并给出提示
@@ -62,7 +68,7 @@
 模型输出完成后，额外加一层 JS 确定性校验，不交给模型自己判断
 
 - **语义证据**：答案逐句送入 Embedding Worker，与全文档索引算最大余弦相似度
-- **词法证据**：中文二元组 + 英文/数字分词覆盖率
+- **词法证据**：中文二元组 + 英文/数字分词覆盖率（与 BM25 检索共用分词口径）
 - **数字事实核查**：答案中的数字必须在原文中能找到，找不到直接判为捏造
 - 逐句裁决 supported / weak / unsupported，UI 逐句高亮（弱依据琥珀底色，无依据红色底色 + 波浪下划线）
 - Worker 不可用时自动降级为纯词法校验，不阻塞回答展示
@@ -72,7 +78,7 @@
 - IndexedDB 双 Store：`conversations`（会话+消息）+ `vectors`（向量索引，Float32Array 原生存储）
 - 启动时并行读取两表恢复会话与向量，自动同步向量索引到 Embedding Worker
 - 增量写库：仅持久化发生变化的会话，避免流式 token 触发全量重写
-- 旧 localStorage 数据首次启动自动迁移到 IndexedDB
+- 旧 localStorage 的数据首次启动自动迁移到 IndexedDB
 - **异常分层**：所有原始 IDB 错误转为 AppError，识别存储空间满（quota exceeded）给独立提示
 - **降级运行**：IndexedDB 打开失败（隐私模式/无痕模式）后设 `dbAvailable=false`，后续读写静默跳过，UI 正常运行不白屏
 
@@ -109,6 +115,25 @@
 - **UI 友好提示**：AppError 的 userMessage + hint 直接展示在消息气泡/加载状态里，而非白屏或控制台报错
 - **加载失败可重试**：模型 Promise 缓存失败后清空，用户重试不会卡在 rejected Promise 上
 
+### 模块 10：模型卸载（embeddingClient.ts / llm.worker.ts / App.tsx）
+
+减少浏览器内存占用，支持空闲自动释放 + 手动释放两种方式
+
+- **空闲自动卸载**：文档上传/问答完成后启动 5 分钟计时器，无操作自动释放 Embedding 模型权重（保留索引缓存，下次只需重新加载模型）
+- **手动卸载**：侧边栏"释放模型内存"按钮，一键释放模型权重 + 全部索引缓存（下次使用时从 IndexedDB 重新同步索引 + 重新加载模型）
+- 卸载后 `embedderPromise=null`，下次请求自动触发重新加载，用户无感
+- LLM worker 预留 `unload-model` 消息分支（当前架构每次问答 new + done 时 terminate 自动释放）
+
+### 模块 11：性能埋点（perf.ts / PerfPanel.tsx）
+
+仅本地内存存储，不上传，不持久化，刷新即清空
+
+- **9 个阶段计时**：parse / chunk / embed-load / embed / search / llm-load / llm-infer / verify / unload
+- 每条记录带附加元数据（chunkCount / topK / hitCount / tokens / progress 等）
+- **统计聚合**：每个阶段的次数 / 平均耗时 / 最小 / 最大 / 最近
+- **最近明细**：最多保留 500 条，超出自动裁剪
+- 弹窗式性能面板，三主题适配，支持导出 JSON / 清空
+
 ## 技术栈
 
 - 基础框架：React + TypeScript + Vite
@@ -134,7 +159,8 @@ react-local-rag
 │   │   ├── ErrorBoundary.tsx            # 全局错误边界，捕获渲染异常
 │   │   ├── MessageBubble.tsx            # 单条气泡+思考折叠+引用折叠+幻觉高亮
 │   │   ├── MessageList.tsx              # 消息列表+自动滚底+拖拽上传
-│   │   ├── Sidebar.tsx                  # 侧边栏：会话列表/备份恢复/主题切换
+│   │   ├── PerfPanel.tsx                # 性能埋点统计弹窗
+│   │   ├── Sidebar.tsx                  # 侧边栏：会话列表/备份恢复/主题切换/模型卸载/性能入口
 │   │   ├── Spinner.tsx                  # 加载旋转图标
 │   │   ├── ThemeSwitcher.tsx            # 主题三选一切换器
 │   │   ├── WelcomeState.tsx             # 新会话引导态
@@ -147,18 +173,20 @@ react-local-rag
 │   │   └── doc.ts                       # 文档/向量分块类型
 │   ├── utils/
 │   │   ├── backup.ts                    # 备份导出/导入恢复
+│   │   ├── bm25.ts                      # 纯 JS Okapi BM25（中文 bigram 分词）
 │   │   ├── chat.ts                      # uid/statusToTip/makeTitle
 │   │   ├── chunk.ts                     # 滑动窗口分块
 │   │   ├── db.ts                        # IndexedDB 封装+异常分层+降级
-│   │   ├── embeddingClient.ts           # Embedding Worker 客户端+超时+崩溃保护
+│   │   ├── embeddingClient.ts           # Embedding Worker 客户端+超时+崩溃保护+模型卸载
 │   │   ├── errors.ts                    # 分类错误体系（10 类错误码）
 │   │   ├── generateAnswer.ts            # LLM 流式生成+超时+错误分类
 │   │   ├── pdfParse.ts                  # PDF 解析+大文件保护+损坏捕获
+│   │   ├── perf.ts                      # 性能埋点工具（9 阶段计时+统计+导出）
 │   │   └── verifyAnswer.ts             # 幻觉后处理校验
 │   ├── worker/
-│   │   ├── embedding.worker.ts          # Embedding+检索 Worker
+│   │   ├── embedding.worker.ts          # Embedding+混合检索 Worker（向量+BM25）
 │   │   └── llm.worker.ts                # LLM 推理 Worker
-│   ├── App.tsx                          # 编排层：RAG 流程+状态机+布局
+│   ├── App.tsx                          # 编排层：RAG 流程+状态机+布局+埋点接入
 │   ├── index.css                        # 三套主题 CSS 变量
 │   └── main.tsx
 ├── index.html

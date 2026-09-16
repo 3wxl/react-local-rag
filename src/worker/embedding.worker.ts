@@ -1,6 +1,7 @@
 /*pipeline：HuggingFace Transformers.js 的高层 API，一行完成「加载模型 + 推理」。
 env：全局配置对象，控制模型从哪加载。*/
 import { pipeline, env } from "@huggingface/transformers";
+import { BM25 } from "../utils/bm25";
 
 //模型从本地 /models 加载,禁止远程，避免走 HF 官网
 env.localModelPath = "/models";
@@ -56,7 +57,7 @@ type MainRequest =
 // { type: "load-progress", progress }      向量模型加载进度（全局，无 id）
 // { type: "embed-progress", id, done, total } 批量向量化进度
 // { type: "embed-result", id, vectors }    批量向量化结果（Float32Array，transfer 零拷贝）
-// { type: "search-result", id, results }   topK 检索结果：只含文本+分数，不传向量
+// { type: "search-result", id, mode, results }  混合检索 topK：mode=hybrid|bm25，results 含混合分/向量分/BM25分，不传向量
 // { type: "verify-result", id, results }   逐句依据分 {text, score}[]，不传向量
 // { type: "error", id, error }
 
@@ -130,7 +131,8 @@ async function unloadEmbedder(clearIndex: boolean): Promise<void> {
   }
   if (clearIndex) {
     indexCache.clear();
-    console.log("向量索引缓存已清空");
+    bm25Cache.clear();
+    console.log("向量索引与 BM25 索引缓存已清空");
   }
   console.log("向量模型已卸载，内存释放");
 }
@@ -142,6 +144,86 @@ const indexCache = new Map<
   string,
   { content: string; vector: Float32Array }[]
 >();
+
+/**
+ * indexId -> BM25 关键词索引。
+ * 纯文本派生（词频统计），从 chunk 文本即可重建，无需持久化到 IndexedDB。
+ */
+const bm25Cache = new Map<string, BM25>();
+
+/** 由 chunk 文本构建 BM25 索引并缓存 */
+function buildBm25(indexId: string, contents: string[]): BM25 {
+  const bm25 = new BM25(contents);
+  bm25Cache.set(indexId, bm25);
+  return bm25;
+}
+
+/* ---------------- 混合检索：向量余弦 + BM25 加权融合 ---------------- */
+
+/** 语义（向量）权重 / 关键词（BM25）权重：语义稍重，关键词做精确匹配补强 */
+const VECTOR_WEIGHT = 0.6;
+const BM25_WEIGHT = 0.4;
+
+interface HybridHit {
+  content: string;
+  /** 混合分（最终排序依据，0~1） */
+  score: number;
+  /** 归一化后的向量相似度 0~1（向量不可用时为 null） */
+  vecScore: number | null;
+  /** 归一化后的 BM25 分 0~1 */
+  bm25Score: number;
+}
+
+/** min-max 归一化到 0~1（所有值相同时退化为 0，避免除零） */
+function minMax(values: number[]): number[] {
+  if (values.length === 0) return [];
+  let min = Infinity;
+  let max = -Infinity;
+  for (const v of values) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  if (max - min < 1e-9) return values.map(() => 0);
+  return values.map((v) => (v - min) / (max - min));
+}
+
+/**
+ * 混合检索打分：
+ * - 向量相似度：语义召回（同义、近义、跨表述）
+ * - BM25：精确关键词匹配（专有名词、数字、型号等向量容易丢失的硬信息）
+ * 两路分别归一化后加权求和。向量模型不可用时自动降级为纯 BM25。
+ */
+function hybridSearch(
+  index: { content: string; vector: Float32Array }[], //index：文档库，数组。每一项存原文 content + 文档向量 vector（Float32）
+  bm25: BM25, //bm25：预构建好的 BM25 实例（已经把所有文档分词建索引）
+  query: string, //query：用户查询文本
+  qvec: Float32Array | null,
+): HybridHit[] {
+  // 路 1：BM25 原始分 -> 按全集最大值归一化
+  const bm25Raw = bm25.scoreAll(query);
+  let bm25Max = 0;
+  for (const s of bm25Raw) if (s > bm25Max) bm25Max = s;
+  const bm25Norm = bm25Max > 0 ? bm25Raw.map((s) => s / bm25Max) : bm25Raw;
+
+  // 路 2：向量余弦 -> min-max 归一化（BGE 余弦通常挤在 0.2~0.8，拉开相对差距）
+  let vecNorm: number[] | null = null;
+  if (qvec) {
+    const cosine = index.map((item) => dotProduct(qvec, item.vector));
+    vecNorm = minMax(cosine);
+  }
+
+  return index.map((item, i) => {
+    const v = vecNorm ? vecNorm[i] : null;
+    const score =
+      v !== null ? VECTOR_WEIGHT * v + BM25_WEIGHT * bm25Norm[i] : bm25Norm[i]; // 向量降级：纯 BM25
+    return {
+      content: item.content,
+      score,
+      vecScore: v,
+      bm25Score: bm25Norm[i],
+    };
+  });
+}
 
 /** 点积：归一化向量的余弦相似度等于点积 */
 function dotProduct(a: Float32Array, b: Float32Array): number {
@@ -214,7 +296,7 @@ self.onmessage = async (e: MessageEvent) => {
 
   try {
     switch (msg.type) {
-      /* 批量向量化文档 chunk：worker 内缓存索引，同时把向量返回主线程持久化 */
+      /* 批量向量化文档 chunk：worker 内缓存向量索引 + BM25 索引，同时把向量返回主线程持久化 */
       case "embed-passages": {
         const { indexId, texts } = msg as EmbedPassagesReq;
         const vectors = await embedBatch(texts, "passage", (done, total) => {
@@ -224,6 +306,8 @@ self.onmessage = async (e: MessageEvent) => {
           indexId,
           texts.map((content, i) => ({ content, vector: vectors[i] })),
         );
+        // 同步构建 BM25 关键词索引（纯文本词频统计，开销很小）
+        buildBm25(indexId, texts);
         // 发送副本并 transfer buffer（零拷贝），worker 缓存里的原件不受影响
         const copies = vectors.map((v) => v.slice());
         (self as any).postMessage(
@@ -233,17 +317,19 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
 
-      /* 恢复 worker 端索引缓存（IndexedDB 恢复 / 导入备份后调用） */
+      /* 恢复 worker 端索引缓存（IndexedDB 恢复 / 导入备份后调用），同时重建 BM25 */
       case "set-index": {
         const { indexId, chunks } = msg as SetIndexReq;
+        const contents = chunks.map((c) => c.content);
         indexCache.set(
           indexId,
           chunks.map((c) => ({ content: c.content, vector: c.vector })),
         );
+        buildBm25(indexId, contents);
         break;
       }
 
-      /* 检索：query 向量化 -> 全量点积 -> topK；只返回文本+分数 */
+      /* 混合检索：query 向量化（可失败降级）+ BM25 -> 归一化加权 -> topK；只返回文本+分数 */
       case "search": {
         const { indexId, query, topK } = msg as SearchReq;
         const index = indexCache.get(indexId);
@@ -251,20 +337,35 @@ self.onmessage = async (e: MessageEvent) => {
           self.postMessage({
             type: "error",
             id,
-            error: "向量索引未同步到检索线程，请重新上传文档或刷新页面",
+            error: "文档索引未同步到检索线程，请重新上传文档或刷新页面",
           });
           break;
         }
-        const [qvec] = await embedBatch([query], "query");
+        // BM25 索引惰性补建（旧缓存兼容）
+        const bm25 =
+          bm25Cache.get(indexId) ??
+          buildBm25(
+            indexId,
+            index.map((i) => i.content),
+          );
+
+        // 向量路径失败（模型加载失败/内存不足）时降级为纯 BM25，不阻断问答
+        let qvec: Float32Array | null = null;
+        let mode: "hybrid" | "bm25" = "hybrid";
+        try {
+          [qvec] = await embedBatch([query], "query");
+        } catch (err) {
+          console.warn("向量检索不可用，本次降级为纯 BM25 关键词检索", err);
+          mode = "bm25";
+        }
+
         const k = Math.max(1, Math.min(topK, index.length));
-        const scored = index.map((item) => ({
-          content: item.content,
-          score: dotProduct(qvec, item.vector),
-        }));
+        const scored = hybridSearch(index, bm25, query, qvec);
         scored.sort((a, b) => b.score - a.score);
         self.postMessage({
           type: "search-result",
           id,
+          mode,
           results: scored.slice(0, k),
         });
         break;
@@ -295,9 +396,11 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
 
-      /* 删除会话时清理对应缓存 */
+      /* 删除会话时清理对应缓存（向量 + BM25） */
       case "remove-index": {
-        indexCache.delete((msg as RemoveIndexReq).indexId);
+        const { indexId } = msg as RemoveIndexReq;
+        indexCache.delete(indexId);
+        bm25Cache.delete(indexId);
         break;
       }
 
@@ -316,9 +419,8 @@ self.onmessage = async (e: MessageEvent) => {
 
 // 兜底：Worker 内未捕获的 Promise rejection
 self.addEventListener("unhandledrejection", (event) => {
-  const msg = event.reason instanceof Error
-    ? event.reason.message
-    : String(event.reason);
+  const msg =
+    event.reason instanceof Error ? event.reason.message : String(event.reason);
   self.postMessage({
     type: "error",
     id: undefined,
