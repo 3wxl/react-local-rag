@@ -28,7 +28,7 @@ export function WelcomeState({
         <p className="text-sm text-ink-muted mb-6">
           {hasDoc
             ? `已加载《${conv.docName}》，共 ${conv.vectorChunks.length} 个文本块，请直接在下方输入框提问`
-            : "支持 PDF 或 TXT 格式，上传后即可基于文档内容进行问答"}
+            : "支持 PDF / TXT / Markdown / DOCX 格式，上传后即可基于文档内容进行问答"}
         </p>
 
         {!hasDoc && (
@@ -45,7 +45,7 @@ export function WelcomeState({
             ) : (
               <>
                 <UploadIcon className="w-5 h-5" />
-                点击上传 PDF / TXT
+                点击上传 PDF / TXT / MD / DOCX
               </>
             )}
           </button>

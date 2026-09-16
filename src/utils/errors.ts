@@ -139,7 +139,7 @@ export function pdfParseError(err: unknown): AppError {
     `文档解析失败：${msg}`,
     {
       cause: err,
-      hint: "请确认文件未损坏且为有效的 PDF/TXT 格式。",
+      hint: "请确认文件未损坏且为有效的 PDF/TXT/MD/DOCX 格式。",
     },
   );
 }

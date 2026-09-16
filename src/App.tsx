@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { parseFile } from "./utils/pdfParse";
-import { createTextChunks } from "./utils/chunk";
+import { createTextChunkStream } from "./utils/chunk";
 import {
   embedPassages,
   searchTopK,
@@ -16,6 +16,7 @@ import { uid } from "./utils/chat";
 import { BackupError } from "./utils/backup";
 import { useConversations } from "./hooks/useConversations";
 import { useTheme } from "./hooks/useTheme";
+import { useTopK } from "./hooks/useSettings";
 import { Sidebar } from "./components/Sidebar";
 import { ChatHeader } from "./components/ChatHeader";
 import { MessageList } from "./components/MessageList";
@@ -23,9 +24,10 @@ import { ChatInput } from "./components/ChatInput";
 import { EmptyState } from "./components/EmptyState";
 import { WelcomeState } from "./components/WelcomeState";
 import { PerfPanel } from "./components/PerfPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 
 /** 允许上传的文档后缀 */
-const DOC_SUFFIX_RE = /\.(pdf|txt)$/i;
+const DOC_SUFFIX_RE = /\.(pdf|txt|md|markdown|mdown|mkd|docx)$/i;
 
 function App() {
   const {
@@ -45,6 +47,7 @@ function App() {
   } = useConversations();
 
   const { theme, setTheme } = useTheme();
+  const [topK, setTopK] = useTopK();
 
   /* 仅容器层保留的运行态 */
   const [input, setInput] = useState("");
@@ -53,6 +56,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loadProgress, setLoadProgress] = useState(0);
   const [perfOpen, setPerfOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const currentHandleRef = useRef<GenerateHandle | null>(null);
@@ -119,12 +123,14 @@ function App() {
       try {
         setDocLoading("正在解析文档...");
         const tParse = startTimer("parse");
-        const text = await parseFile(file);
-        tParse.done({ sizeKB: Math.round(text.length / 1024) });
+        const tChunk = startTimer("chunk");
+        // 流式链路：PDF 逐页解析 → 每页立即分块，全文长字符串不落内存
+        const chunker = createTextChunkStream("pdf-001");
+        await parseFile(file, (pageText) => chunker.push(pageText));
+        tParse.done({ sizeKB: Math.round(chunker.totalChars / 1024) });
 
         setDocLoading("正在文本分块...");
-        const tChunk = startTimer("chunk");
-        const chunks = createTextChunks("pdf-001", text);
+        const chunks = chunker.finish();
         tChunk.done({ chunkCount: chunks.length });
 
         setDocLoading("正在向量化（本地模型计算）...");
@@ -226,9 +232,9 @@ function App() {
       const { mode: searchMode, hits: resultChunks } = await searchTopK(
         activeConv.id,
         text,
-        3,
+        topK,
       );
-      tSearch.done({ topK: 3, hitCount: resultChunks.length, mode: searchMode });
+      tSearch.done({ topK, hitCount: resultChunks.length, mode: searchMode });
       const ctx = resultChunks.map((item) => item.content).join("\n\n");
 
       // 2. 调用 worker 流式生成
@@ -309,6 +315,7 @@ function App() {
     input,
     busy,
     activeConv,
+    topK,
     addMessages,
     patchMessage,
     appendToMessage,
@@ -368,6 +375,7 @@ function App() {
         onUnloadModel={handleUnloadModel}
         busy={busy}
         onOpenPerf={() => setPerfOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
         theme={theme}
         onThemeChange={setTheme}
       />
@@ -424,13 +432,21 @@ function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pdf,.txt,application/pdf,text/plain"
+        accept=".pdf,.txt,.md,.markdown,.docx,application/pdf,text/plain,text/markdown"
         onChange={handleFileChange}
         className="hidden"
       />
 
       {/* 性能埋点面板 */}
       <PerfPanel open={perfOpen} onClose={() => setPerfOpen(false)} />
+
+      {/* 检索设置面板 */}
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        topK={topK}
+        onTopKChange={setTopK}
+      />
     </div>
   );
 }

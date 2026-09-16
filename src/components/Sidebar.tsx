@@ -7,6 +7,7 @@ import {
   EjectIcon,
   PlusIcon,
   RestoreIcon,
+  SettingsIcon,
   TrashIcon,
 } from "./icons";
 import { Spinner } from "./Spinner";
@@ -31,6 +32,8 @@ interface SidebarProps {
   busy: boolean;
   /** 打开性能埋点面板 */
   onOpenPerf: () => void;
+  /** 打开检索设置面板 */
+  onOpenSettings: () => void;
   /** 主题 */
   theme: ThemeMode;
   onThemeChange: (theme: ThemeMode) => void;
@@ -50,6 +53,7 @@ export function Sidebar({
   onUnloadModel,
   busy,
   onOpenPerf,
+  onOpenSettings,
   theme,
   onThemeChange,
 }: SidebarProps) {
@@ -222,6 +226,14 @@ export function Sidebar({
           >
             <ChartIcon className="w-3.5 h-3.5 text-ink-faint" />
             性能埋点
+          </button>
+          <button
+            onClick={onOpenSettings}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-ink-muted hover:bg-bg-hover transition"
+            title="调整混合检索返回给大模型的片段条数 Top-K"
+          >
+            <SettingsIcon className="w-3.5 h-3.5 text-ink-faint" />
+            检索设置
           </button>
         </div>
 

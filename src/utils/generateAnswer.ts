@@ -120,8 +120,12 @@ function createThinkTagSplitter(
   };
 }
 
-/** LLM 推理超时（含模型加载 5 分钟） */
-const LLM_TIMEOUT = 300_000;
+/**
+ * LLM 空闲超时：连续 120s 收不到 worker 任何消息（加载进度/生成 token）才判定卡死。
+ * 不能用固定总时长——本地 WASM 推理慢，长回答合法耗时可能超过固定上限，
+ * 只要有消息就重置计时，保证正常流式输出不会被误杀。
+ */
+const LLM_IDLE_TIMEOUT = 120_000;
 
 export function generateAnswer(
   question: string,
@@ -138,11 +142,15 @@ export function generateAnswer(
     reject = rej;
   });
 
-  // 超时兜底：模型加载卡死/推理无响应
-  const timeoutTimer = setTimeout(() => {
-    worker.terminate();
-    reject(workerTimeoutError("大模型", LLM_TIMEOUT));
-  }, LLM_TIMEOUT);
+  // 空闲超时兜底：只在 worker 完全无响应（卡死）时触发
+  let timeoutTimer: ReturnType<typeof setTimeout>;
+  const armTimeout = () => {
+    clearTimeout(timeoutTimer);
+    timeoutTimer = setTimeout(() => {
+      worker.terminate();
+      reject(workerTimeoutError("大模型", LLM_IDLE_TIMEOUT));
+    }, LLM_IDLE_TIMEOUT);
+  };
 
   const splitter = createThinkTagSplitter(
     (delta) => callbacks.onThinking?.(delta),
@@ -150,6 +158,8 @@ export function generateAnswer(
   );
 
   worker.onmessage = (e: MessageEvent) => {
+    // 任何消息都证明 worker 存活，重置空闲计时
+    armTimeout();
     const msg = e.data;
     switch (msg.type) {
       case "load-progress":
@@ -187,6 +197,8 @@ export function generateAnswer(
   };
 
   worker.postMessage({ question, contextChunks });
+  // 发出请求后开始第一轮空闲计时（覆盖模型加载阶段，加载进度消息会持续重置）
+  armTimeout();
 
   return {
     promise,

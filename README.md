@@ -6,7 +6,7 @@
 
 - 完全离线运行，文档数据不上传任何服务器，隐私友好，不依赖后端接口
 - 双 WebWorker 隔离 AI 计算任务（LLM 推理 + Embedding 向量化），不阻塞 UI 主线程
-- **会话级隔离**：每个会话的文档、向量索引、BM25 索引、检索、校验互不串扰，上传的 PDF 只在对应会话生效
+- **会话级隔离**：每个会话的文档、向量索引、BM25 索引、检索、校验互不串扰，上传的文档只在对应会话生效
 - IndexedDB 持久化存储文档块、向量索引与对话记录，突破 localStorage 存储容量限制
 - 滑动窗口重叠分块 + **混合检索（向量排名 + BM25 排名，RRF 倒数排名融合）**，RAG 核心逻辑自主实现
 - **幻觉后处理校验**：模型输出完成后，由纯 JS + 向量数学逐句校验答案是否有文档依据，不依赖模型自觉
@@ -15,15 +15,15 @@
 - **性能埋点**：记录模型加载、分块、检索、推理等各阶段耗时，本地内存存储不上传，侧边栏可查看统计
 - 备份 / 恢复：一键导出全部会话与向量索引为 JSON 文件，换浏览器或清缓存后可完整恢复
 - 三套主题（白天 / 夜晚 / 护眼），CSS 变量驱动，切换平滑
-- 豆包式对话 UI：历史会话侧边栏、思考过程折叠、流式回答、引用片段展开、加载状态提示
+- 对话 UI：历史会话侧边栏、思考过程折叠、流式回答、引用片段展开、加载状态提示
 
 ## RAG 流程
 
 ```
-用户上传 PDF/TXT
+用户上传 PDF/TXT/Markdown/DOCX
     │
     ▼
-[1] pdfParse.ts        逐页解析 + 文本清洗
+[1] pdfParse.ts        多格式解析 + 文本清洗
     │
     ▼
 [2] chunk.ts           滑动窗口分块（固定长度 + 重叠）
@@ -57,16 +57,20 @@
 
 ### 模块 1：本地文件解析（pdfParse.ts）
 
-前端直接读取 PDF / TXT 文件，无需后端中转
+前端直接读取 PDF / TXT / Markdown / DOCX 四种格式，无需后端中转
 
+- **流式逐页解析 PDF**：每页提取完文本立即清洗并送入分块器，全页拼接的长字符串不落内存，峰值内存与页数解耦
 - 逐页解析 PDF 文本内容，单页解析失败不中断整体流程
+- **Markdown 解析**：保留标题/列表/换行结构（标题与列表标记是 BM25 关键词检索的重要信号），去除 HTML 注释与 front matter 元数据块
+- **DOCX 解析**：mammoth 提取纯文本，动态 `import()` 懒加载，不占首屏体积；旧版 .doc 给出"另存为 .docx"的友好提示
 - 文本清洗：去除多余换行、空白、无效特殊字符
 - 大文件保护：超过 50MB 上限直接拒绝，防止内存溢出
-- PDF 损坏/加密/空文档等异常转为分类错误提示
+- 格式不支持/文件损坏/空文档等异常统一转为分类错误提示
 
 ### 模块 2：文本分块算法（chunk.ts）
 
 - 固定长度滑动窗口分块 + 重叠切片策略
+- **流式分块器**：支持逐段 push 增量切块（与大文件逐页解析配合，全文不落内存），切块结果与一次性切法完全等价
 - 解决 LLM 上下文窗口溢出问题，提升检索匹配精准度
 
 ### 模块 3：Embedding 向量化 + 混合检索（embedding.worker.ts / embeddingClient.ts / bm25.ts）
@@ -95,7 +99,7 @@
 - 支持中途停止生成
 - **内存预算**：加载前检查 `performance.memory`，不足 450MB 直接拒绝并提示关闭标签页
 - **加载失败可重试**：Promise 缓存失败后清空，下次请求重新加载，不卡死
-- **超时兜底**：5 分钟超时定时器，模型加载卡死/推理无响应自动终止 Worker
+- **超时兜底**：120s 空闲超时（收到任何加载进度/token 消息自动重置计时），只在线程真正卡死时终止 Worker，慢速长回答不会被误杀
 - **错误分类**：按错误内容自动分类为 model-load / model-inference，展示对应提示
 - **unhandledrejection 兜底**：第三方库内部异常不会让 Worker 静默崩溃
 
@@ -145,7 +149,7 @@
   3. `unhandledrejection` 监听器捕获第三方库内部未 catch 的 Promise rejection
 - **主线程超时兜底**：
   - Embedding Worker 请求带 120s/300s 超时定时器，收到响应才清除
-  - LLM Worker 5 分钟超时，超时自动 terminate 并分类报错
+  - LLM Worker 120s 空闲超时：连续无任何消息才 terminate 并分类报错，收到消息自动重置计时
   - Worker 崩溃后设 `crashed=true`，拒绝新请求直到刷新页面
 - **IndexedDB 降级**：打开失败设 `dbAvailable=false`，后续读写静默跳过，UI 以内存模式继续运行
 - **UI 友好提示**：AppError 的 userMessage + hint 直接展示在消息气泡/加载状态里，而非白屏或控制台报错
@@ -175,6 +179,7 @@
 - 基础框架：React + TypeScript + Vite
 - 前端离线 AI：@huggingface/transformers（Embedding + LLM）
 - PDF 解析：pdfjs-dist
+- Markdown / DOCX 解析：原生 FileReader（保留结构）+ mammoth（动态 import 懒加载）
 - 性能优化：双 Web Worker（LLM 推理 + Embedding 向量化）
 - 本地持久化：IndexedDB
 - 混合检索：自主实现 BM25（Okapi BM25，中文 bigram 分词）+ 向量余弦 + RRF 融合
@@ -197,13 +202,15 @@ react-local-rag
 │   │   ├── MessageBubble.tsx            # 单条气泡+思考折叠+引用折叠+幻觉高亮
 │   │   ├── MessageList.tsx              # 消息列表+自动滚底+拖拽上传
 │   │   ├── PerfPanel.tsx                # 性能埋点统计弹窗
-│   │   ├── Sidebar.tsx                  # 侧边栏：会话列表/备份恢复/主题切换/模型卸载/性能入口
+│   │   ├── SettingsPanel.tsx            # 检索设置面板（Top-K 滑杆）
+│   │   ├── Sidebar.tsx                  # 侧边栏：会话列表/备份恢复/主题切换/模型卸载/性能入口/检索设置
 │   │   ├── Spinner.tsx                  # 加载旋转图标
 │   │   ├── ThemeSwitcher.tsx            # 主题三选一切换器
 │   │   ├── WelcomeState.tsx             # 新会话引导态
 │   │   └── icons.tsx                    # 复用 SVG 图标
 │   ├── hooks/
 │   │   ├── useConversations.ts          # 会话状态机+IndexedDB 持久化
+│   │   ├── useSettings.ts               # Top-K 设置（localStorage 持久化+钳制）
 │   │   └── useTheme.ts                  # 主题状态管理
 │   ├── types/
 │   │   ├── chat.ts                      # 消息/会话类型
@@ -217,7 +224,7 @@ react-local-rag
 │   │   ├── embeddingClient.ts           # Embedding Worker 客户端+超时+崩溃保护+模型卸载
 │   │   ├── errors.ts                    # 分类错误体系（10 类错误码）
 │   │   ├── generateAnswer.ts            # LLM 流式生成+超时+错误分类
-│   │   ├── pdfParse.ts                  # PDF 解析+大文件保护+损坏捕获
+│   │   ├── pdfParse.ts                  # 多格式文件解析（PDF/TXT/MD/DOCX）+大文件保护+损坏捕获
 │   │   ├── perf.ts                      # 性能埋点工具（9 阶段计时+统计+导出）
 │   │   └── verifyAnswer.ts             # 幻觉后处理校验
 │   ├── worker/
@@ -253,15 +260,16 @@ npm run dev
 ## 使用流程
 
 1. **新建会话**：左侧栏点击"新建会话"
-2. **上传文档**：点击顶栏上传按钮，或直接拖拽 PDF/TXT 到消息区
+2. **上传文档**：点击顶栏上传按钮，或直接拖拽 PDF/TXT/Markdown/DOCX 到消息区
 3. **等待处理**：状态显示"正在解析文档 → 正在向量化"（首次会触发模型加载，约 10~30s）
 4. **提问**：在输入框输入问题，Enter 发送
 5. **查看回答**：AI 流式输出思考过程 + 最终答案，下方可展开"引用文档片段"
 6. **幻觉校验**：回答完成后自动逐句校验，无依据句子红色高亮 + 波浪下划线
 7. **切换主题**：左下角选择白天/夜晚/护眼模式
 8. **性能查看**：左下角"性能埋点"查看各阶段耗时统计
-9. **释放内存**：左下角"释放模型内存"手动卸载模型权重
-10. **备份恢复**：左下角"导出全部备份"生成 JSON，换浏览器后"导入备份文件"恢复
+9. **检索设置**：左下角"检索设置"调整 Top-K 召回数量（1~10，localStorage 持久化）
+10. **释放内存**：左下角"释放模型内存"手动卸载模型权重
+11. **备份恢复**：左下角"导出全部备份"生成 JSON，换浏览器后"导入备份文件"恢复
 
 ## 模型加载说明
 
@@ -269,10 +277,10 @@ npm run dev
 
 > 模型权重体积较大，已写入 `.gitignore`，不会提交到 Git 仓库。其他人克隆仓库后需要自行下载对应模型放到 `public/models` 目录，否则模型加载失败。
 
-| 用途           | 模型                  | 存放路径                                            | 说明                               |
-| -------------- | --------------------- | --------------------------------------------------- | ---------------------------------- |
-| Embedding 向量 | bge-small-zh-v1.5     | public/models/Xenova/bge-small-zh-v1.5/             | 中文语义向量模型                   |
-| LLM 对话推理   | Qwen2.5-0.5B-Instruct | public/models/onnx-community/Qwen2.5-0.5B-Instruct/ | 轻量中文对话大模型，q4 量化        |
+| 用途           | 模型                  | 存放路径                                            | 说明                        |
+| -------------- | --------------------- | --------------------------------------------------- | --------------------------- |
+| Embedding 向量 | bge-small-zh-v1.5     | public/models/Xenova/bge-small-zh-v1.5/             | 中文语义向量模型            |
+| LLM 对话推理   | Qwen2.5-0.5B-Instruct | public/models/onnx-community/Qwen2.5-0.5B-Instruct/ | 轻量中文对话大模型，q4 量化 |
 
 ### 模型下载方式
 
@@ -290,4 +298,3 @@ git clone https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct public/mod
 ```
 
 > 两个模型总体积约 500MB~1GB，下载耗时取决于网络。放置完成后项目即完全离线可用。
-

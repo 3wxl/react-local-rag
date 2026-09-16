@@ -13,5 +13,12 @@ export default defineConfig({
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
   },
+  // preview 同样需要：缺了这两个头 crossOriginIsolated=false，ORT 静默回退单线程
+  preview: {
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+  },
   assetsInclude: ["**/*.wasm"],
 });
