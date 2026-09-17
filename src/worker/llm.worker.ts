@@ -57,8 +57,37 @@ self.onmessage = async (e: MessageEvent) => {
   const data = e.data as {
     question?: string;
     contextChunks?: string[];
+    history?: { role: "user" | "assistant"; content: string }[];
+    historySummary?: string;
+    text?: string;
     type?: string;
   };
+
+  // 历史摘要压缩模式：非流式、低温、短输出，产出滚动摘要
+  if (data.type === "summarize" && typeof data.text === "string") {
+    try {
+      self.postMessage({ type: "loading" });
+      const generator = await getGenerator(() => {});
+      const summaryPrompt = `<|im_start|>system
+你是对话压缩助手。把用户提供的历史对话（可能包含一段已有摘要和新增对话）压缩成一段连贯的中文摘要，只保留：用户的关键问题、已确认的结论、重要数字与专有名词、尚未解决的问题。要求：不要新增信息、不要分点罗列、不要寒暄，直接输出摘要正文，300字以内。<|im_end|>
+<|im_start|>user
+${data.text}<|im_end|>
+<|im_start|>assistant
+`;
+      const output = await generator(summaryPrompt, {
+        max_new_tokens: 320,
+        do_sample: false,
+        return_full_text: false,
+      });
+      self.postMessage({
+        type: "done",
+        text: String(output[0].generated_text ?? "").trim(),
+      });
+    } catch (err: any) {
+      self.postMessage({ type: "error", error: err?.message || String(err) });
+    }
+    return;
+  }
 
   // 手动卸载模型（当前架构 LLM worker 是一次性的，done 时已 terminate；
   // 此消息以备未来改为常驻 worker 时使用）
@@ -81,9 +110,11 @@ self.onmessage = async (e: MessageEvent) => {
     return;
   }
 
-  const { question, contextChunks } = data as {
+  const { question, contextChunks, history, historySummary } = data as {
     question: string;
     contextChunks: string[];
+    history?: { role: "user" | "assistant"; content: string }[];
+    historySummary?: string;
   };
 
   try {
@@ -95,15 +126,24 @@ self.onmessage = async (e: MessageEvent) => {
     }); //模型加载完成之后，generator 就是 transformers 的 pipeline 实例，用来做文本生成。
 
     const context = contextChunks.join("\n"); //把检索出来的多个文档切片，用换行拼接成一整段文本，放进 prompt 作为参考文档。
+    // 最近对话历史（旧对话已在主线程压缩为 historySummary），支持追问中的指代理解
+    const historyBlock = (history ?? [])
+      .map((turn) => `<|im_start|>${turn.role}\n${turn.content}<|im_end|>`)
+      .join("\n");
     // 让模型先用 <think>...</think> 输出思考过程，再给最终回答
     const prompt = `<|im_start|>system
 你是文档问答助手，只能使用【文档内容】回答。
 回答前先在写出简短思考，再输出答案。
+可结合【此前对话摘要】与最近对话理解用户追问中的指代（如"它""上面提到的"），但回答依据仍必须来自文档内容。
 文档无相关内容，直接回复：文档中没有找到相关内容，禁止编造信息。
 【文档内容】
-${context}
+${context}${
+      historySummary
+        ? `\n【此前对话摘要】\n${historySummary}`
+        : ""
+    }
 <|im_end|>
-<|im_start|>user
+${historyBlock ? historyBlock + "\n" : ""}<|im_start|>user
 ${question}<|im_end|>
 <|im_start|>assistant
 `;

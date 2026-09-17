@@ -6,7 +6,17 @@ import {
   searchTopK,
   unloadEmbeddingModel,
 } from "./utils/embeddingClient";
-import { generateAnswer, type GenerateHandle } from "./utils/generateAnswer";
+import {
+  generateAnswer,
+  summarizeHistory,
+  type GenerateHandle,
+} from "./utils/generateAnswer";
+import {
+  buildPromptHistory,
+  planHistoryCompression,
+  renderSummaryInput,
+  MAX_SUMMARY_CHARS,
+} from "./utils/history";
 import { stripThinkTags, verifyAnswer } from "./utils/verifyAnswer";
 import { startTimer } from "./utils/perf";
 import type { AppError } from "./utils/errors";
@@ -37,6 +47,7 @@ function App() {
     setActiveId,
     createConversation,
     deleteConversation,
+    patchConversation,
     patchMessage,
     appendToMessage,
     attachDocument,
@@ -203,6 +214,10 @@ function App() {
     }
 
     const convId = activeConv.id;
+    // 快照：新消息入列之前的历史，供多轮上下文与摘要压缩使用
+    const prevMessages = activeConv.messages;
+    const prevSummary = activeConv.historySummary;
+    const prevMarker = activeConv.historySummaryUpToId;
     const now = Date.now();
     const userMsg: ChatMessage = {
       id: uid(),
@@ -226,6 +241,35 @@ function App() {
     setLoadProgress(0);
 
     try {
+      // 0. 长对话自动摘要压缩：旧消息折叠为滚动摘要，避免 Prompt 随轮次持续膨胀
+      let historySummary = prevSummary;
+      let historyMarker = prevMarker;
+      try {
+        const plan = planHistoryCompression(prevMessages, prevMarker);
+        if (plan) {
+          patchMessage(convId, assistantMsg.id, { status: "summarizing" });
+          const tSummary = startTimer("llm-infer");
+          const rawSummary = await summarizeHistory(
+            renderSummaryInput(prevSummary, plan.toFold),
+            (p) => setLoadProgress(p),
+          );
+          tSummary.done({ mode: "history-summary", folded: plan.toFold.length });
+          if (rawSummary) {
+            historySummary = rawSummary.slice(0, MAX_SUMMARY_CHARS);
+            historyMarker = plan.toFold[plan.toFold.length - 1].id;
+            patchConversation(convId, {
+              historySummary,
+              historySummaryUpToId: historyMarker,
+            });
+          }
+        }
+      } catch (sumErr) {
+        // 摘要失败不阻断问答：本轮只带最近几轮原文，下轮会自动重试压缩
+        console.warn("历史摘要压缩失败，本轮使用未压缩的最近对话", sumErr);
+      }
+      // 进入 Prompt 的最近对话（永远只取标记后的最近 4 条，Prompt 长度有上界）
+      const historyTurns = buildPromptHistory(prevMessages, historyMarker);
+
       // 1. 混合检索（向量相似度 + BM25 加权；向量不可用时自动降级纯 BM25）
       patchMessage(convId, assistantMsg.id, { status: "retrieving" });
       const tSearch = startTimer("search");
@@ -269,6 +313,7 @@ function App() {
             appendToMessage(convId, assistantMsg.id, "content", delta);
           },
         },
+        { history: historyTurns, historySummary },
       );
       currentHandleRef.current = handle;
 
@@ -317,6 +362,7 @@ function App() {
     activeConv,
     topK,
     addMessages,
+    patchConversation,
     patchMessage,
     appendToMessage,
     resetIdleTimer,

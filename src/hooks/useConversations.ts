@@ -29,6 +29,8 @@ function toRecord(c: Conversation): ConversationRecord {
     docName: c.docName,
     chunkCount: c.vectorChunks.length,
     messages: c.messages,
+    historySummary: c.historySummary,
+    historySummaryUpToId: c.historySummaryUpToId,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -47,6 +49,8 @@ async function readMergedConversations(): Promise<Conversation[]> {
       docName: r.docName,
       vectorChunks: vecMap.get(r.id) ?? [],
       messages: r.messages ?? [],
+      historySummary: r.historySummary,
+      historySummaryUpToId: r.historySummaryUpToId,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
     }))
@@ -219,6 +223,20 @@ export function useConversations() {
     [activeId],
   );
 
+  /* ---------- 局部更新会话级字段（历史摘要压缩后持久化） ---------- */
+  const patchConversation = useCallback(
+    (convId: string, patch: Partial<Conversation>) => {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? { ...c, ...patch, updatedAt: Date.now() }
+            : c,
+        ),
+      );
+    },
+    [],
+  );
+
   /* ---------- 局部更新某条消息（状态切换等） ---------- */
   const patchMessage = useCallback(
     (convId: string, msgId: string, patch: Partial<ChatMessage>) => {
@@ -372,6 +390,7 @@ export function useConversations() {
     setActiveId,
     createConversation,
     deleteConversation,
+    patchConversation,
     patchMessage,
     appendToMessage,
     attachDocument,

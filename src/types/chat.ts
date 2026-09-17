@@ -7,6 +7,7 @@ export type Role = "user" | "assistant";
 /** 单条消息的运行状态 */
 export type MessageStatus =
   | "pending" // 已创建，等待处理
+  | "summarizing" // 长对话历史自动摘要压缩中
   | "loading-model" // 模型加载中
   | "retrieving" // 检索文档中
   | "thinking" // 思考过程中
@@ -42,6 +43,10 @@ export interface Conversation {
   /** 关联文档的分块向量（检索用） */
   vectorChunks: VectorChunk[];
   messages: ChatMessage[];
+  /** 长对话历史的滚动摘要（旧对话被压缩为此文本，避免 Prompt 持续膨胀） */
+  historySummary?: string;
+  /** 摘要已覆盖到的消息 id（该消息及其之前的对话均已折叠进 historySummary） */
+  historySummaryUpToId?: string;
   createdAt: number;
   updatedAt: number;
 }

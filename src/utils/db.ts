@@ -14,6 +14,10 @@ export interface ConversationRecord {
   docName?: string;
   chunkCount: number; // ← 只存块数，不存向量本身
   messages: ChatMessage[];
+  /** 长对话滚动摘要（见 Conversation.historySummary） */
+  historySummary?: string;
+  /** 摘要覆盖到的消息 id */
+  historySummaryUpToId?: string;
   createdAt: number;
   updatedAt: number;
 }

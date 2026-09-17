@@ -5,6 +5,8 @@ import {
   workerCrashError,
   workerTimeoutError,
 } from "./errors";
+import { stripThinkTags } from "./verifyAnswer";
+import type { HistoryTurn } from "./history";
 //导入后 LlmWorker 是构造函数，new LlmWorker() 创建实例
 export interface GenerateCallbacks {
   /** 模型加载进度 0~1 */
@@ -127,10 +129,18 @@ function createThinkTagSplitter(
  */
 const LLM_IDLE_TIMEOUT = 120_000;
 
+export interface GenerateOptions {
+  /** 最近对话历史（旧对话应已由调用方压缩为摘要） */
+  history?: HistoryTurn[];
+  /** 更早对话的滚动摘要 */
+  historySummary?: string;
+}
+
 export function generateAnswer(
   question: string,
   contextChunks: string[],
   callbacks: GenerateCallbacks = {},
+  options: GenerateOptions = {},
 ): GenerateHandle {
   const worker = new LlmWorker();
 
@@ -196,7 +206,12 @@ export function generateAnswer(
     worker.terminate();
   };
 
-  worker.postMessage({ question, contextChunks });
+  worker.postMessage({
+    question,
+    contextChunks,
+    history: options.history,
+    historySummary: options.historySummary,
+  });
   // 发出请求后开始第一轮空闲计时（覆盖模型加载阶段，加载进度消息会持续重置）
   armTimeout();
 
@@ -207,4 +222,52 @@ export function generateAnswer(
       worker.terminate();
     },
   };
+}
+
+/**
+ * 调用本地模型生成滚动摘要（非流式）。
+ * 失败时抛出异常，由调用方决定是否放弃本轮压缩（不阻断问答）。
+ */
+export function summarizeHistory(
+  text: string,
+  onLoadProgress?: (progress: number) => void,
+): Promise<string> {
+  const worker = new LlmWorker();
+
+  return new Promise<string>((resolve, reject) => {
+    let timeoutTimer: ReturnType<typeof setTimeout>;
+    const armTimeout = () => {
+      clearTimeout(timeoutTimer);
+      timeoutTimer = setTimeout(() => {
+        worker.terminate();
+        reject(workerTimeoutError("大模型", LLM_IDLE_TIMEOUT));
+      }, LLM_IDLE_TIMEOUT);
+    };
+
+    worker.onmessage = (e: MessageEvent) => {
+      armTimeout();
+      const msg = e.data;
+      if (msg.type === "load-progress") {
+        onLoadProgress?.(msg.progress);
+      } else if (msg.type === "done") {
+        clearTimeout(timeoutTimer);
+        const cleaned = stripThinkTags(String(msg.text || "")).trim();
+        worker.terminate();
+        resolve(cleaned);
+      } else if (msg.type === "error") {
+        clearTimeout(timeoutTimer);
+        worker.terminate();
+        reject(modelInferenceError(new Error(msg.error || "摘要生成失败")));
+      }
+    };
+
+    worker.onerror = (err) => {
+      clearTimeout(timeoutTimer);
+      worker.terminate();
+      reject(workerCrashError("大模型", err));
+    };
+
+    worker.postMessage({ type: "summarize", text });
+    armTimeout();
+  });
 }

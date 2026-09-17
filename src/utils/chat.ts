@@ -25,6 +25,8 @@ export function statusToTip(status: MessageStatus, loadProgress = 0): string {
       return "正在校验回答是否有文档依据...";
     case "pending":
       return "排队中...";
+    case "summarizing":
+      return "正在压缩历史对话摘要...";
     case "error":
       return "生成失败";
     default:
