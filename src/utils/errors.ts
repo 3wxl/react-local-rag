@@ -45,13 +45,19 @@ export function modelLoadError(err: unknown): AppError {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
 
-  if (lower.includes("memory") || lower.includes("oom") || lower.includes("out of memory")) {
+  if (
+    lower.includes("memory") ||
+    lower.includes("oom") ||
+    lower.includes("out of memory") ||
+    lower.includes("allocation") ||
+    lower.includes("array buffer")
+  ) {
     return new AppError(
       "model-load",
       "模型加载失败：浏览器内存不足",
       {
         cause: err,
-        hint: "请关闭其他标签页后刷新重试，或换用更小的模型权重文件。",
+        hint: "请关闭其他标签页后刷新重试；若刚上传过大文档，可新建会话或重启浏览器后再试。",
       },
     );
   }

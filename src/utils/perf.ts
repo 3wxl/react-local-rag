@@ -15,6 +15,8 @@ export type PerfStage =
   | "llm-load" // LLM 模型加载
   | "llm-infer" // LLM 流式推理
   | "verify" // 幻觉后处理校验
+  | "agent-plan" // Self-RAG Agent 规划（问题拆分）
+  | "agent-iterate" // Self-RAG Agent 迭代（检索-判断单轮）
   | "unload"; // 模型卸载
 
 export interface PerfRecord {
@@ -168,5 +170,7 @@ export const PERF_STAGE_LABELS: Record<PerfStage, string> = {
   "llm-load": "LLM 模型加载",
   "llm-infer": "LLM 推理",
   verify: "幻觉校验",
+  "agent-plan": "Agent 规划",
+  "agent-iterate": "Agent 迭代",
   unload: "模型卸载",
 };

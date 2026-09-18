@@ -1,8 +1,12 @@
 import type { VectorChunk } from "./doc";
 import type { VerificationResult } from "../utils/verifyAnswer";
+import type { AgentStep } from "../agent/types";
 
 /** 消息角色 */
 export type Role = "user" | "assistant";
+
+/** 回答来源：区分普通 RAG 与 Self-RAG Agent（仅 assistant 消息） */
+export type AnswerSource = "normal-rag" | "self-rag";
 
 /** 单条消息的运行状态 */
 export type MessageStatus =
@@ -25,6 +29,10 @@ export interface ChatMessage {
   thinking?: string;
   /** 检索到的原文片段（仅 assistant 消息，可折叠查看） */
   context?: string;
+  /** Self-RAG / Agent 执行步骤链（仅 assistant，供思考面板渲染） */
+  agentSteps?: AgentStep[];
+  /** 回答来源标记：普通 RAG / Self-RAG Agent（仅 assistant 消息） */
+  answerSource?: AnswerSource;
   /** 幻觉后处理校验结果（仅 assistant 消息，生成完成后填充） */
   verification?: VerificationResult;
   /** 当前运行状态 */

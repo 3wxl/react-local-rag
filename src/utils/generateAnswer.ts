@@ -1,13 +1,10 @@
-import LlmWorker from "../worker/llm.worker?worker";
-import {
-  modelInferenceError,
-  modelLoadError,
-  workerCrashError,
-  workerTimeoutError,
-} from "./errors";
-import { stripThinkTags } from "./verifyAnswer";
+import { modelLoadError } from "./errors";
 import type { HistoryTurn } from "./history";
-//导入后 LlmWorker 是构造函数，new LlmWorker() 创建实例
+import {
+  callWorker,
+  callWorkerStreaming,
+} from "../agent/agentPlanner";
+
 export interface GenerateCallbacks {
   /** 模型加载进度 0~1 */
   onLoadProgress?: (progress: number) => void;
@@ -122,13 +119,6 @@ function createThinkTagSplitter(
   };
 }
 
-/**
- * LLM 空闲超时：连续 120s 收不到 worker 任何消息（加载进度/生成 token）才判定卡死。
- * 不能用固定总时长——本地 WASM 推理慢，长回答合法耗时可能超过固定上限，
- * 只要有消息就重置计时，保证正常流式输出不会被误杀。
- */
-const LLM_IDLE_TIMEOUT = 120_000;
-
 export interface GenerateOptions {
   /** 最近对话历史（旧对话应已由调用方压缩为摘要） */
   history?: HistoryTurn[];
@@ -136,138 +126,72 @@ export interface GenerateOptions {
   historySummary?: string;
 }
 
+/**
+ * 流式调用 LLM 生成回答，复用共享常驻 Worker 实例。
+ * 模型只加载一次：split/evaluate/summarize/generate 全部走同一 worker。
+ * cancel 不 terminate worker，只标记取消 + reject promise，worker 继续服务其他任务。
+ */
 export function generateAnswer(
   question: string,
   contextChunks: string[],
   callbacks: GenerateCallbacks = {},
   options: GenerateOptions = {},
 ): GenerateHandle {
-  const worker = new LlmWorker();
-
-  let resolve: (text: string) => void;
-  let reject: (err: Error) => void;
-
-  const promise = new Promise<string>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-
-  // 空闲超时兜底：只在 worker 完全无响应（卡死）时触发
-  let timeoutTimer: ReturnType<typeof setTimeout>;
-  const armTimeout = () => {
-    clearTimeout(timeoutTimer);
-    timeoutTimer = setTimeout(() => {
-      worker.terminate();
-      reject(workerTimeoutError("大模型", LLM_IDLE_TIMEOUT));
-    }, LLM_IDLE_TIMEOUT);
-  };
-
   const splitter = createThinkTagSplitter(
     (delta) => callbacks.onThinking?.(delta),
     (delta) => callbacks.onToken?.(delta),
   );
 
-  worker.onmessage = (e: MessageEvent) => {
-    // 任何消息都证明 worker 存活，重置空闲计时
-    armTimeout();
-    const msg = e.data;
-    switch (msg.type) {
-      case "load-progress":
-        callbacks.onLoadProgress?.(msg.progress);
-        break;
-      case "generating":
-        callbacks.onGenerating?.();
-        break;
-      case "token":
-        splitter(msg.text as string);
-        break;
-      case "done":
-        clearTimeout(timeoutTimer);
-        resolve(msg.text);
-        worker.terminate();
-        break;
-      case "error": {
-        clearTimeout(timeoutTimer);
-        const msgStr = msg.error || "模型推理失败";
-        // 加载阶段失败 vs 生成阶段失败，分类不同
-        const err = msgStr.match(/加载|load|memory|内存|not found|404|fetch/i)
-          ? modelLoadError(new Error(msgStr))
-          : modelInferenceError(new Error(msgStr));
-        reject(err);
-        worker.terminate();
-        break;
-      }
-    }
-  };
-
-  worker.onerror = (err) => {
-    clearTimeout(timeoutTimer);
-    reject(workerCrashError("大模型", err));
-    worker.terminate();
-  };
-
-  worker.postMessage({
-    question,
-    contextChunks,
-    history: options.history,
-    historySummary: options.historySummary,
-  });
-  // 发出请求后开始第一轮空闲计时（覆盖模型加载阶段，加载进度消息会持续重置）
-  armTimeout();
-
-  return {
-    promise,
-    cancel: () => {
-      clearTimeout(timeoutTimer);
-      worker.terminate();
+  const handle = callWorkerStreaming(
+    {
+      question,
+      contextChunks,
+      history: options.history,
+      historySummary: options.historySummary,
     },
-  };
+    {
+      onLoadProgress: callbacks.onLoadProgress,
+      onGenerating: callbacks.onGenerating,
+      onToken: (text: string) => splitter(text),
+    },
+  );
+
+  // 错误重分类：共享 worker 统一抛 modelInferenceError，
+  // 这里根据原始错误消息重新判断是加载失败（内存/网络/文件）还是推理失败
+  const promise = handle.promise.catch((err: Error) => {
+    // 从 AppError 的 cause 中取原始错误消息
+    const causeMsg =
+      err.name === "AppError" && err.cause instanceof Error
+        ? err.cause.message
+        : err.message;
+    const lower = causeMsg.toLowerCase();
+
+    if (
+      lower.includes("memory") ||
+      lower.includes("allocation") ||
+      lower.includes("oom") ||
+      lower.includes("fetch") ||
+      lower.includes("not found") ||
+      lower.includes("404") ||
+      lower.includes("network")
+    ) {
+      throw modelLoadError(new Error(causeMsg));
+    }
+    // 已经是 AppError（model-inference / worker-timeout / worker-crash）直接透传
+    throw err;
+  });
+
+  return { promise, cancel: handle.cancel };
 }
 
 /**
  * 调用本地模型生成滚动摘要（非流式）。
+ * 复用共享常驻 LLM Worker（split/evaluate/summarize/generate 同一实例，模型只加载一次）。
  * 失败时抛出异常，由调用方决定是否放弃本轮压缩（不阻断问答）。
  */
 export function summarizeHistory(
   text: string,
   onLoadProgress?: (progress: number) => void,
 ): Promise<string> {
-  const worker = new LlmWorker();
-
-  return new Promise<string>((resolve, reject) => {
-    let timeoutTimer: ReturnType<typeof setTimeout>;
-    const armTimeout = () => {
-      clearTimeout(timeoutTimer);
-      timeoutTimer = setTimeout(() => {
-        worker.terminate();
-        reject(workerTimeoutError("大模型", LLM_IDLE_TIMEOUT));
-      }, LLM_IDLE_TIMEOUT);
-    };
-
-    worker.onmessage = (e: MessageEvent) => {
-      armTimeout();
-      const msg = e.data;
-      if (msg.type === "load-progress") {
-        onLoadProgress?.(msg.progress);
-      } else if (msg.type === "done") {
-        clearTimeout(timeoutTimer);
-        const cleaned = stripThinkTags(String(msg.text || "")).trim();
-        worker.terminate();
-        resolve(cleaned);
-      } else if (msg.type === "error") {
-        clearTimeout(timeoutTimer);
-        worker.terminate();
-        reject(modelInferenceError(new Error(msg.error || "摘要生成失败")));
-      }
-    };
-
-    worker.onerror = (err) => {
-      clearTimeout(timeoutTimer);
-      worker.terminate();
-      reject(workerCrashError("大模型", err));
-    };
-
-    worker.postMessage({ type: "summarize", text });
-    armTimeout();
-  });
+  return callWorker({ type: "summarize", text }, onLoadProgress);
 }

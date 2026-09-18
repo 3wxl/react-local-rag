@@ -6,11 +6,13 @@ import {
   searchTopK,
   unloadEmbeddingModel,
 } from "./utils/embeddingClient";
+import { disposeSharedLlmWorker } from "./agent/agentPlanner";
 import {
   generateAnswer,
   summarizeHistory,
-  type GenerateHandle,
 } from "./utils/generateAnswer";
+import { runSelfRagAgent } from "./agent/agentRunner";
+import type { AgentStep } from "./agent/types";
 import {
   buildPromptHistory,
   planHistoryCompression,
@@ -35,6 +37,7 @@ import { EmptyState } from "./components/EmptyState";
 import { WelcomeState } from "./components/WelcomeState";
 import { PerfPanel } from "./components/PerfPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { useAgentSettings } from "./agent/useAgentSettings";
 
 /** 允许上传的文档后缀 */
 const DOC_SUFFIX_RE = /\.(pdf|txt|md|markdown|mdown|mkd|docx)$/i;
@@ -59,6 +62,7 @@ function App() {
 
   const { theme, setTheme } = useTheme();
   const [topK, setTopK] = useTopK();
+  const [agentSettings, setAgentSettings] = useAgentSettings();
 
   /* 仅容器层保留的运行态 */
   const [input, setInput] = useState("");
@@ -70,7 +74,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const currentHandleRef = useRef<GenerateHandle | null>(null);
+  const currentHandleRef = useRef<{ cancel: () => void } | null>(null);
 
   /* ---------- 空闲自动卸载向量模型，减少浏览器内存占用 ---------- */
   /** 空闲多久后自动卸载向量模型（5 分钟） */
@@ -87,7 +91,9 @@ function App() {
       try {
         // 只释放模型权重，保留索引缓存（下次检索无需重新向量化）
         await unloadEmbeddingModel(false);
-        console.log("[空闲] 向量模型已自动卸载释放内存");
+        // 同时释放常驻 LLM Worker（split/evaluate/summarize 共享实例）
+        disposeSharedLlmWorker();
+        console.log("[空闲] 向量模型 + LLM Worker 已自动卸载释放内存");
       } catch (err) {
         console.error("空闲卸载失败", err);
       } finally {
@@ -105,8 +111,10 @@ function App() {
     try {
       const tUnload = startTimer("unload");
       await unloadEmbeddingModel(true);
+      // 同时释放常驻 LLM Worker
+      disposeSharedLlmWorker();
       tUnload.done();
-      alert("向量模型已释放，下次提问时会自动重新加载");
+      alert("向量模型 + LLM Worker 已释放，下次提问时会自动重新加载");
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     } catch (err) {
       console.error(err);
@@ -167,15 +175,16 @@ function App() {
         }));
 
         attachDocument(convId, file.name, vecChunks);
+        setDocLoading("");
       } catch (err) {
         console.error(err);
         // AppError 有 userMessage + hint，直接展示友好提示
         const appErr = err as Partial<AppError>;
         const hint = appErr?.hint ? `\n${appErr.hint}` : "";
-        setDocLoading(appErr?.userMessage || "文档处理失败" + hint);
+        setDocLoading((appErr?.userMessage || "文档处理失败") + hint);
+        // 错误提示停留片刻；勿在 finally 里立刻清空，否则用户看不到
         setTimeout(() => setDocLoading(""), 4000);
       } finally {
-        setDocLoading("");
         resetIdleTimer();
       }
     },
@@ -233,6 +242,11 @@ function App() {
       thinking: "",
       status: "pending",
       createdAt: now + 1,
+      // 回答来源标记：local-rag + enableSelfRag → Self-RAG Agent；其余走普通 RAG
+      answerSource:
+        agentSettings.agentMode === "local-rag" && agentSettings.enableSelfRag
+          ? "self-rag"
+          : "normal-rag",
     };
 
     addMessages(convId, [userMsg, assistantMsg], text);
@@ -270,76 +284,156 @@ function App() {
       // 进入 Prompt 的最近对话（永远只取标记后的最近 4 条，Prompt 长度有上界）
       const historyTurns = buildPromptHistory(prevMessages, historyMarker);
 
-      // 1. 混合检索（向量相似度 + BM25 加权；向量不可用时自动降级纯 BM25）
-      patchMessage(convId, assistantMsg.id, { status: "retrieving" });
-      const tSearch = startTimer("search");
-      const { mode: searchMode, hits: resultChunks } = await searchTopK(
-        activeConv.id,
-        text,
-        topK,
-      );
-      tSearch.done({ topK, hitCount: resultChunks.length, mode: searchMode });
-      const ctx = resultChunks.map((item) => item.content).join("\n\n");
+      // ── Agent 模式分支 ──
+      // local-rag 模式下按 enableSelfRag 选择 Self-RAG Agent 或原有流水线；
+      // hybrid-agent / cloud-only 阶段二实现，暂时降级走普通本地 RAG（原有流水线）
+      const useSelfRag =
+        agentSettings.agentMode === "local-rag" && agentSettings.enableSelfRag;
 
-      // 2. 调用 worker 流式生成
-      let llmLoaded = false;
-      const tInfer = startTimer("llm-infer");
-      const handle = generateAnswer(
-        text,
-        resultChunks.map((i) => i.content),
-        {
-          onLoadProgress: (progress) => {
-            if (!llmLoaded) {
-              llmLoaded = true;
-              startTimer("llm-load").done({ progress: Math.round(progress) });
-            }
-            setLoadProgress(progress);
-            patchMessage(convId, assistantMsg.id, {
-              status: "loading-model",
-            });
-          },
-          onGenerating: () => {
-            patchMessage(convId, assistantMsg.id, { status: "thinking" });
-          },
-          onThinking: (delta) => {
-            patchMessage(convId, assistantMsg.id, { status: "thinking" });
-            appendToMessage(convId, assistantMsg.id, "thinking", delta);
-          },
-          onToken: (delta) => {
-            patchMessage(convId, assistantMsg.id, {
-              status: "generating",
-              context: ctx,
-            });
-            appendToMessage(convId, assistantMsg.id, "content", delta);
-          },
-        },
-        { history: historyTurns, historySummary },
-      );
-      currentHandleRef.current = handle;
+      if (useSelfRag) {
+        // Self-RAG Agent 分支：拆分 → 检索 → 充足性判断 → 生成（步骤经 onStep 实时写入消息）
+        patchMessage(convId, assistantMsg.id, {
+          status: "thinking",
+          agentSteps: [],
+        });
+        const liveSteps: AgentStep[] = [];
+        let llmLoaded = false;
+        const tInfer = startTimer("llm-infer");
 
-      const rawFinal = await handle.promise;
-      tInfer.done({ tokens: rawFinal?.length || 0 });
-      // 清洗最终文本中可能残留的 think 块
-      const finalText = stripThinkTags(rawFinal || "");
-      patchMessage(convId, assistantMsg.id, {
-        status: "verifying",
-        content: finalText,
-        context: ctx,
-      });
+        const handle = runSelfRagAgent(
+          convId,
+          text,
+          {
+            onLoadProgress: (progress) => {
+              if (!llmLoaded) {
+                llmLoaded = true;
+                startTimer("llm-load").done({ progress: Math.round(progress) });
+              }
+              setLoadProgress(progress);
+              patchMessage(convId, assistantMsg.id, { status: "loading-model" });
+            },
+            onGenerating: () => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+            },
+            onThinking: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+              appendToMessage(convId, assistantMsg.id, "thinking", delta);
+            },
+            onToken: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "generating" });
+              appendToMessage(convId, assistantMsg.id, "content", delta);
+            },
+            onStep: (step) => {
+              liveSteps.push(step);
+              const status =
+                step.type === "retrieve"
+                  ? "retrieving"
+                  : step.type === "generate"
+                    ? "generating"
+                    : "thinking";
+              patchMessage(convId, assistantMsg.id, {
+                agentSteps: [...liveSteps],
+                status,
+              });
+            },
+          },
+          {
+            topK,
+            history: historyTurns,
+            historySummary,
+          },
+        );
+        currentHandleRef.current = handle;
 
-      // 幻觉后处理：纯 JS/向量数学校验每句话能否在文档中找到依据（不调用大模型）
-      try {
-        const tVerify = startTimer("verify");
-        const verification = await verifyAnswer(convId, finalText, ctx);
-        tVerify.done({ sentences: verification?.sentences?.length || 0 });
+        const result = await handle.promise;
+        tInfer.done({
+          tokens: result.answer?.length || 0,
+          iterations: result.iterations,
+        });
+        const ctx = result.chunks.join("\n\n");
         patchMessage(convId, assistantMsg.id, {
           status: "done",
-          verification,
+          content: stripThinkTags(result.answer || ""),
+          context: ctx,
+          verification: result.verification,
+          agentSteps: result.steps,
         });
-      } catch (verifyErr) {
-        // 校验本身异常不影响答案展示
-        console.error("答案依据校验失败", verifyErr);
-        patchMessage(convId, assistantMsg.id, { status: "done" });
+      } else {
+        // 普通本地 RAG 分支（原有流水线）：单次检索 → 流式生成 → 校验
+        patchMessage(convId, assistantMsg.id, { status: "retrieving" });
+        const tSearch = startTimer("search");
+        const { mode: searchMode, hits: resultChunks } = await searchTopK(
+          activeConv.id,
+          text,
+          topK,
+        );
+        tSearch.done({ topK, hitCount: resultChunks.length, mode: searchMode });
+        const ctx = resultChunks.map((item) => item.content).join("\n\n");
+
+        // 检索完成后暂时卸载向量模型，给 LLM（~300–400MB）腾出堆内存；
+        // 后续 verifyAnswer 会按需重新加载，索引仍保留在 worker 外的 IDB。
+        try {
+          await unloadEmbeddingModel(false);
+        } catch {
+          /* 卸载失败不阻断生成 */
+        }
+
+        let llmLoaded = false;
+        const tInfer = startTimer("llm-infer");
+        const handle = generateAnswer(
+          text,
+          resultChunks.map((i) => i.content),
+          {
+            onLoadProgress: (progress) => {
+              if (!llmLoaded) {
+                llmLoaded = true;
+                startTimer("llm-load").done({ progress: Math.round(progress) });
+              }
+              setLoadProgress(progress);
+              patchMessage(convId, assistantMsg.id, {
+                status: "loading-model",
+              });
+            },
+            onGenerating: () => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+            },
+            onThinking: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+              appendToMessage(convId, assistantMsg.id, "thinking", delta);
+            },
+            onToken: (delta) => {
+              patchMessage(convId, assistantMsg.id, {
+                status: "generating",
+                context: ctx,
+              });
+              appendToMessage(convId, assistantMsg.id, "content", delta);
+            },
+          },
+          { history: historyTurns, historySummary },
+        );
+        currentHandleRef.current = handle;
+
+        const rawFinal = await handle.promise;
+        tInfer.done({ tokens: rawFinal?.length || 0 });
+        const finalText = stripThinkTags(rawFinal || "");
+        patchMessage(convId, assistantMsg.id, {
+          status: "verifying",
+          content: finalText,
+          context: ctx,
+        });
+
+        try {
+          const tVerify = startTimer("verify");
+          const verification = await verifyAnswer(convId, finalText, ctx);
+          tVerify.done({ sentences: verification?.sentences?.length || 0 });
+          patchMessage(convId, assistantMsg.id, {
+            status: "done",
+            verification,
+          });
+        } catch (verifyErr) {
+          console.error("答案依据校验失败", verifyErr);
+          patchMessage(convId, assistantMsg.id, { status: "done" });
+        }
       }
     } catch (err: any) {
       console.error(err);
@@ -348,7 +442,7 @@ function App() {
       const hint = appErr?.hint ? `\n${appErr.hint}` : "";
       patchMessage(convId, assistantMsg.id, {
         status: "error",
-        error: appErr?.userMessage || err?.message || "生成失败" + hint,
+        error: (appErr?.userMessage || err?.message || "生成失败") + hint,
       });
     } finally {
       currentHandleRef.current = null;
@@ -361,6 +455,7 @@ function App() {
     busy,
     activeConv,
     topK,
+    agentSettings,
     addMessages,
     patchConversation,
     patchMessage,
@@ -492,6 +587,8 @@ function App() {
         onClose={() => setSettingsOpen(false)}
         topK={topK}
         onTopKChange={setTopK}
+        agentSettings={agentSettings}
+        onAgentSettingsChange={setAgentSettings}
       />
     </div>
   );

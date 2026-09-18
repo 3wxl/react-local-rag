@@ -47,6 +47,7 @@ function checkMemoryBudget(): boolean {
   const mem = (performance as any).memory;
   if (!mem) return true; // 无法检测，放行
   // jsHeapSizeLimit：浏览器分配给 JS 堆的上限；usedJSHeapSize：当前已用
+  // 注意：WASM/ArrayBuffer 往往不计入 usedJSHeapSize，此检查只能粗筛，不能保证加载成功
   const available = mem.jsHeapSizeLimit - mem.usedJSHeapSize;
   // Qwen 0.5B q4 约需 300~400MB，阈值设 450MB 给余量
   return available > 450 * 1024 * 1024;
@@ -65,8 +66,9 @@ self.onmessage = async (e: MessageEvent) => {
 
   // 历史摘要压缩模式：非流式、低温、短输出，产出滚动摘要
   if (data.type === "summarize" && typeof data.text === "string") {
+    const id = data.id;
     try {
-      self.postMessage({ type: "loading" });
+      self.postMessage({ type: "loading", id });
       const generator = await getGenerator(() => {});
       const summaryPrompt = `<|im_start|>system
 你是对话压缩助手。把用户提供的历史对话（可能包含一段已有摘要和新增对话）压缩成一段连贯的中文摘要，只保留：用户的关键问题、已确认的结论、重要数字与专有名词、尚未解决的问题。要求：不要新增信息、不要分点罗列、不要寒暄，直接输出摘要正文，300字以内。<|im_end|>
@@ -81,10 +83,90 @@ ${data.text}<|im_end|>
       });
       self.postMessage({
         type: "done",
+        id,
         text: String(output[0].generated_text ?? "").trim(),
       });
     } catch (err: any) {
-      self.postMessage({ type: "error", error: err?.message || String(err) });
+      self.postMessage({ type: "error", id, error: err?.message || String(err) });
+    }
+    return;
+  }
+
+  // 子问题拆分模式：非流式、低温，输出 JSON 数组
+  if (data.type === "split" && typeof data.text === "string") {
+    const id = data.id;
+    try {
+      self.postMessage({ type: "loading", id });
+      const generator = await getGenerator(() => {});
+      const splitPrompt = `<|im_start|>system
+你是一个问题拆分助手。把用户的问题拆分成最多 3 个独立的子问题，用于后续检索。
+
+规则：
+1. 最多 3 个子问题，能不拆就不拆
+2. 每个子问题必须是完整、独立可检索的短句
+3. 只输出 JSON 数组，不要解释、不要寒暄
+
+示例：
+问："对比文档中 A 产品和 B 产品的性能差异"
+输出：["A 产品的性能指标","B 产品的性能指标","A 产品与 B 产品的性能对比"]<|im_end|>
+<|im_start|>user
+${data.text}<|im_end|>
+<|im_start|>assistant
+`;
+      const output = await generator(splitPrompt, {
+        max_new_tokens: 256,
+        do_sample: false,
+        return_full_text: false,
+      });
+      self.postMessage({
+        type: "done",
+        id,
+        text: String(output[0].generated_text ?? "").trim(),
+      });
+    } catch (err: any) {
+      self.postMessage({ type: "error", id, error: err?.message || String(err) });
+    }
+    return;
+  }
+
+  // 信息充足性判断模式：非流式、低温，只输出「足够」或「不足」
+  if (
+    data.type === "evaluate" &&
+    typeof data.text === "string" &&
+    Array.isArray(data.contextChunks)
+  ) {
+    const id = data.id;
+    try {
+      self.postMessage({ type: "loading", id });
+      const generator = await getGenerator(() => {});
+      const context = (data.contextChunks as string[]).join("\n");
+      const evalPrompt = `<|im_start|>system
+你是信息充足性判断助手。根据【检索到的文档片段】，判断是否能完整回答用户的问题。
+
+规则：
+1. 只能输出「足够」或「不足」两个词之一
+2. 片段包含回答问题所需的关键信息 → 输出「足够」
+3. 片段缺失关键信息、只有部分内容、或与问题不相关 → 输出「不足」
+4. 禁止输出其他任何文字<|im_end|>
+<|im_start|>user
+【用户问题】
+${data.text}
+【检索到的文档片段】
+${context}<|im_end|>
+<|im_start|>assistant
+`;
+      const output = await generator(evalPrompt, {
+        max_new_tokens: 32,
+        do_sample: false,
+        return_full_text: false,
+      });
+      self.postMessage({
+        type: "done",
+        id,
+        text: String(output[0].generated_text ?? "").trim(),
+      });
+    } catch (err: any) {
+      self.postMessage({ type: "error", id, error: err?.message || String(err) });
     }
     return;
   }
@@ -116,13 +198,14 @@ ${data.text}<|im_end|>
     history?: { role: "user" | "assistant"; content: string }[];
     historySummary?: string;
   };
+  const id = data.id;
 
   try {
     // 通知主线程：开始加载模型
-    self.postMessage({ type: "loading" });
+    self.postMessage({ type: "loading", id });
 
     const generator = await getGenerator((progress) => {
-      self.postMessage({ type: "load-progress", progress });
+      self.postMessage({ type: "load-progress", progress, id });
     }); //模型加载完成之后，generator 就是 transformers 的 pipeline 实例，用来做文本生成。
 
     const context = contextChunks.join("\n"); //把检索出来的多个文档切片，用换行拼接成一整段文本，放进 prompt 作为参考文档。
@@ -149,7 +232,7 @@ ${question}<|im_end|>
 `;
 
     // 通知：模型已加载完成，准备生成
-    self.postMessage({ type: "generating" });
+    self.postMessage({ type: "generating", id });
 
     const streamer = new TextStreamer(generator.tokenizer, {
       //`TextStreamer`：transformers.js 的流式输出工具。
@@ -157,8 +240,7 @@ ${question}<|im_end|>
       skip_special_tokens: true, //`skip_special_tokens:true`：过滤掉 `<|im_start|>`、`<|im_end|>` 这类模型特殊标记，不展示给用户
       callback_function: (text: string) => {
         // 直接把原始 token 转发给主线程，由主线程解析 think 标签
-        console.log("模型流式原始token：", JSON.stringify(text));
-        self.postMessage({ type: "token", text });
+        self.postMessage({ type: "token", text, id });
       },
     });
 
@@ -171,9 +253,9 @@ ${question}<|im_end|>
     });
 
     const finalText: string = output[0].generated_text;
-    self.postMessage({ type: "done", text: finalText });
+    self.postMessage({ type: "done", id, text: finalText });
   } catch (err: any) {
-    self.postMessage({ type: "error", error: err?.message || String(err) });
+    self.postMessage({ type: "error", id, error: err?.message || String(err) });
   }
 };
 

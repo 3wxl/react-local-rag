@@ -73,7 +73,15 @@ async function parseTxt(
     reader.onload = () => {
       const cleaned = cleanText(reader.result as string);
       if (!cleaned) {
-        reject(pdfParseError(new Error("文本文件内容为空")));
+        reject(
+          pdfParseError(
+            new Error(
+              file.size === 0
+                ? "文本文件为空（0 字节）"
+                : "文本文件内容为空（仅空白字符）",
+            ),
+          ),
+        );
         return;
       }
       onPageText(cleaned);
@@ -83,6 +91,22 @@ async function parseTxt(
       reject(pdfParseError(new Error("文本文件读取失败")));
     reader.readAsText(file);
   });
+}
+
+/**
+ * 去掉 YAML front matter（文件开头 --- ... ---），兼容 CRLF。
+ * 仅当首行是 `---` 且块内像 YAML（含 key: value）或为空时才剥离，
+ * 避免把正文水平分割线误删成空文档。
+ */
+function stripMarkdownFrontMatter(text: string): string {
+  const normalized = text.replace(/^\uFEFF/, ""); // UTF-8 BOM
+  const m = normalized.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!m) return normalized;
+  const body = m[1];
+  if (body.trim() === "" || /^[\w-]+\s*:/m.test(body)) {
+    return normalized.slice(m[0].length);
+  }
+  return normalized;
 }
 
 /**
@@ -96,18 +120,24 @@ async function parseMarkdown(
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const raw = reader.result as string;
-      // 去掉 HTML 注释与 front matter（--- 包围的元数据块）
+      const raw = String(reader.result ?? "");
+      // 去掉 HTML 注释与 YAML front matter
       const noComment = raw.replace(/<!--[\s\S]*?-->/g, "");
-      const noFrontMatter = noComment.replace(/^---\n[\s\S]*?\n---\n?/, "");
+      const noFrontMatter = stripMarkdownFrontMatter(noComment);
       const cleaned = noFrontMatter
-        .split("\n")
+        .split(/\r?\n/)
         .map((line) => line.replace(/\s+$/g, "")) // 去行尾空白
         .join("\n")
         .replace(/\n{3,}/g, "\n\n") // 压缩多余空行
         .trim();
       if (!cleaned) {
-        reject(pdfParseError(new Error("Markdown 文件内容为空")));
+        const hint =
+          file.size === 0
+            ? "Markdown 文件为空（0 字节）"
+            : raw.trim().length > 0
+              ? "Markdown 清洗后无正文（可能仅含 front matter / HTML 注释）"
+              : "Markdown 文件内容为空";
+        reject(pdfParseError(new Error(hint)));
         return;
       }
       onPageText(cleaned);
@@ -115,7 +145,8 @@ async function parseMarkdown(
     };
     reader.onerror = () =>
       reject(pdfParseError(new Error("Markdown 文件读取失败")));
-    reader.readAsText(file, "utf-8");
+    // 不强制 utf-8：按 BOM / 浏览器默认解码，避免编码标注导致误读
+    reader.readAsText(file);
   });
 }
 

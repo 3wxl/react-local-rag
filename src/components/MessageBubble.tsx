@@ -1,11 +1,14 @@
 import { useState } from "react";
-import type { ChatMessage } from "../types/chat";
+import type { AnswerSource, ChatMessage } from "../types/chat";
 import { statusToTip } from "../utils/chat";
 import { splitSentences, type VerificationResult } from "../utils/verifyAnswer";
+import { AgentStepPanel } from "./AgentStepPanel";
 import { Spinner } from "./Spinner";
 import {
+  AiIcon,
   CheckCircleIcon,
   ChevronRightIcon,
+  DocIcon,
   RobotIcon,
   UserIcon,
   WarningIcon,
@@ -16,6 +19,28 @@ interface MessageBubbleProps {
   /** 模型加载进度，仅最后一条助手消息需要 */
   loadProgress: number;
   busy: boolean;
+}
+
+/**
+ * 回答来源标记：区分普通 RAG 回答 / Self-RAG Agent 回答。
+ * 普通 RAG：灰底文档图标 + "普通 RAG"。
+ * Self-RAG：强调色底 + AiIcon + "Self-RAG Agent"，醒目区分多轮检索-判断链路。
+ */
+function AnswerSourceBadge({ source }: { source: AnswerSource }) {
+  if (source === "self-rag") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-accent/10 text-accent border border-accent/30">
+        <AiIcon className="w-3 h-3" />
+        Self-RAG Agent
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-bg-hover text-ink-muted border border-line">
+      <DocIcon className="w-3 h-3" />
+      普通 RAG
+    </span>
+  );
 }
 
 /** 思考中三点动画 */
@@ -209,8 +234,13 @@ export function MessageBubble({
   const tip = statusToTip(message.status, loadProgress);
   const hasThinking = (message.thinking || "").trim().length > 0;
   const hasContent = (message.content || "").trim().length > 0;
+  const hasAgentSteps = (message.agentSteps?.length ?? 0) > 0;
+  // 有 Agent 步骤时优先展示步骤面板；模型 think 标签内容仍可单独折叠展示
   const showThinking =
-    hasThinking || message.status === "thinking" || (isStreaming && !hasContent);
+    !hasAgentSteps &&
+    (hasThinking ||
+      message.status === "thinking" ||
+      (isStreaming && !hasContent));
 
   return (
     <div className="flex gap-3">
@@ -226,8 +256,24 @@ export function MessageBubble({
       </div>
 
       <div className="flex-1 min-w-0">
-        {/* 思考过程 */}
-        {showThinking && <ThinkingBlock message={message} />}
+        {/* 回答来源标记：普通 RAG / Self-RAG Agent */}
+        {message.answerSource && (
+          <div className="mb-1.5">
+            <AnswerSourceBadge source={message.answerSource} />
+          </div>
+        )}
+
+        {/* Self-RAG / Agent 思考步骤链 */}
+        {hasAgentSteps && (
+          <div className="mb-2">
+            <AgentStepPanel steps={message.agentSteps!} />
+          </div>
+        )}
+
+        {/* 模型内部 think 标签（无 Agent 步骤时，或 Agent 生成阶段有思考文本时） */}
+        {(showThinking || (hasAgentSteps && hasThinking)) && (
+          <ThinkingBlock message={message} />
+        )}
 
         {/* 状态横幅（尚无答案内容时） */}
         {!hasContent && tip && (
