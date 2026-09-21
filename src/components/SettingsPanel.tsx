@@ -5,8 +5,13 @@ import type { AgentSettings } from "../agent/useAgentSettings";
 import {
   validateCloudConfig,
   DEFAULT_CLOUD_BASE_URL,
+  DEFAULT_CLOUD_MODEL,
+  DEFAULT_CLOUD_UPSTREAM_URL,
+  CLOUD_PROVIDER_PRESETS,
+  matchCloudProvider,
 } from "../agent/useAgentSettings";
 import type { AgentMode } from "../agent/types";
+import { requestCloudPlanner } from "../agent/cloudPlanner";
 
 interface SettingsPanelProps {
   open: boolean;
@@ -45,7 +50,16 @@ export function SettingsPanel({
 
   if (!open) return null;
 
-  const { agentMode, enableSelfRag, cloudApiKey, cloudBaseUrl } = agentSettings;
+  const {
+    agentMode,
+    enableSelfRag,
+    cloudApiKey,
+    cloudBaseUrl,
+    cloudUpstreamUrl,
+    cloudModel,
+  } = agentSettings;
+
+  const activeProvider = matchCloudProvider(cloudUpstreamUrl);
 
   // 仅纯本地 RAG 模式显示 Self-RAG 复选框
   const showSelfRag = agentMode === "local-rag";
@@ -54,31 +68,60 @@ export function SettingsPanel({
   // 纯云端才显示隐私提示
   const showCloudOnlyHint = agentMode === "cloud-only";
 
-  // 云端连通性测试：发一个最简 models 请求
+  // 云端连通性测试：走本机代理；上游由 X-Upstream-Base-Url 按请求切换，无需重启代理。
   const runConnectivityTest = async () => {
+    const missing = validateCloudConfig(agentSettings).missing;
+    if (missing.length > 0) {
+      setTesting("fail");
+      setTestMsg(`缺少：${missing.join("、")}`);
+      return;
+    }
+    const base = cloudBaseUrl.trim().toLowerCase();
+    if (
+      base.includes("api.openai.com") ||
+      base.includes("api.deepseek.com") ||
+      base.includes("api.anthropic.com") ||
+      base.includes("dashscope.aliyuncs.com") ||
+      base.includes("api.moonshot.cn") ||
+      base.includes("api.siliconflow.cn")
+    ) {
+      setTesting("fail");
+      setTestMsg(
+        `「代理地址」请填 ${DEFAULT_CLOUD_BASE_URL}（先 npm run proxy）；真实厂商请在「上游服务」里选`,
+      );
+      return;
+    }
     setTesting("testing");
     setTestMsg("");
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
-      const url = `${cloudBaseUrl.replace(/\/$/, "")}/models`;
-      const resp = await fetch(url, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${cloudApiKey}` },
-        signal: ctrl.signal,
-      });
-      clearTimeout(timer);
-      if (resp.ok) {
-        setTesting("ok");
-        setTestMsg("连通成功");
-      } else {
-        setTesting("fail");
-        setTestMsg(`HTTP ${resp.status}${resp.status === 401 ? "（API Key 无效）" : ""}`);
-      }
-    } catch (e) {
-      setTesting("fail");
-      setTestMsg(e instanceof Error ? e.message : "请求失败");
+    const result = await requestCloudPlanner(
+      "测试",
+      { hitCount: 0, topScore: 0, mode: "hybrid" },
+      [],
+      {
+        apiKey: cloudApiKey,
+        baseUrl: cloudBaseUrl,
+        upstreamBaseUrl: cloudUpstreamUrl,
+        model: cloudModel,
+      },
+      { timeoutMs: 20_000 },
+    );
+    if (!result.fallback) {
+      setTesting("ok");
+      setTestMsg(
+        `连通成功${activeProvider ? `（${activeProvider.label}）` : ""}`,
+      );
+      return;
     }
+    setTesting("fail");
+    const reasonMap: Record<string, string> = {
+      config: "配置缺失",
+      timeout: `请求超时：请确认已 npm run proxy，代理地址为 ${DEFAULT_CLOUD_BASE_URL}`,
+      network: "网络故障：代理未启动或端口不对（请先 npm run proxy）",
+      auth: "API Key 无效：须与上方所选上游厂商匹配（DeepSeek Key≠百炼 Key）",
+      http: `HTTP 异常${result.httpStatus ? `（${result.httpStatus}）` : ""}`,
+      format: "返回格式异常（上游模型未输出合法路由指令）",
+    };
+    setTestMsg(reasonMap[result.fallbackReason ?? ""] ?? "未知错误");
   };
 
   return (
@@ -164,9 +207,66 @@ export function SettingsPanel({
           {/* ── 云端配置区（仅混合 Agent 模式） ── */}
           {showCloudConfig && (
             <div className="space-y-3 rounded-lg border border-line p-3">
+              {/* 厂商一键切换：写上游 URL + 默认模型，无需重启代理 */}
+              <div>
+                <label className="text-xs font-medium text-ink-muted block mb-1.5">
+                  上游服务（OpenAI 兼容）
+                </label>
+                <div className="flex flex-wrap gap-1.5">
+                  {CLOUD_PROVIDER_PRESETS.map((p) => {
+                    const active = activeProvider?.id === p.id;
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() =>
+                          onAgentSettingsChange({
+                            cloudUpstreamUrl: p.upstreamUrl,
+                            cloudModel: p.models[0],
+                            cloudBaseUrl: DEFAULT_CLOUD_BASE_URL,
+                          })
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-xs border transition ${
+                          active
+                            ? "border-accent bg-accent/15 text-accent font-medium"
+                            : "border-line text-ink-muted hover:border-accent hover:text-accent"
+                        }`}
+                      >
+                        {p.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] text-ink-faint mt-1.5 leading-relaxed">
+                  点选厂商即可切换；代理只需启动一次（
+                  <code className="text-accent">npm run proxy</code>
+                  ），按请求头转发，不必改环境变量重启。
+                </p>
+              </div>
+
               <div>
                 <label className="text-xs font-medium text-ink-muted block mb-1">
-                  API Key
+                  上游地址
+                </label>
+                <input
+                  type="url"
+                  value={cloudUpstreamUrl}
+                  onChange={(e) =>
+                    onAgentSettingsChange({ cloudUpstreamUrl: e.target.value })
+                  }
+                  placeholder={DEFAULT_CLOUD_UPSTREAM_URL}
+                  className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink font-mono focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-ink-faint mt-1 leading-relaxed">
+                  {activeProvider
+                    ? activeProvider.keyHint
+                    : "自定义上游须在代理白名单内，或设置 ALLOWED_UPSTREAM_HOSTS"}
+                </p>
+              </div>
+
+              <div>
+                <label className="text-xs font-medium text-ink-muted block mb-1">
+                  API Key（须与上方厂商匹配）
                 </label>
                 <input
                   type="password"
@@ -178,9 +278,10 @@ export function SettingsPanel({
                   className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent"
                 />
               </div>
+
               <div>
                 <label className="text-xs font-medium text-ink-muted block mb-1">
-                  Base URL
+                  代理地址
                 </label>
                 <input
                   type="url"
@@ -191,7 +292,67 @@ export function SettingsPanel({
                   placeholder={DEFAULT_CLOUD_BASE_URL}
                   className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent"
                 />
+                <p className="text-[11px] text-ink-faint mt-1 leading-relaxed">
+                  固定填{" "}
+                  <code className="text-accent">{DEFAULT_CLOUD_BASE_URL}</code>
+                  ，不要填云端域名。
+                </p>
               </div>
+
+              <div>
+                <label className="text-xs font-medium text-ink-muted block mb-1">
+                  模型名
+                </label>
+                <input
+                  type="text"
+                  value={cloudModel}
+                  onChange={(e) =>
+                    onAgentSettingsChange({ cloudModel: e.target.value })
+                  }
+                  placeholder={DEFAULT_CLOUD_MODEL}
+                  list="cloud-model-presets"
+                  className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent"
+                />
+                <datalist id="cloud-model-presets">
+                  {CLOUD_PROVIDER_PRESETS.flatMap((g) => g.models).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+                <div className="mt-2 space-y-2 rounded-lg bg-bg-hover/50 px-2.5 py-2">
+                  {(activeProvider
+                    ? [activeProvider]
+                    : CLOUD_PROVIDER_PRESETS
+                  ).map((group) => (
+                    <div key={group.id}>
+                      <span className="text-[11px] font-medium text-ink block mb-1">
+                        {group.label} 可选模型
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.models.map((name) => {
+                          const active = cloudModel.trim() === name;
+                          return (
+                            <button
+                              key={name}
+                              type="button"
+                              onClick={() =>
+                                onAgentSettingsChange({ cloudModel: name })
+                              }
+                              className={`px-2 py-0.5 rounded-md text-[11px] font-mono border transition ${
+                                active
+                                  ? "border-accent bg-accent/15 text-accent"
+                                  : "border-line text-ink-muted hover:border-accent hover:text-accent"
+                              }`}
+                            >
+                              {name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
               <div className="flex items-center gap-2">
                 <button
                   onClick={runConnectivityTest}
@@ -207,9 +368,8 @@ export function SettingsPanel({
                   <span className="text-xs text-red-500">✗ {testMsg}</span>
                 )}
               </div>
-              {/* 隐私提示 */}
               <p className="text-[11px] text-amber-500/80 leading-relaxed">
-                ⚠️ 隐私提示：混合模式下，你的问题及检索片段会发送到云端 API 用于规划路由。本地文档全文不会上传。请确认你信任所配置的 API 提供方。
+                ⚠️ 隐私提示：混合模式下，问题会发送到所选云端上游用于规划路由。本地文档全文不会上传。
               </p>
             </div>
           )}
@@ -221,7 +381,7 @@ export function SettingsPanel({
                 ⚠️ 纯云端模式下，不读取本地已上传的文档，提问会直接发送到云端大模型。如需引用本地文档，请切换到「混合 Agent」或「纯本地 RAG」。
               </p>
               <p className="text-[11px] text-ink-faint mt-1">
-                Base URL: {cloudBaseUrl}
+                代理: {cloudBaseUrl} · 上游: {cloudUpstreamUrl}
               </p>
             </div>
           )}

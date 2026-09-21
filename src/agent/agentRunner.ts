@@ -8,8 +8,15 @@ import {
 import { verifyAnswer, type VerificationResult } from "../utils/verifyAnswer";
 import type { HistoryTurn } from "../utils/history";
 import { startTimer } from "../utils/perf";
+import {
+  requestCloudPlanner,
+  requestCloudAnswer,
+  type CloudPlannerConfig,
+  type CloudFallbackReason,
+} from "./cloudPlanner";
+import { mergeResult } from "./mergeResult";
 import { DEFAULT_AGENT_CONFIG } from "./types";
-import type { AgentStep } from "./types";
+import type { AgentStep, AgentStepOrigin, CloudAgentCommand } from "./types";
 
 /** runSelfRagAgent 最终产出 */
 export interface SelfRagAgentResult {
@@ -226,6 +233,304 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
       // 规划/判断阶段的 worker 是非流式短任务，会自行结束并被忽略结果；
       // 最终生成是长任务，立即终止
       genHandle?.cancel();
+    },
+  };
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ *  混合 Agent（阶段三）
+ *  本地轻量检索取信号（不取片段原文上云）→ 云端规划 → 三指令分支：
+ *    LOCAL_KNOWLEDGE  → runSelfRagAgent
+ *    GENERAL_KNOWLEDGE→ 云端直答（不读本地文档）；云端异常降级本地
+ *    MIXED            → 本地 Self-RAG 与云端通用问答并行，mergeResult 合并
+ *  规划器本身任何异常都会降级 LOCAL_KNOWLEDGE，因此最坏情况等价本地 Self-RAG。
+ * ────────────────────────────────────────────────────────────────── */
+
+/** runHybridAgent 最终产出 */
+export interface HybridAgentResult {
+  /** 云端规划器实际下发（或降级后采用）的指令 */
+  command: CloudAgentCommand;
+  /** 主答案文本：LOCAL/MIXED=本地答案；GENERAL=云端答案 */
+  answer: string;
+  /** 云端部分文本（MIXED 的拓展 / GENERAL 的全部），UI 须带「无本地依据」警示块 */
+  cloudContent?: string;
+  /** 本地部分的幻觉校验结果（纯云端时为 undefined，不执行校验） */
+  verification?: VerificationResult;
+  /** 本地实际使用的片段（context 展示；纯云端时为空数组） */
+  chunks: string[];
+  /** 完整步骤链 */
+  steps: AgentStep[];
+  /** 本地 Self-RAG 实际迭代轮数（纯云端为 0） */
+  iterations: number;
+  /** 云端规划是否降级（true=回退到本地链路） */
+  plannerFallback: boolean;
+  /** 规划降级原因（plannerFallback=true 时有值） */
+  plannerFallbackReason?: CloudFallbackReason;
+  /** 云端直答/拓展是否失败被忽略（MIXED 云端挂掉时为 true，仅交付本地部分） */
+  cloudFailed?: boolean;
+}
+
+export interface HybridAgentHandle {
+  promise: Promise<HybridAgentResult>;
+  cancel: () => void;
+}
+
+export interface HybridAgentOptions extends SelfRagOptions {
+  /** 云端连接配置（apiKey / baseUrl / model） */
+  cloud: CloudPlannerConfig;
+}
+
+export function runHybridAgent(
+  indexId: string,
+  question: string,
+  callbacks: SelfRagCallbacks = {},
+  options: HybridAgentOptions,
+): HybridAgentHandle {
+  const topK = options.topK ?? 3;
+
+  // 父级步骤链：子 Self-RAG 的步骤经 onStep 拦截后重新编号并打 origin 标记
+  const steps: AgentStep[] = [];
+  let stepSeq = 0;
+  const emit = (
+    step: Omit<AgentStep, "stepIndex" | "timestamp">,
+  ): AgentStep => {
+    const full: AgentStep = {
+      ...step,
+      stepIndex: ++stepSeq,
+      timestamp: Date.now(),
+    };
+    steps.push(full);
+    callbacks.onStep?.(full);
+    return full;
+  };
+
+  let cancelled = false;
+  let subHandle: SelfRagAgentHandle | null = null;
+  const cloudAbort = new AbortController();
+
+  const ensureAlive = () => {
+    if (cancelled) throw new Error("Agent 已取消");
+  };
+
+  /**
+   * 委托运行本地 Self-RAG，子步骤统一打上 origin 标记并入父链重新编号。
+   * 返回 SelfRag 的结果（steps 字段以父链为准，子结果内的 steps 仅备用）。
+   */
+  const runLocal = (origin: AgentStepOrigin): Promise<SelfRagAgentResult> => {
+    const handle = runSelfRagAgent(
+      indexId,
+      question,
+      {
+        onLoadProgress: callbacks.onLoadProgress,
+        onGenerating: callbacks.onGenerating,
+        onThinking: callbacks.onThinking,
+        onToken: callbacks.onToken,
+        onStep: (sub) => {
+          // 剥去子步骤自带的序号/时间，按父链重新编号并标记来源
+          const { stepIndex: _ignoredIdx, timestamp: _ignoredTs, ...rest } = sub;
+          void _ignoredIdx;
+          void _ignoredTs;
+          emit({ ...rest, origin });
+        },
+      },
+      {
+        topK,
+        maxIterations: options.maxIterations,
+        history: options.history,
+        historySummary: options.historySummary,
+      },
+    );
+    subHandle = handle;
+    return handle.promise;
+  };
+
+  /** 把本地 Self-RAG 结果映射为 Hybrid 结果 */
+  const fromLocal = (
+    command: CloudAgentCommand,
+    local: SelfRagAgentResult,
+    extra: Partial<HybridAgentResult> = {},
+  ): HybridAgentResult => ({
+    command,
+    answer: local.answer,
+    verification: local.verification,
+    chunks: local.chunks,
+    steps,
+    iterations: local.iterations,
+    plannerFallback: false,
+    ...extra,
+  });
+
+  const promise = (async (): Promise<HybridAgentResult> => {
+    // 1. 本地轻量检索：只用 RRF 分数构造数字信号，片段原文不进入云端请求
+    const search = await searchTopK(indexId, question, topK, {
+      onLoadProgress: callbacks.onLoadProgress,
+    });
+    ensureAlive();
+    const topHit = search.hits[0];
+    const signals = {
+      hitCount: search.hits.length,
+      topScore: topHit?.score ?? 0,
+      mode: search.mode,
+    };
+
+    // 2. 云端规划（任何失败内部已降级为 LOCAL_KNOWLEDGE，不抛异常）
+    const plan = await requestCloudPlanner(
+      question,
+      signals,
+      options.history ?? [],
+      options.cloud,
+    );
+    ensureAlive();
+    const rawCommand: CloudAgentCommand = plan.command;
+
+    // 保底修正：云端规划器只看到数字信号（红线：chunk 原文不能上传），
+    // 无法准确判断本地是否真有用户问的内容。若本地有命中却仍被路由到纯云端，
+    // 容易出现"用户问文档、云端答'你忘记附上文档了'"的尴尬。
+    // 命中数 > 0 时强制把 GENERAL_KNOWLEDGE 升级为 MIXED，
+    // 让本地 Self-RAG 必跑一遍给有依据的答案，云端再补充通用视角，分区合并。
+    const routingOverride =
+      rawCommand === "GENERAL_KNOWLEDGE" && signals.hitCount > 0
+        ? ("general-to-mixed" as const)
+        : undefined;
+    const command: CloudAgentCommand =
+      routingOverride === "general-to-mixed" ? "MIXED" : rawCommand;
+
+    emit({
+      type: "cloud-route",
+      origin: "cloud-plan",
+      subQuestion: question,
+      thinking:
+        `本地预检索（${signals.mode}）命中 ${signals.hitCount} 条，最高 RRF 分 ${signals.topScore.toFixed(4)}；` +
+        `云端规划指令：${rawCommand}` +
+        (plan.fallback
+          ? `（云端不可用，已降级本地，原因：${plan.fallbackReason}）`
+          : "") +
+        (routingOverride
+          ? `；本地有命中，强制升级为 MIXED 以保证本地答案参与`
+          : ""),
+    });
+
+    // 3. 三指令分支
+    if (command === "LOCAL_KNOWLEDGE") {
+      const local = await runLocal("local-selfrag");
+      return fromLocal(command, local, {
+        plannerFallback: plan.fallback,
+        plannerFallbackReason: plan.fallbackReason,
+      });
+    }
+
+    if (command === "GENERAL_KNOWLEDGE") {
+      emit({
+        type: "cloud-execute",
+        origin: "cloud-plan",
+        subQuestion: question,
+        thinking: "纯云端直答：不读取本地文档，等待云端通用知识回答…",
+      });
+      const cloud = await requestCloudAnswer(
+        question,
+        options.history ?? [],
+        options.cloud,
+        { mode: "general", externalSignal: cloudAbort.signal },
+      );
+      ensureAlive();
+
+      // 云端异常（超时/网络/key）→ 降级本地 Self-RAG
+      if (cloud.fallback) {
+        emit({
+          type: "cloud-execute",
+          origin: "cloud-plan",
+          thinking: `云端直答失败（${cloud.fallbackReason}），自动降级本地 Self-RAG`,
+        });
+        const local = await runLocal("local-selfrag");
+        // 降级后实际走的是本地知识库，指令按实际执行链路修正
+        return fromLocal("LOCAL_KNOWLEDGE", local, {
+          plannerFallback: true,
+          plannerFallbackReason: cloud.fallbackReason,
+        });
+      }
+
+      emit({
+        type: "cloud-execute",
+        origin: "cloud-plan",
+        thinking: `云端直答完成，共 ${cloud.text.length} 字（无本地文档依据，不执行幻觉校验）`,
+      });
+      return {
+        command,
+        answer: cloud.text,
+        cloudContent: cloud.text,
+        chunks: [],
+        steps,
+        iterations: 0,
+        plannerFallback: false,
+      };
+    }
+
+    // command === "MIXED"：本地 Self-RAG 与云端通用问答并行
+    emit({
+      type: "cloud-execute",
+      origin: "mixed-cloud",
+      subQuestion: question,
+      thinking: "MIXED：本地 Self-RAG 与云端通用知识问答并行执行中…",
+    });
+
+    const [localSettled, cloudSettled] = await Promise.allSettled([
+      runLocal("local-selfrag"),
+      requestCloudAnswer(question, options.history ?? [], options.cloud, {
+        mode: "mixed",
+        externalSignal: cloudAbort.signal,
+      }),
+    ]);
+
+    // 用户取消：两路都会中止，直接抛出
+    if (cancelled) throw new Error("Agent 已取消");
+
+    // 本地链路是 MIXED 的主体，失败必须上抛；云端失败则只交付本地部分
+    if (localSettled.status === "rejected") throw localSettled.reason;
+    const local = localSettled.value;
+
+    if (cloudSettled.status === "rejected") throw cloudSettled.reason;
+    const cloud = cloudSettled.value;
+
+    if (cloud.fallback || !cloud.text) {
+      emit({
+        type: "cloud-execute",
+        origin: "mixed-cloud",
+        thinking: `云端拓展失败（${cloud.fallbackReason ?? "空响应"}），仅交付本地 Self-RAG 答案`,
+      });
+      return fromLocal("LOCAL_KNOWLEDGE", local, { cloudFailed: true });
+    }
+
+    emit({
+      type: "cloud-execute",
+      origin: "mixed-cloud",
+      thinking: `云端拓展完成 ${cloud.text.length} 字，与本地答案分区合并`,
+    });
+
+    const merged = mergeResult({
+      command: "MIXED",
+      local: { text: local.answer, verification: local.verification },
+      cloud: { text: cloud.text },
+    });
+
+    return {
+      command: "MIXED",
+      answer: merged.local?.text ?? "",
+      cloudContent: merged.cloud.text,
+      verification: merged.local?.verification,
+      chunks: local.chunks,
+      steps,
+      iterations: local.iterations,
+      plannerFallback: false,
+    };
+  })();
+
+  return {
+    promise,
+    cancel: () => {
+      cancelled = true;
+      // 中止云端 fetch；本地子 Agent 同步取消
+      cloudAbort.abort();
+      subHandle?.cancel();
     },
   };
 }

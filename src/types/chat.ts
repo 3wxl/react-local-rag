@@ -5,8 +5,8 @@ import type { AgentStep } from "../agent/types";
 /** 消息角色 */
 export type Role = "user" | "assistant";
 
-/** 回答来源：区分普通 RAG 与 Self-RAG Agent（仅 assistant 消息） */
-export type AnswerSource = "normal-rag" | "self-rag";
+/** 回答来源：普通 RAG / Self-RAG Agent / 混合 Agent（仅 assistant 消息） */
+export type AnswerSource = "normal-rag" | "self-rag" | "hybrid-agent";
 
 /** 单条消息的运行状态 */
 export type MessageStatus =
@@ -31,8 +31,13 @@ export interface ChatMessage {
   context?: string;
   /** Self-RAG / Agent 执行步骤链（仅 assistant，供思考面板渲染） */
   agentSteps?: AgentStep[];
-  /** 回答来源标记：普通 RAG / Self-RAG Agent（仅 assistant 消息） */
+  /** 回答来源标记：普通 RAG / Self-RAG Agent / 混合 Agent（仅 assistant 消息） */
   answerSource?: AnswerSource;
+  /**
+   * 云端拓展/直答文本（仅混合 Agent）。
+   * 与 content（本地答案）分区渲染，UI 必须带「无本地文档依据，不执行幻觉校验」警示。
+   */
+  cloudContent?: string;
   /** 幻觉后处理校验结果（仅 assistant 消息，生成完成后填充） */
   verification?: VerificationResult;
   /** 当前运行状态 */

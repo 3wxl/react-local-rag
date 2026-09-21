@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentStep, AgentStepType } from "../agent/types";
+import type { AgentStep, AgentStepOrigin, AgentStepType } from "../agent/types";
 import {
   ChevronRightIcon,
   CheckCircleIcon,
@@ -30,6 +30,47 @@ const STEP_META: Record<
   "cloud-execute": { label: "云端执行", thinking: true },
   generate: { label: "最终回答", thinking: false },
 };
+
+/**
+ * 步骤来源标记（混合 Agent）：
+ * 🟦 云端规划 / 🟩 本地 Self-RAG / 🟪 MIXED 子任务
+ * 用色块 + 文字标签，与面板整体的 SVG/小圆点风格保持一致。
+ */
+const ORIGIN_META: Record<
+  AgentStepOrigin,
+  { label: string; square: string; text: string }
+> = {
+  "cloud-plan": {
+    label: "云端规划",
+    square: "bg-sky-500",
+    text: "text-sky-600 dark:text-sky-400",
+  },
+  "local-selfrag": {
+    label: "本地 Self-RAG",
+    square: "bg-emerald-500",
+    text: "text-emerald-600 dark:text-emerald-400",
+  },
+  "mixed-cloud": {
+    label: "MIXED 子任务",
+    square: "bg-purple-500",
+    text: "text-purple-600 dark:text-purple-400",
+  },
+};
+
+/** 来源标记小徽标：彩色方块 + 文案 */
+function OriginBadge({ origin }: { origin: AgentStepOrigin }) {
+  const meta = ORIGIN_META[origin];
+  if (!meta) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${meta.text} bg-bg`}
+      title={`步骤来源：${meta.label}`}
+    >
+      <span className={`w-2 h-2 rounded-sm ${meta.square}`} />
+      {meta.label}
+    </span>
+  );
+}
 
 /** 单个步骤的折叠行 */
 function StepRow({
@@ -72,6 +113,7 @@ function StepRow({
         <span className="text-ink-muted font-medium flex-shrink-0">
           {meta.label}
         </span>
+        {step.origin && <OriginBadge origin={step.origin} />}
         {resultIcon}
         {step.subQuestion && (
           <span className="text-ink truncate flex-1 text-left">

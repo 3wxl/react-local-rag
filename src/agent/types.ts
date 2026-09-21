@@ -15,6 +15,17 @@ export type AgentMode = "local-rag" | "hybrid-agent" | "cloud-only";
 export type CloudAgentCommand = "LOCAL_KNOWLEDGE" | "GENERAL_KNOWLEDGE" | "MIXED";
 
 /**
+ * 步骤来源标记（混合 Agent 阶段三）：
+ * - cloud-plan：云端规划链路（路由 / 纯云端直答）
+ * - local-selfrag：本地 Self-RAG 链路（拆分 / 检索 / 判断 / 本地生成）
+ * - mixed-cloud：MIXED 分支中与本地并行的云端子任务
+ */
+export type AgentStepOrigin =
+  | "cloud-plan"
+  | "local-selfrag"
+  | "mixed-cloud";
+
+/**
  * Agent 执行中的一步记录（用于展示思考链 / 调试 / 性能埋点）
  */
 export interface AgentStep {
@@ -22,6 +33,8 @@ export interface AgentStep {
   stepIndex: number;
   /** 步骤类型 */
   type: AgentStepType;
+  /** 步骤来源（混合 Agent 用，UI 显示 🟦/🟩/🟪 彩色标记） */
+  origin?: AgentStepOrigin;
   /** 当前处理的子问题（拆分场景下有值） */
   subQuestion?: string;
   /** 本步检索到的文档片段（local-rag 场景） */

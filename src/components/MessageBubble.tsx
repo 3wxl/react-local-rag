@@ -3,6 +3,7 @@ import type { AnswerSource, ChatMessage } from "../types/chat";
 import { statusToTip } from "../utils/chat";
 import { splitSentences, type VerificationResult } from "../utils/verifyAnswer";
 import { AgentStepPanel } from "./AgentStepPanel";
+import { CLOUD_NO_EVIDENCE_WARNING } from "../agent/mergeResult";
 import { Spinner } from "./Spinner";
 import {
   AiIcon,
@@ -22,9 +23,8 @@ interface MessageBubbleProps {
 }
 
 /**
- * 回答来源标记：区分普通 RAG 回答 / Self-RAG Agent 回答。
- * 普通 RAG：灰底文档图标 + "普通 RAG"。
- * Self-RAG：强调色底 + AiIcon + "Self-RAG Agent"，醒目区分多轮检索-判断链路。
+ * 回答来源标记：区分普通 RAG / Self-RAG Agent / 混合 Agent。
+ * 普通 RAG：灰底文档图标；Self-RAG：强调色；混合 Agent：紫色（与 🟪 MIXED 标记呼应）。
  */
 function AnswerSourceBadge({ source }: { source: AnswerSource }) {
   if (source === "self-rag") {
@@ -35,11 +35,38 @@ function AnswerSourceBadge({ source }: { source: AnswerSource }) {
       </span>
     );
   }
+  if (source === "hybrid-agent") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/30">
+        <AiIcon className="w-3 h-3" />
+        混合 Agent
+      </span>
+    );
+  }
   return (
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-bg-hover text-ink-muted border border-line">
       <DocIcon className="w-3 h-3" />
       普通 RAG
     </span>
+  );
+}
+
+/**
+ * 云端回答块（混合 Agent 的云端直答 / 云端拓展）。
+ * 紫色虚线边框与本地答案气泡视觉分区，头部固定展示
+ * ⚠️「无本地文档依据，不执行幻觉校验」，该部分不做逐句高亮。
+ */
+function CloudAnswerBlock({ text }: { text: string }) {
+  return (
+    <div className="mt-2 rounded-2xl rounded-tl-md border border-dashed border-purple-400/60 bg-purple-500/5 overflow-hidden">
+      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-purple-400/30 text-xs font-medium text-purple-600 dark:text-purple-400">
+        <WarningIcon className="w-3.5 h-3.5 shrink-0" />
+        <span>云端回答 · {CLOUD_NO_EVIDENCE_WARNING}</span>
+      </div>
+      <div className="px-4 py-2.5 text-sm text-ink leading-7 whitespace-pre-wrap break-words">
+        {text}
+      </div>
+    </div>
   );
 }
 
@@ -234,6 +261,7 @@ export function MessageBubble({
   const tip = statusToTip(message.status, loadProgress);
   const hasThinking = (message.thinking || "").trim().length > 0;
   const hasContent = (message.content || "").trim().length > 0;
+  const hasCloudContent = (message.cloudContent || "").trim().length > 0;
   const hasAgentSteps = (message.agentSteps?.length ?? 0) > 0;
   // 有 Agent 步骤时优先展示步骤面板；模型 think 标签内容仍可单独折叠展示
   const showThinking =
@@ -305,9 +333,14 @@ export function MessageBubble({
           </div>
         )}
 
-        {/* 幻觉校验结果横幅 */}
+        {/* 幻觉校验结果横幅（仅本地答案部分） */}
         {hasContent && message.verification && message.status === "done" && (
           <VerificationBanner result={message.verification} />
+        )}
+
+        {/* 云端回答块（直答/拓展）：独立分区，固定「无本地依据」警示，不做幻觉高亮 */}
+        {hasCloudContent && message.status === "done" && (
+          <CloudAnswerBlock text={message.cloudContent!} />
         )}
 
         {/* 错误提示 */}

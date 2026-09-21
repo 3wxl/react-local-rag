@@ -11,7 +11,7 @@ import {
   generateAnswer,
   summarizeHistory,
 } from "./utils/generateAnswer";
-import { runSelfRagAgent } from "./agent/agentRunner";
+import { runSelfRagAgent, runHybridAgent } from "./agent/agentRunner";
 import type { AgentStep } from "./agent/types";
 import {
   buildPromptHistory,
@@ -242,11 +242,14 @@ function App() {
       thinking: "",
       status: "pending",
       createdAt: now + 1,
-      // 回答来源标记：local-rag + enableSelfRag → Self-RAG Agent；其余走普通 RAG
+      // 回答来源标记：hybrid-agent → 混合 Agent；local-rag + enableSelfRag → Self-RAG；其余普通 RAG
       answerSource:
-        agentSettings.agentMode === "local-rag" && agentSettings.enableSelfRag
-          ? "self-rag"
-          : "normal-rag",
+        agentSettings.agentMode === "hybrid-agent"
+          ? "hybrid-agent"
+          : agentSettings.agentMode === "local-rag" &&
+              agentSettings.enableSelfRag
+            ? "self-rag"
+            : "normal-rag",
     };
 
     addMessages(convId, [userMsg, assistantMsg], text);
@@ -285,12 +288,92 @@ function App() {
       const historyTurns = buildPromptHistory(prevMessages, historyMarker);
 
       // ── Agent 模式分支 ──
-      // local-rag 模式下按 enableSelfRag 选择 Self-RAG Agent 或原有流水线；
-      // hybrid-agent / cloud-only 阶段二实现，暂时降级走普通本地 RAG（原有流水线）
+      // hybrid-agent：本地轻量检索取信号 → 云端规划 → 三指令分支（异常自动降级本地）
+      // local-rag：按 enableSelfRag 选择 Self-RAG Agent 或原有流水线
+      // cloud-only：阶段三未实现，暂时走普通本地 RAG（原有流水线）
+      const isHybrid = agentSettings.agentMode === "hybrid-agent";
       const useSelfRag =
         agentSettings.agentMode === "local-rag" && agentSettings.enableSelfRag;
 
-      if (useSelfRag) {
+      if (isHybrid) {
+        // 混合 Agent 分支：云端规划 → LOCAL / 云端直答 / MIXED 合并
+        patchMessage(convId, assistantMsg.id, {
+          status: "thinking",
+          agentSteps: [],
+        });
+        const liveSteps: AgentStep[] = [];
+        let llmLoaded = false;
+        const tInfer = startTimer("llm-infer");
+
+        const handle = runHybridAgent(
+          convId,
+          text,
+          {
+            onLoadProgress: (progress) => {
+              if (!llmLoaded) {
+                llmLoaded = true;
+                startTimer("llm-load").done({ progress: Math.round(progress) });
+              }
+              setLoadProgress(progress);
+              patchMessage(convId, assistantMsg.id, { status: "loading-model" });
+            },
+            onGenerating: () => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+            },
+            onThinking: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+              appendToMessage(convId, assistantMsg.id, "thinking", delta);
+            },
+            onToken: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "generating" });
+              appendToMessage(convId, assistantMsg.id, "content", delta);
+            },
+            onStep: (step) => {
+              liveSteps.push(step);
+              const status =
+                step.type === "retrieve"
+                  ? "retrieving"
+                  : step.type === "generate" || step.type === "cloud-execute"
+                    ? "generating"
+                    : "thinking";
+              patchMessage(convId, assistantMsg.id, {
+                agentSteps: [...liveSteps],
+                status,
+              });
+            },
+          },
+          {
+            topK,
+            history: historyTurns,
+            historySummary,
+            cloud: {
+              apiKey: agentSettings.cloudApiKey,
+              baseUrl: agentSettings.cloudBaseUrl,
+              upstreamBaseUrl: agentSettings.cloudUpstreamUrl,
+              model: agentSettings.cloudModel,
+            },
+          },
+        );
+        currentHandleRef.current = handle;
+
+        const result = await handle.promise;
+        tInfer.done({
+          tokens: (result.answer?.length || 0) + (result.cloudContent?.length || 0),
+          iterations: result.iterations,
+          command: result.command,
+        });
+        patchMessage(convId, assistantMsg.id, {
+          status: "done",
+          // content 为本地答案（纯云端时为空）；云端文本进 cloudContent 独立分区
+          content: stripThinkTags(result.answer || ""),
+          cloudContent: result.cloudContent
+            ? stripThinkTags(result.cloudContent)
+            : undefined,
+          context: result.chunks.join("\n\n"),
+          verification: result.verification,
+          agentSteps: result.steps,
+        });
+      } else if (useSelfRag) {
         // Self-RAG Agent 分支：拆分 → 检索 → 充足性判断 → 生成（步骤经 onStep 实时写入消息）
         patchMessage(convId, assistantMsg.id, {
           status: "thinking",
@@ -436,14 +519,19 @@ function App() {
         }
       }
     } catch (err: any) {
-      console.error(err);
-      // AppError 带 userMessage + hint，展示更友好的错误信息
-      const appErr = err as Partial<AppError>;
-      const hint = appErr?.hint ? `\n${appErr.hint}` : "";
-      patchMessage(convId, assistantMsg.id, {
-        status: "error",
-        error: (appErr?.userMessage || err?.message || "生成失败") + hint,
-      });
+      // 用户主动取消 Agent：不显示失败标记，保留已生成的部分内容，按正常结束处理
+      if (err?.message === "Agent 已取消") {
+        patchMessage(convId, assistantMsg.id, { status: "done" });
+      } else {
+        console.error(err);
+        // AppError 带 userMessage + hint，展示更友好的错误信息
+        const appErr = err as Partial<AppError>;
+        const hint = appErr?.hint ? `\n${appErr.hint}` : "";
+        patchMessage(convId, assistantMsg.id, {
+          status: "error",
+          error: (appErr?.userMessage || err?.message || "生成失败") + hint,
+        });
+      }
     } finally {
       currentHandleRef.current = null;
       setBusy(false);
