@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { TOPK_MAX, TOPK_MIN } from "../hooks/useSettings";
 import { CloseIcon, SettingsIcon } from "./icons";
 import type { AgentSettings } from "../agent/useAgentSettings";
@@ -22,12 +22,14 @@ interface SettingsPanelProps {
   /** Agent 模式 + 云端配置 */
   agentSettings: AgentSettings;
   onAgentSettingsChange: (patch: Partial<AgentSettings>) => void;
+  /** 是否正在生成回答（流式中），用于禁用模式切换 */
+  busy: boolean;
 }
 
 const MODE_LABELS: Record<AgentMode, string> = {
   "local-rag": "纯本地 RAG",
   "hybrid-agent": "混合 Agent",
-  "cloud-only": "纯云端问答",
+  "cloud-only": "云端 RAG",
 };
 
 /**
@@ -41,12 +43,17 @@ export function SettingsPanel({
   onTopKChange,
   agentSettings,
   onAgentSettingsChange,
+  busy,
 }: SettingsPanelProps) {
   // 连通性测试状态
   const [testing, setTesting] = useState<"idle" | "testing" | "ok" | "fail">(
     "idle",
   );
   const [testMsg, setTestMsg] = useState("");
+  // 切到 cloud-only 时的确认弹窗：用户同意后才真正切换并发 chunk 到云端
+  const [pendingCloudOnly, setPendingCloudOnly] = useState(false);
+  // 用户是否已同意 cloud-only；同意过本轮不再弹（同一会话期间）
+  const cloudOnlyAcceptedRef = useRef(false);
 
   if (!open) return null;
 
@@ -63,8 +70,9 @@ export function SettingsPanel({
 
   // 仅纯本地 RAG 模式显示 Self-RAG 复选框
   const showSelfRag = agentMode === "local-rag";
-  // 混合 Agent 才显示云端配置区
-  const showCloudConfig = agentMode === "hybrid-agent";
+  // 混合 Agent 与纯云端模式都需要云端配置区（API Key + Base URL）
+  const showCloudConfig =
+    agentMode === "hybrid-agent" || agentMode === "cloud-only";
   // 纯云端才显示隐私提示
   const showCloudOnlyHint = agentMode === "cloud-only";
 
@@ -157,24 +165,39 @@ export function SettingsPanel({
             </label>
             <select
               value={agentMode}
-              onChange={(e) =>
-                onAgentSettingsChange({
-                  agentMode: e.target.value as AgentMode,
-                })
-              }
-              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent"
+              disabled={busy}
+              onChange={(e) => {
+                const next = e.target.value as AgentMode;
+                // 流式回答进行中：禁止切换
+                if (busy) return;
+                // 切到 cloud-only 需要用户明确同意（会发送本地分片到云端）
+                if (
+                  next === "cloud-only" &&
+                  !cloudOnlyAcceptedRef.current
+                ) {
+                  setPendingCloudOnly(true);
+                  return;
+                }
+                // 切走 cloud-only 后，同意标志失效，下次再切回仍需重新确认
+                if (next !== "cloud-only") {
+                  cloudOnlyAcceptedRef.current = false;
+                }
+                onAgentSettingsChange({ agentMode: next });
+              }}
+              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <option value="local-rag">{MODE_LABELS["local-rag"]}</option>
               <option value="hybrid-agent">{MODE_LABELS["hybrid-agent"]}</option>
               <option value="cloud-only">{MODE_LABELS["cloud-only"]}</option>
             </select>
             <p className="text-xs text-ink-faint mt-2 leading-relaxed">
-              {agentMode === "local-rag" &&
-                "纯本地运行：向量+BM25 检索 + Qwen 本地推理，零外部服务，隐私安全。"}
-              {agentMode === "hybrid-agent" &&
-                "混合模式：本地检索 + 云端规划（问题路由），按需调用云端大模型。"}
-              {agentMode === "cloud-only" &&
-                "纯云端：不读取本地文档，问题直接发送云端大模型回答。"}
+              {busy
+                ? "⏳ 回答生成中，无法切换检索模式，请等当前这一轮对话完整结束后再切换。"
+                : agentMode === "local-rag"
+                  ? "纯本地运行：向量+BM25 检索 + Qwen 本地推理，零外部服务，隐私安全。"
+                  : agentMode === "hybrid-agent"
+                    ? "混合模式：本地检索 + 云端规划（问题路由），按需调用云端大模型。"
+                    : "云端 RAG：本地检索 Top-K 分片，仅将相关分片发送云端生成（无文档时云端基于通用知识回答）。"}
             </p>
           </div>
 
@@ -378,7 +401,7 @@ export function SettingsPanel({
           {showCloudOnlyHint && (
             <div className="rounded-lg border border-amber-400/40 bg-amber-400/10 px-3 py-2.5">
               <p className="text-xs text-amber-600 dark:text-amber-400 leading-relaxed">
-                ⚠️ 纯云端模式下，不读取本地已上传的文档，提问会直接发送到云端大模型。如需引用本地文档，请切换到「混合 Agent」或「纯本地 RAG」。
+                ⚠️ 云端 RAG 模式：本地检索到的 Top-K 相关分片将随每次提问发送给云端大模型作答（全量文档原文保留在本地）。云端回答不做本地幻觉校验，请确认你信任云端服务商后再使用。如需"分片也不上传云端"，请切换到「混合 Agent」。
               </p>
               <p className="text-[11px] text-ink-faint mt-1">
                 代理: {cloudBaseUrl} · 上游: {cloudUpstreamUrl}
@@ -435,6 +458,60 @@ export function SettingsPanel({
           </button>
         </div>
       </div>
+
+      {/* 切到 cloud-only 的隐私确认弹窗：同意后才发 chunk 到云端 */}
+      {pendingCloudOnly && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-md">
+          <div
+            style={{ backgroundColor: "var(--bg-elevated)" }}
+            className="border-2 border-amber-400/50 rounded-2xl shadow-2xl max-w-sm w-full mx-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-line">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">⚠️</span>
+                <span className="font-semibold text-ink text-sm">
+                  切换到云端 RAG 模式
+                </span>
+              </div>
+            </div>
+            <div className="px-5 py-4 space-y-2">
+              <p className="text-sm text-ink leading-relaxed">
+                此模式下，每次提问时<b>本地检索到的 Top-K 相关分片原文</b>将随请求发送给你所选的云端大模型作答。
+              </p>
+              <p className="text-xs text-amber-600 dark:text-amber-400 leading-relaxed">
+                · 全量文档原文仍保留在本地，仅发送检索命中的少量分片<br />
+                · 云端回答不做本地幻觉校验<br />
+                · 请确认你信任云端服务商（如 DeepSeek、OpenAI 等）后再继续
+              </p>
+              <p className="text-[11px] text-ink-faint">
+                如不希望任何分片上传云端，请改用「混合 Agent」模式。
+              </p>
+            </div>
+            <div className="flex gap-2 px-5 py-3 border-t border-line">
+              <button
+                onClick={() => {
+                  setPendingCloudOnly(false);
+                  cloudOnlyAcceptedRef.current = false;
+                }}
+                className="flex-1 py-2 rounded-lg border border-line text-sm text-ink-muted hover:bg-bg-hover transition"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  cloudOnlyAcceptedRef.current = true;
+                  setPendingCloudOnly(false);
+                  onAgentSettingsChange({ agentMode: "cloud-only" });
+                }}
+                className="flex-1 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:opacity-90 transition"
+              >
+                我已了解，同意
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

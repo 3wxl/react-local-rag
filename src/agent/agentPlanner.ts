@@ -3,9 +3,9 @@ import {
   modelInferenceError,
   workerCrashError,
   workerTimeoutError,
-  type AppError,
 } from "../utils/errors";
 import { stripThinkTags } from "../utils/verifyAnswer";
+import { acquireInferenceLock, type InferencePriority } from "../utils/inferenceLock";
 
 const LLM_IDLE_TIMEOUT = 120_000;
 
@@ -15,9 +15,9 @@ const LLM_IDLE_TIMEOUT = 120_000;
 //  推理完成不 terminate，模型只加载一次。
 // ──────────────────────────────────────────────
 
-let sharedWorker: Worker | null = null;
-let workerCrashed = false;
-let msgSeq = 0;
+let sharedWorker: Worker | null = null; // 全局唯一LLM Worker实例
+let workerCrashed = false; // 标记worker是否崩溃，崩溃后会重建
+let msgSeq = 0; // 自增任务ID，用来区分多个排队任务
 
 interface PendingTask {
   resolve: (text: string) => void;
@@ -30,6 +30,8 @@ interface PendingTask {
   onToken?: (text: string) => void;
   /** 已取消：后续 token/done 忽略，promise 已 reject */
   cancelled?: boolean;
+  /** 推理锁释放函数（acquire 后才有值，推理结束/超时/取消/崩溃时调用） */
+  releaseLock?: () => void;
 }
 
 const pendingTasks = new Map<number, PendingTask>();
@@ -39,6 +41,7 @@ function armTaskTimeout(task: PendingTask, id: number): void {
   clearTimeout(task.timeoutTimer);
   task.timeoutTimer = setTimeout(() => {
     pendingTasks.delete(id);
+    task.releaseLock?.();
     task.reject(workerTimeoutError("大模型", task.timeoutMs));
   }, task.timeoutMs);
 }
@@ -101,13 +104,18 @@ function getSharedWorker(): Worker {
     clearTimeout(task.timeoutTimer);
     pendingTasks.delete(id);
 
-    // 已取消的任务：token/done 都忽略（promise 已在 cancel 时 reject）
-    if (task.cancelled) return;
+    // 已取消的任务：token/done 都忽略（promise 已在 cancel 时 reject，锁也已释放）
+    if (task.cancelled) {
+      task.releaseLock?.();
+      return;
+    }
 
     if (msg.type === "done") {
       const cleaned = stripThinkTags(String(msg.text || "")).trim();
+      task.releaseLock?.();
       task.resolve(cleaned);
     } else if (msg.type === "error") {
+      task.releaseLock?.();
       task.reject(modelInferenceError(new Error(msg.error || "模型推理失败")));
     }
   };
@@ -118,6 +126,7 @@ function getSharedWorker(): Worker {
     sharedWorker = null;
     for (const [id, task] of pendingTasks) {
       clearTimeout(task.timeoutTimer);
+      task.releaseLock?.();
       task.reject(workerCrashError("大模型", err));
       pendingTasks.delete(id);
     }
@@ -129,27 +138,36 @@ function getSharedWorker(): Worker {
 /**
  * 调用共享 LLM Worker 执行非流式推理（split/evaluate/summarize）。
  * 复用常驻实例，不 new / terminate，模型只加载一次。
+ *
+ * 推理锁：acquire 后才 postMessage，防止与 BGE 向量化/检索/校验同时
+ * 占用 WASM 堆触发 std::bad_alloc。锁在 done/error/timeout/crash/cancel
+ * 路径统一释放（见 PendingTask.releaseLock）。
  */
 export function callWorker(
   payload: Record<string, unknown>,
   onLoadProgress?: (progress: number) => void,
   timeoutMs: number = LLM_IDLE_TIMEOUT,
+  priority: InferencePriority = "high",
 ): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const id = ++msgSeq;
-    const task: PendingTask = {
-      resolve,
-      reject,
-      timeoutTimer: undefined as unknown as ReturnType<typeof setTimeout>,
-      timeoutMs,
-      onLoadProgress,
-    };
-    armTaskTimeout(task, id);
-    pendingTasks.set(id, task);
+  return (async (): Promise<string> => {
+    const release = await acquireInferenceLock(`llm:${payload.type}`, priority);
+    return new Promise<string>((resolve, reject) => {
+      const id = ++msgSeq;
+      const task: PendingTask = {
+        resolve,
+        reject,
+        timeoutTimer: undefined as unknown as ReturnType<typeof setTimeout>,
+        timeoutMs,
+        onLoadProgress,
+        releaseLock: release,
+      };
+      armTaskTimeout(task, id);
+      pendingTasks.set(id, task);
 
-    const worker = getSharedWorker();
-    worker.postMessage({ ...payload, id });
-  });
+      const worker = getSharedWorker();
+      worker.postMessage({ ...payload, id });
+    });
+  })();
 }
 
 /** 流式回调接口（与 generateAnswer 的 GenerateCallbacks 对齐） */
@@ -169,14 +187,18 @@ export interface StreamingHandle {
  * token 通过 id 路由到 onToken 回调，与 split/evaluate/summarize 共享同一 worker 实例。
  * 每收到一个 token/generating/load-progress 都重置空闲超时，长回答不会被误杀。
  * cancel 不 terminate worker，只标记取消 + reject promise，worker 继续生成但结果被忽略。
+ *
+ * 推理锁：与 callWorker 相同，acquire 后才 postMessage；cancel 路径需处理
+ * "等待锁期间被取消" 的边界 —— 通过 task.cancelled 标记，acquire 完成时立即 release。
  */
 export function callWorkerStreaming(
   payload: Record<string, unknown>,
   callbacks: StreamingCallbacks = {},
   timeoutMs: number = LLM_IDLE_TIMEOUT,
+  priority: InferencePriority = "high",
 ): StreamingHandle {
-  let resolve: (text: string) => void;
-  let reject: (err: Error) => void;
+  let resolve!: (text: string) => void;
+  let reject!: (err: Error) => void;
   const promise = new Promise<string>((res, rej) => {
     resolve = res;
     reject = rej;
@@ -184,8 +206,8 @@ export function callWorkerStreaming(
 
   const id = ++msgSeq;
   const task: PendingTask = {
-    resolve: resolve!,
-    reject: reject!,
+    resolve,
+    reject,
     timeoutTimer: undefined as unknown as ReturnType<typeof setTimeout>,
     timeoutMs,
     onLoadProgress: callbacks.onLoadProgress,
@@ -193,22 +215,38 @@ export function callWorkerStreaming(
     onToken: callbacks.onToken,
     cancelled: false,
   };
-  armTaskTimeout(task, id);
-  pendingTasks.set(id, task);
 
-  const worker = getSharedWorker();
-  worker.postMessage({ ...payload, id });
+  // 异步 acquire 推理锁：拿到锁后才 postMessage，防止与 BGE 推理并发抢占 WASM 堆。
+  // 若在等待锁期间被 cancel，acquire 完成时检查 cancelled 立即 release 并 return。
+  acquireInferenceLock(`llm:${payload.type}`, priority).then((release) => {
+    if (task.cancelled) {
+      // 等待锁期间用户已取消，promise 已 reject，直接释放锁
+      release();
+      return;
+    }
+    task.releaseLock = release;
+    armTaskTimeout(task, id);
+    pendingTasks.set(id, task);
+
+    const worker = getSharedWorker();
+    worker.postMessage({ ...payload, id });
+  });
 
   return {
     promise,
     cancel: () => {
+      // 幂等：多次调用安全
+      if (task.cancelled) return;
+      task.cancelled = true;
+
       const t = pendingTasks.get(id);
       if (t) {
-        t.cancelled = true;
         clearTimeout(t.timeoutTimer);
         pendingTasks.delete(id);
-        reject(new Error("用户取消生成"));
+        t.releaseLock?.();
       }
+      // 无论 t 是否存在（还在 acquire 锁中），都要 reject promise 避免悬挂
+      reject(new Error("用户取消生成"));
     },
   };
 }
@@ -223,9 +261,10 @@ export function disposeSharedLlmWorker(): void {
     sharedWorker = null;
   }
   workerCrashed = false;
-  // 清理所有 pending 的超时定时器
+  // 清理所有 pending：超时定时器 + 推理锁一并释放，避免锁悬挂导致后续推理永久阻塞
   for (const [, task] of pendingTasks) {
     clearTimeout(task.timeoutTimer);
+    task.releaseLock?.();
   }
   pendingTasks.clear();
 }

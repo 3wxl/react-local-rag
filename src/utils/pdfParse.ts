@@ -202,7 +202,9 @@ async function parsePdf(
     try {
       const page = await pdfDoc.getPage(pageNum);
       const content = await page.getTextContent();
-      const pageText = content.items.map((item: any) => item.str).join(" ");
+      const pageText = content.items
+        .map((item) => ("str" in item ? item.str : ""))
+        .join(" ");
       const cleaned = cleanText(pageText);
       if (cleaned) {
         // 页尾补空格做分隔，避免相邻两页的单词被拼在一起

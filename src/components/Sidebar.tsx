@@ -125,6 +125,15 @@ export function Sidebar({
           ) : (
             conversations.map((c) => {
               const active = c.id === activeId;
+              // 文档状态文案：处理中/失败优先展示，其次文档名
+              const docLabel =
+                c.docStatus === "pending" || c.docStatus === "processing"
+                  ? "⏳ 文档处理中…"
+                  : c.docStatus === "failed"
+                    ? "⚠️ 文档处理失败"
+                    : c.docName
+                      ? `${c.docName}`
+                      : "未上传文档";
               return (
               <div
                 key={c.id}
@@ -141,8 +150,16 @@ export function Sidebar({
                 )}
                 <div className="flex-1 min-w-0">
                   <p className={`text-sm truncate ${active ? "font-semibold text-accent" : "font-medium"}`}>{c.title}</p>
-                  <p className="text-[11px] text-ink-faint truncate">
-                    {c.docName ? `${c.docName}` : "未上传文档"}
+                  <p
+                    className={`text-[11px] truncate ${
+                      c.docStatus === "pending" || c.docStatus === "processing"
+                        ? "text-accent animate-pulse"
+                        : c.docStatus === "failed"
+                          ? "text-red-500"
+                          : "text-ink-faint"
+                    }`}
+                  >
+                    {docLabel}
                     {" · "}
                     {new Date(c.updatedAt).toLocaleDateString("zh-CN")}
                   </p>

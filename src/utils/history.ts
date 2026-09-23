@@ -14,6 +14,22 @@ export const FOLD_BATCH_SIZE = 4;
 const MAX_TURN_CHARS = 800;
 /** 滚动摘要持久化前的字符上限（模型输出 320 token 以内，再做一道硬保险） */
 export const MAX_SUMMARY_CHARS = 600;
+/**
+ * 进入摘要模型的输入文本总字符上限。
+ * 本地 Qwen2.5-0.5B 上下文窗口有限，几千 token 一次性喂入会导致
+ * 截断 / 性能塌方 / bad_alloc。2000 字符约 1000 token，留足上下文余量。
+ * 超限时按时间顺序保留**最新的**（摘要要衔接当前对话，近因最有价值），
+ * 截掉最旧的消息并加省略标记。
+ */
+export const MAX_SUMMARY_INPUT_CHARS = 2000;
+
+/**
+ * 获取消息的有效文本内容。
+ * cloud-only / hybrid 模式下 assistant 答案可能存在 cloudContent，content 为空。
+ */
+function messageText(m: ChatMessage): string {
+  return (m.content || m.cloudContent || "").trim();
+}
 
 /** 可作为历史上下文的消息：有实际内容、已完成（排除出错/空回答/生成中） */
 function validHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -22,7 +38,7 @@ function validHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
     (m) =>
       (m.role === "user" || m.role === "assistant") &&
       (m.status === "done" || m.role === "user") &&
-      m.content.trim().length > 0,
+      messageText(m).length > 0,
   );
 }
 
@@ -70,6 +86,11 @@ export function planHistoryCompression(
 /**
  * 构造发给摘要模型的文本：已有滚动摘要 + 本次新增对话。
  * 摘要模型据此产出覆盖全部旧对话的新摘要。
+ *
+ * 输入字符总量硬上限 MAX_SUMMARY_INPUT_CHARS：超限时**保留最新的消息、截掉最旧的**。
+ * 摘要的定位是衔接「已有摘要」与 Prompt 中最近 4 条原样消息，越靠近当下的上下文
+ * 对回答当前问题越有价值；被截掉的最旧部分离当前语境最远，损失最小。
+ * （marker 仍推进到 toFold 末尾，被截内容不会再进摘要，故宁可牺牲远端）
  */
 export function renderSummaryInput(
   existingSummary: string | undefined,
@@ -81,14 +102,37 @@ export function renderSummaryInput(
 这样模型能理解"这是迭代摘要"，而不是"从头摘要"。 */
   toFold: ChatMessage[],
 ): string {
-  const turns = toFold
-    .map((m) => `${m.role === "user" ? "用户" : "助手"}：${m.content.trim()}`)
-    .join("\n");
+  const lines = toFold.map(
+    (m) => `${m.role === "user" ? "用户" : "助手"}：${messageText(m)}`,
+  );
+
+  // 从最新（尾部）往前累计，超出预算的最旧消息丢弃
+  const kept: string[] = [];
+  let total = 0;
+  let truncated = false;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (total + lines[i].length > MAX_SUMMARY_INPUT_CHARS) {
+      truncated = true;
+      break;
+    }
+    kept.unshift(lines[i]);
+    total += lines[i].length;
+  }
+
+  // 边界：最新一条消息单独就超预算 —— 硬截断保头部（与 clipTurn「结论在开头」一致）
+  if (kept.length === 0 && lines.length > 0) {
+    kept.push(lines[lines.length - 1].slice(0, MAX_SUMMARY_INPUT_CHARS) + "…");
+    truncated = true;
+  }
+
+  const turns = kept.join("\n");
+  // 截断发生在时间轴前端（最旧），省略标记放在开头
+  const head = truncated ? "…（更早对话已截断）\n" : "";
 
   if (existingSummary) {
-    return `【已有摘要】\n${existingSummary}\n\n【新增对话】\n${turns}`;
+    return `【已有摘要】\n${existingSummary}\n\n【新增对话】\n${head}${turns}`;
   }
-  return `【历史对话】\n${turns}`;
+  return `【历史对话】\n${head}${turns}`;
 }
 
 /**
@@ -110,6 +154,6 @@ export function buildPromptHistory(
     .slice(-KEEP_RECENT_MESSAGES)
     .map((m) => ({
       role: m.role as "user" | "assistant",
-      content: clipTurn(m.content),
+      content: clipTurn(messageText(m)),
     }));
 }

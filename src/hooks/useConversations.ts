@@ -262,7 +262,7 @@ export function useConversations() {
     (
       convId: string,
       msgId: string,
-      field: "content" | "thinking",
+      field: "content" | "thinking" | "cloudContent",
       delta: string,
     ) => {
       setConversations((prev) =>

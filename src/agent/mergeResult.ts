@@ -13,9 +13,13 @@ import type { CloudAgentCommand } from "./types";
 import type { VerificationResult } from "../utils/verifyAnswer";
 import { stripThinkTags } from "../utils/verifyAnswer";
 
-/** 云端部分固定警示文案（UI 原样展示，勿改写措辞） */
+/** 云端部分固定警示文案（混合 Agent：云端只补充通用知识，无文档依据） */
 export const CLOUD_NO_EVIDENCE_WARNING =
   "⚠️ 无本地文档依据，不执行幻觉校验";
+
+/** 云端 RAG 警示文案（cloud-only：本地检索的 Top-K 分片已发送云端，云端基于分片作答） */
+export const CLOUD_RAG_WARNING =
+  "⚠️ 本地检索的相关分片已发送云端，云端基于分片作答（不做本地幻觉校验）";
 
 /** 本地答案部分（带幻觉校验结果，供逐句高亮） */
 export interface LocalAnswerPart {

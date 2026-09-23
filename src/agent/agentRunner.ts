@@ -11,6 +11,7 @@ import { startTimer } from "../utils/perf";
 import {
   requestCloudPlanner,
   requestCloudAnswer,
+  streamCloudAnswer,
   type CloudPlannerConfig,
   type CloudFallbackReason,
 } from "./cloudPlanner";
@@ -362,16 +363,30 @@ export function runHybridAgent(
 
   const promise = (async (): Promise<HybridAgentResult> => {
     // 1. 本地轻量检索：只用 RRF 分数构造数字信号，片段原文不进入云端请求
-    const search = await searchTopK(indexId, question, topK, {
-      onLoadProgress: callbacks.onLoadProgress,
-    });
-    ensureAlive();
-    const topHit = search.hits[0];
-    const signals = {
-      hitCount: search.hits.length,
-      topScore: topHit?.score ?? 0,
-      mode: search.mode,
+    //    无文档/索引未同步时 searchTopK 会失败，兜底为空信号，让云端规划走 GENERAL_KNOWLEDGE
+    let signals: { hitCount: number; topScore: number; mode: string } = {
+      hitCount: 0,
+      topScore: 0,
+      mode: "empty",
     };
+    try {
+      const search = await searchTopK(indexId, question, topK, {
+        onLoadProgress: callbacks.onLoadProgress,
+      });
+      ensureAlive();
+      const topHit = search.hits[0];
+      signals = {
+        hitCount: search.hits.length,
+        topScore: topHit?.score ?? 0,
+        mode: search.mode,
+      };
+    } catch (searchErr) {
+      // 无文档或索引未同步：signals 保持空，云端规划基于 hitCount=0 走 GENERAL_KNOWLEDGE
+      console.warn(
+        "[Hybrid] 本地预检索失败（可能未上传文档），将走云端规划",
+        searchErr,
+      );
+    }
 
     // 2. 云端规划（任何失败内部已降级为 LOCAL_KNOWLEDGE，不抛异常）
     const plan = await requestCloudPlanner(
@@ -531,6 +546,169 @@ export function runHybridAgent(
       // 中止云端 fetch；本地子 Agent 同步取消
       cloudAbort.abort();
       subHandle?.cancel();
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* 纯云端模式（cloud-only）：完全绕过本地知识库                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * runCloudOnlyChat 最终产出。
+ * 与 SelfRagAgentResult 字段对齐（缺 chunks / verification / iterations），
+ * 让 App.tsx 调用方无需根据模式分支写不同 schema。
+ */
+export interface CloudOnlyChatResult {
+  /** 云端流式累积的完整回答 */
+  answer: string;
+  /** cloud-only 不执行幻觉校验，恒为 undefined */
+  verification?: VerificationResult;
+  /** cloud-only 不读本地文档，chunks 恒为空 */
+  chunks: string[];
+  /** 步骤链（cloud-only 只有一步「云端直答」） */
+  steps: AgentStep[];
+  /** 降级原因（config/timeout/network/auth/http）；用户取消不在此，直接抛错 */
+  fallbackReason?: CloudFallbackReason;
+  /** 是否降级 */
+  fallback: boolean;
+}
+
+/**
+ * 纯云端聊天 Agent。
+ *
+ * 阶段四核心：
+ * - 不加载本地 Embedding 模型 / 不加载本地 Qwen LLM
+ * - 不调 searchTopK / 不读 IndexedDB 向量
+ * - 不执行 verifyAnswer 幻觉校验
+ * - 直接流式请求云端，token 经 onToken 回调实时推到 UI
+ *
+ * 红线：调用 streamCloudAnswer，内部 filterContextForCloud 剥除用户问题里
+ * 任何可能的 chunk 片段，确保只发用户纯问题 + 过滤后历史。
+ *
+ * 失败处理（与 hybrid 不同）：
+ * - 用户主动取消 → throw Error("Agent 已取消")，App.tsx catch 块识别文案置 done
+ * - 其余故障 → fallback 结果返回，App.tsx 在消息气泡里展示降级原因
+ *   （cloud-only 不回退本地，因为用户显式选择不读本地）
+ *
+ * @param question  用户提问原文（filterContextForCloud 会剥除可能的 chunk 片段）
+ * @param history   过滤后的对话历史（最近 4 条 × 800 字硬截断）
+ * @param callbacks 流式回调（onToken/onStep/onDone 等）
+ * @param options   云端配置 + 外部取消信号
+ */
+export interface CloudOnlyCallbacks {
+  /** 流式 token 回调（每收到一段 delta 触发一次） */
+  onToken?: (delta: string) => void;
+  /** 步骤回调（cloud-only 仅触发一次「云端直答」步骤） */
+  onStep?: (step: AgentStep) => void;
+  /** 完成回调 */
+  onDone?: (result: CloudOnlyChatResult) => void;
+}
+
+export interface CloudOnlyOptions {
+  /** 云端配置 */
+  cloud: CloudPlannerConfig;
+  /** 外部取消信号（来自 UI 停止按钮） */
+  externalSignal?: AbortSignal;
+}
+
+export interface CloudOnlyChatHandle {
+  promise: Promise<CloudOnlyChatResult>;
+  cancel: () => void;
+}
+
+export function runCloudOnlyChat(
+  question: string,
+  history: HistoryTurn[],
+  callbacks: CloudOnlyCallbacks,
+  options: CloudOnlyOptions,
+  contextChunks: string[] = [],
+): CloudOnlyChatHandle {
+  let cancelled = false;
+  const controller = new AbortController();
+  const steps: AgentStep[] = [];
+  let stepCounter = 0;
+
+  const emit = (
+    partial: Omit<AgentStep, "stepIndex" | "timestamp">,
+  ): AgentStep => {
+    stepCounter += 1;
+    const step: AgentStep = {
+      ...partial,
+      stepIndex: stepCounter,
+      timestamp: Date.now(),
+    };
+    steps.push(step);
+    callbacks.onStep?.(step);
+    return step;
+  };
+
+  const promise = (async (): Promise<CloudOnlyChatResult> => {
+    const tStream = startTimer("agent-iterate");
+    emit({
+      type: "cloud-execute",
+      origin: "cloud-plan",
+      subQuestion: question,
+      thinking:
+        contextChunks.length > 0
+          ? `云端 RAG：本地已检索到 Top-K ${contextChunks.length} 个相关分片，将这些分片发送云端，由云端大模型基于分片作答（不加载本地 Qwen、不做本地幻觉校验）…`
+          : "云端直答：未上传文档，直接基于通用知识与对话历史作答…",
+    });
+
+    const result = await streamCloudAnswer(
+      question,
+      history,
+      options.cloud,
+      {
+        externalSignal: controller.signal,
+        onToken: (delta) => {
+          if (!cancelled) callbacks.onToken?.(delta);
+        },
+      },
+      contextChunks,
+    );
+
+    if (result.fallback) {
+      tStream.done({ fallback: result.fallbackReason ?? "unknown" });
+      emit({
+        type: "cloud-execute",
+        origin: "cloud-plan",
+        subQuestion: question,
+        thinking: `云端 RAG 失败（${result.fallbackReason}）；cloud-only 不回退本地，已停止`,
+      });
+      return {
+        answer: "",
+        chunks: [],
+        steps,
+        fallback: true,
+        fallbackReason: result.fallbackReason,
+      };
+    }
+
+    tStream.done({ chars: result.text.length });
+    emit({
+      type: "cloud-execute",
+      origin: "cloud-plan",
+      subQuestion: question,
+      thinking:
+        contextChunks.length > 0
+          ? `云端 RAG 完成，共 ${result.text.length} 字（云端基于本地检索的 Top-K 分片作答，不做本地幻觉校验）`
+          : `云端直答完成，共 ${result.text.length} 字（基于通用知识，无文档依据）`,
+    });
+
+    return {
+      answer: result.text,
+      chunks: [],
+      steps,
+      fallback: false,
+    };
+  })();
+
+  return {
+    promise,
+    cancel: () => {
+      cancelled = true;
+      controller.abort();
     },
   };
 }

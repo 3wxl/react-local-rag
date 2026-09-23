@@ -1,6 +1,12 @@
 /*pipeline：HuggingFace Transformers.js 的高层 API，一行完成「加载模型 + 推理」。
 env：全局配置对象，控制模型从哪加载。*/
 import { pipeline, env } from "@huggingface/transformers";
+import type {
+  FeatureExtractionPipeline,
+  PretrainedModelOptions,
+  ProgressInfo,
+  Tensor,
+} from "@huggingface/transformers";
 import { BM25 } from "../utils/bm25";
 
 //模型从本地 /models 加载,禁止远程，避免走 HF 官网
@@ -17,6 +23,12 @@ interface EmbedPassagesReq {
   id: number;
   indexId: string; // 索引标识（会话 id），worker 内缓存键
   texts: string[];
+  /**
+   * 是否追加到同 indexId 的已有索引（客户端分批让出推理锁时使用）：
+   * - false/缺省：覆盖语义（单次全量上传，保持旧行为）
+   * - true：追加到旧 entry 末尾，BM25 基于全量文本重建
+   */
+  append?: boolean;
 }
 interface SetIndexReq {
   type: "set-index"; // 主线程上传已有向量索引（页面刷新/导入备份后恢复 worker 缓存）
@@ -63,9 +75,15 @@ type MainRequest =
 
 /* ================= 向量模型：惰性加载 + Promise 缓存（单例） ================= */
 
-let embedderPromise: Promise<any> | null = null;
+/** Chrome 非标准 performance.memory 字段（其他浏览器无此字段，访问前先探测） */
+interface ChromeMemoryInfo {
+  jsHeapSizeLimit: number; //浏览器给当前页面分配的 JS 堆**最大总上限**
+  usedJSHeapSize: number; //当前已经占用的 JS 堆内存
+}
 
-function getEmbedder(): Promise<any> {
+let embedderPromise: Promise<FeatureExtractionPipeline> | null = null; //缓存加载模型的 Promise
+
+function getEmbedder(): Promise<FeatureExtractionPipeline> {
   if (!embedderPromise) {
     // 内存预算检查（bge-small 约 100~150MB）
     if (!checkMemoryBudget()) {
@@ -79,7 +97,7 @@ function getEmbedder(): Promise<any> {
       "Xenova/bge-small-zh-v1.5",
       {
         quantized: true,
-        progress_callback: (info: any) => {
+        progress_callback: (info: ProgressInfo) => {
           if (info.status === "progress" && typeof info.progress === "number") {
             self.postMessage({
               type: "load-progress",
@@ -87,7 +105,7 @@ function getEmbedder(): Promise<any> {
             });
           }
         },
-      } as any,
+      } as unknown as PretrainedModelOptions,
     ).catch((err) => {
       embedderPromise = null;
       throw err;
@@ -98,7 +116,8 @@ function getEmbedder(): Promise<any> {
 
 /** 检查浏览器内存预算（Chrome 非标准 API，无则放行） */
 function checkMemoryBudget(): boolean {
-  const mem = (performance as any).memory;
+  const perf = performance as unknown as { memory?: ChromeMemoryInfo };
+  const mem = perf.memory;
   if (!mem) return true;
   const available = mem.jsHeapSizeLimit - mem.usedJSHeapSize;
   return available > 200 * 1024 * 1024;
@@ -107,7 +126,8 @@ function checkMemoryBudget(): boolean {
 /**
  * 释放向量模型 + 可选清空索引缓存，减少浏览器内存占用。
  * 立即置空 embedderPromise（新请求会触发重新加载），
- * 后台异步 dispose 旧实例（transformers.js pipeline 可能有 dispose 方法）。
+ * 后台异步 dispose 旧实例 + 显式 release ONNX Runtime session，
+ * 彻底释放 WASM 堆上的模型权重，避免内存越跑越高。
  */
 async function unloadEmbedder(clearIndex: boolean): Promise<void> {
   // 立即标记为已卸载，并发新请求会重新加载
@@ -116,13 +136,27 @@ async function unloadEmbedder(clearIndex: boolean): Promise<void> {
   if (oldPromise) {
     try {
       const embedder = await oldPromise;
-      // transformers.js pipeline 实例可能暴露 dispose
+      // 优先调用 pipeline.dispose（内部会 dispose model + tokenizer）
       if (embedder && typeof embedder.dispose === "function") {
-        await embedder.dispose();
+        await embedder.dispose(); //优先调用`pipeline.dispose()`：transformers.js 官方 API，释放模型、分词器
+      }
+      // 显式 release ONNX Runtime session，释放 WASM 堆上的模型权重
+      // （session 是 ORT 私有字段，不在 transformers.js 公开类型里，探测式访问）
+      const ortModel = embedder?.model as unknown as
+        | { session?: { release?: () => void } }
+        | undefined;
+      const session = ortModel?.session;
+      if (session && typeof session.release === "function") {
+        try {
+          session.release(); //直接释放 ONNX Runtime WASM 堆上的张量权重（最关键）
+        } catch {
+          // release 失败忽略
+        }
       } else if (
         embedder?.model &&
         typeof embedder.model.dispose === "function"
       ) {
+        // 旧版本 transformers.js 没有 session.release，退而用 model.dispose
         await embedder.model.dispose();
       }
     } catch {
@@ -134,7 +168,7 @@ async function unloadEmbedder(clearIndex: boolean): Promise<void> {
     bm25Cache.clear();
     console.log("向量索引与 BM25 索引缓存已清空");
   }
-  console.log("向量模型已卸载，内存释放");
+  console.log("向量模型已卸载，session 已 release，内存释放");
 }
 
 /* ================= 向量索引缓存：存在 worker 内存，检索不搬运向量 ================= */
@@ -149,7 +183,7 @@ const indexCache = new Map<
  * indexId -> BM25 关键词索引。
  * 纯文本派生（词频统计），从 chunk 文本即可重建，无需持久化到 IndexedDB。
  */
-const bm25Cache = new Map<string, BM25>();
+const bm25Cache = new Map<string, BM25>(); //存储 BM25 实例，纯文本词频索引，**不需要向量，只靠文本构建**
 
 /** 由 chunk 文本构建 BM25 索引并缓存 */
 function buildBm25(indexId: string, contents: string[]): BM25 {
@@ -290,10 +324,10 @@ async function embedBatch(
     const prefixed = batch.map((t) => `${prefix}: ${t}`);
 
     // 一次性传数组给 pipeline，内部 batch padding 后批量推理
-    const result = (await embedder(prefixed, {
+    const result: Tensor = await embedder(prefixed, {
       pooling: "mean",
       normalize: true,
-    })) as any;
+    });
 
     // result.data 是展平的 Float32Array：[batch_size × hidden_size]
     // 按行切分，每行 dim 个浮点数
@@ -305,6 +339,17 @@ async function embedBatch(
       out.push(data.slice(j * dim, (j + 1) * dim));
     }
 
+    // 关键：本批次推理结束后立即 dispose 原始 ort.Tensor，
+    // 释放 ONNX Runtime WASM 堆上的中间张量内存，
+    // 否则每轮推理累积的 tensor 会让内存越跑越高直至 std::bad_alloc
+    try {
+      if (result && typeof result.dispose === "function") {
+        result.dispose();
+      }
+    } catch {
+      // dispose 失败忽略，已复制出独立 buffer 不影响后续
+    }
+
     onBatch?.(Math.min(i + batchSize, texts.length), texts.length);
   }
   return out;
@@ -314,25 +359,41 @@ async function embedBatch(
 
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data as MainRequest | RemoveIndexReq;
-  const id = (msg as any).id as number | undefined;
+  const id = "id" in msg ? msg.id : undefined;
 
   try {
     switch (msg.type) {
-      /* 批量向量化文档 chunk：worker 内缓存向量索引 + BM25 索引，同时把向量返回主线程持久化 */
+      /* 批量向量化文档 chunk：worker 内缓存向量索引 + BM25 索引，同时把向量返回主线程持久化。
+         append=true 时追加到已有索引（客户端按 8 条/批分次持锁，给实时问答让路） */
       case "embed-passages": {
-        const { indexId, texts } = msg as EmbedPassagesReq;
+        const { indexId, texts, append } = msg as EmbedPassagesReq;
         const vectors = await embedBatch(texts, "passage", (done, total) => {
           self.postMessage({ type: "embed-progress", id, done, total });
         });
-        indexCache.set(
+        const newEntries = texts.map((content, i) => ({
+          content,
+          vector: vectors[i],
+        }));
+        if (append) {
+          // 追加语义：取旧索引拼接（首批 append=false 已写入，旧索引缺失时退化为覆盖）
+          const prev = indexCache.get(indexId);
+          indexCache.set(indexId, prev ? [...prev, ...newEntries] : newEntries);
+        } else {
+          indexCache.set(indexId, newEntries);
+        }
+        // BM25 不支持增量，基于全量文本重建（纯词频统计，开销远小于向量推理）
+        const all = indexCache.get(indexId)!;
+        buildBm25(
           indexId,
-          texts.map((content, i) => ({ content, vector: vectors[i] })),
+          all.map((e) => e.content),
         );
-        // 同步构建 BM25 关键词索引（纯文本词频统计，开销很小）
-        buildBm25(indexId, texts);
         // 发送副本并 transfer buffer（零拷贝），worker 缓存里的原件不受影响
+        // （tsconfig 未引入 WebWorker lib，self 按 Window 解析，transfer 重载需显式转换）
         const copies = vectors.map((v) => v.slice());
-        (self as any).postMessage(
+        const workerSelf = self as unknown as {
+          postMessage(message: unknown, transfer: Transferable[]): void;
+        };
+        workerSelf.postMessage(
           { type: "embed-result", id, vectors: copies },
           copies.map((v) => v.buffer),
         );
@@ -434,8 +495,9 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
     }
-  } catch (err: any) {
-    self.postMessage({ type: "error", id, error: err?.message || String(err) });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    self.postMessage({ type: "error", id, error: message });
   }
 };
 

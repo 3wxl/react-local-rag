@@ -5,6 +5,8 @@ import {
   parseCloudCommand,
   buildPlannerRequestBody,
   filterHistoryForCloud,
+  filterContextForCloud,
+  streamCloudAnswer,
   DEFAULT_CLOUD_MODEL,
   type CloudPlannerConfig,
   type FetchLike,
@@ -507,5 +509,254 @@ describe("requestCloudAnswer", () => {
     });
     external.abort();
     await expect(pending).rejects.toThrow("Agent 已取消");
+  });
+});
+
+/* ---------------- filterContextForCloud：全局上下文过滤（红线） ---------------- */
+
+describe("filterContextForCloud 红线", () => {
+  it("纯问题原样返回", () => {
+    expect(filterContextForCloud("文档里提到的 A 方案成本是多少？")).toBe(
+      "文档里提到的 A 方案成本是多少？",
+    );
+    expect(filterContextForCloud("What is RRF?")).toBe("What is RRF?");
+  });
+
+  it("剥除 ``` 代码块/引用块（用户从 chunk 复制粘贴的常见形态）", () => {
+    const input = "问题：A 方案\n```\n这是文档片段原文...\n成本 100\n```\n请问成本是多少";
+    const filtered = filterContextForCloud(input);
+    expect(filtered).toContain("A 方案");
+    expect(filtered).toContain("请问成本是多少");
+    expect(filtered).not.toContain("这是文档片段原文");
+    expect(filtered).not.toContain("成本 100");
+  });
+
+  it("剥除行首显式引用标记行（中英文）", () => {
+    const input = `根据文档，A 方案
+文档原文：成本是 100
+引用：B 方案成本 200
+context: some english chunk
+chunk: another chunk
+请问 A 方案成本？`;
+    const filtered = filterContextForCloud(input);
+    expect(filtered).toContain("根据文档，A 方案");
+    expect(filtered).toContain("请问 A 方案成本？");
+    expect(filtered).not.toContain("成本是 100");
+    expect(filtered).not.toContain("B 方案成本 200");
+    expect(filtered).not.toContain("some english chunk");
+    expect(filtered).not.toContain("another chunk");
+  });
+
+  it("剥除显式 chunk 标记（#chunk-1 / 片段#2 / chunk[0]）", () => {
+    const input = "根据 #chunk-1 的内容，片段#2 提到 chunk[0] 的成本是 100";
+    const filtered = filterContextForCloud(input);
+    expect(filtered).not.toContain("#chunk-1");
+    expect(filtered).not.toContain("片段#2");
+    expect(filtered).not.toContain("chunk[0]");
+    expect(filtered).toContain("根据");
+    expect(filtered).toContain("的内容");
+    expect(filtered).toContain("提到");
+    expect(filtered).toContain("的成本是 100");
+  });
+
+  it("单条硬截断：超过 2000 字符直接截断", () => {
+    const long = "啊".repeat(3000);
+    const filtered = filterContextForCloud(long);
+    expect(filtered).toHaveLength(2000);
+  });
+
+  it("空字符串与纯空白", () => {
+    expect(filterContextForCloud("")).toBe("");
+    expect(filterContextForCloud("   \n\n   ")).toBe("");
+  });
+
+  it("折叠多余空白行", () => {
+    const filtered = filterContextForCloud("第一行\n\n\n\n第二行");
+    expect(filtered).toBe("第一行\n\n第二行");
+  });
+
+  it("完整红线：发往云端的请求体不含 chunks/contextChunks/documents 字段", () => {
+    // 模拟 streamCloudAnswer 内部使用 filterContextForCloud 后构造的 user 消息
+    const maliciousInput = `文档原文：成本 100
+contextChunks: 这是一个 chunk
+chunks: [{id:1}]
+documents: [全文]
+\`\`\`
+原文片段
+\`\`\`
+请问 A 方案？`;
+    const safe = filterContextForCloud(maliciousInput);
+    const serialized = JSON.stringify({ role: "user", content: safe });
+    expect(serialized).not.toContain("chunks");
+    expect(serialized).not.toContain("contextChunks");
+    expect(serialized).not.toContain("documents");
+    expect(serialized).not.toContain("原文片段");
+  });
+});
+
+/* ---------------- streamCloudAnswer：流式云端直答 ---------------- */
+
+/** 构造一个返回 SSE 流的 fetch 替身 */
+function sseFetch(chunks: string[]): FetchLike {
+  return vi.fn(async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }) as unknown as FetchLike;
+}
+
+describe("streamCloudAnswer", () => {
+  const CONFIG: CloudPlannerConfig = {
+    apiKey: "sk-test",
+    baseUrl: "https://api.example.com/v1/",
+  };
+
+  it("成功：SSE delta 实时推送，累积完整文本", async () => {
+    const tokens: string[] = [];
+    const sseChunks = [
+      'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":" world"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"!"}}]}\n\n',
+      "data: [DONE]\n\n",
+    ];
+    const result = await streamCloudAnswer("Hi", [], CONFIG, {
+      fetchImpl: sseFetch(sseChunks),
+      onToken: (delta) => tokens.push(delta),
+    });
+    expect(tokens).toEqual(["Hello", " world", "!"]);
+    expect(result.text).toBe("Hello world!");
+    expect(result.fallback).toBe(false);
+  });
+
+  it("成功：合并跨 chunk 边界的 SSE 行（按 \\n 分割）", async () => {
+    // 同一 chunk 内含两个事件，且事件被切断
+    const sseChunks = [
+      'data: {"choices":[{"delta":{"content":"A"}}]}\n\nda', // 第一个完整 + 第二个被切
+      'ta: {"choices":[{"delta":{"content":"B"}}]}\n\n', // 第二个补完
+      "data: [DONE]\n\n",
+    ];
+    const result = await streamCloudAnswer("Q", [], CONFIG, {
+      fetchImpl: sseFetch(sseChunks),
+    });
+    expect(result.text).toBe("AB");
+  });
+
+  it("成功：filterContextForCloud 在内部生效（剥除代码块）", async () => {
+    const calls: Array<{ body: string }> = [];
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      calls.push({ body: init?.body as string });
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'));
+            c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+    }) as unknown as FetchLike;
+
+    await streamCloudAnswer(
+      "问题\n```\n文档原文不应该上传\n```",
+      [],
+      CONFIG,
+      { fetchImpl },
+    );
+    expect(calls).toHaveLength(1);
+    const body = calls[0].body;
+    expect(body).toContain("问题");
+    expect(body).not.toContain("文档原文不应该上传");
+  });
+
+  it("成功：请求体含 stream: true", async () => {
+    const calls: Array<{ body: string }> = [];
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      calls.push({ body: init?.body as string });
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+    }) as unknown as FetchLike;
+
+    await streamCloudAnswer("Q", [], CONFIG, { fetchImpl });
+    const body = JSON.parse(calls[0].body);
+    expect(body.stream).toBe(true);
+  });
+
+  it("config 缺失：fallback=config 不调 fetch", async () => {
+    const fetchImpl = vi.fn() as unknown as FetchLike;
+    const result = await streamCloudAnswer("Q", [], { apiKey: "", baseUrl: "" }, { fetchImpl });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result.fallback).toBe(true);
+    expect(result.fallbackReason).toBe("config");
+  });
+
+  it("非法 key：401 → auth 降级", async () => {
+    const result = await streamCloudAnswer("Q", [], CONFIG, {
+      fetchImpl: fakeFetch(401, { error: "invalid" }),
+    });
+    expect(result.fallback).toBe(true);
+    expect(result.fallbackReason).toBe("auth");
+    expect(result.httpStatus).toBe(401);
+  });
+
+  it("5xx → http 降级", async () => {
+    const result = await streamCloudAnswer("Q", [], CONFIG, {
+      fetchImpl: fakeFetch(500, { error: "boom" }),
+    });
+    expect(result.fallbackReason).toBe("http");
+  });
+
+  it("用户主动取消 → throw Agent 已取消", async () => {
+    const hangFetch = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    }) as unknown as FetchLike;
+
+    const external = new AbortController();
+    const pending = streamCloudAnswer("Q", [], CONFIG, {
+      fetchImpl: hangFetch,
+      externalSignal: external.signal,
+    });
+    external.abort();
+    await expect(pending).rejects.toThrow("Agent 已取消");
+  });
+
+  it("空流（无 token 无 DONE）→ http 降级", async () => {
+    const fetchImpl = vi.fn(async () => {
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.close();
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+    }) as unknown as FetchLike;
+
+    const result = await streamCloudAnswer("Q", [], CONFIG, { fetchImpl });
+    expect(result.fallback).toBe(true);
+    expect(result.fallbackReason).toBe("http");
   });
 });

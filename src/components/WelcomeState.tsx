@@ -1,6 +1,6 @@
 import type { Conversation } from "../types/chat";
 import { Spinner } from "./Spinner";
-import { DocIcon, UploadIcon } from "./icons";
+import { AiIcon, DocIcon, UploadIcon } from "./icons";
 
 interface WelcomeStateProps {
   conv: Conversation;
@@ -8,7 +8,7 @@ interface WelcomeStateProps {
   onUploadClick: () => void;
 }
 
-/** 会话已创建但尚无消息时的引导态（提示上传/可提问） */
+/** 会话已创建但尚无消息时的引导态（可直接提问，上传文档为可选功能） */
 export function WelcomeState({
   conv,
   docLoading,
@@ -20,15 +20,15 @@ export function WelcomeState({
     <div className="h-full flex items-center justify-center p-6">
       <div className="text-center max-w-lg w-full">
         <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-accent to-indigo-600 flex items-center justify-center text-white">
-          <DocIcon className="w-7 h-7" />
+          {hasDoc ? <DocIcon className="w-7 h-7" /> : <AiIcon className="w-7 h-7" />}
         </div>
         <h2 className="text-lg font-bold text-ink mb-2">
-          {hasDoc ? "可以开始提问了" : "上传文档开启问答"}
+          {hasDoc ? "可以开始提问了" : "可以直接提问或上传文档"}
         </h2>
         <p className="text-sm text-ink-muted mb-6">
           {hasDoc
-            ? `已加载《${conv.docName}》，共 ${conv.vectorChunks.length} 个文本块，请直接在下方输入框提问`
-            : "支持 PDF / TXT / Markdown / DOCX 格式，上传后即可基于文档内容进行问答"}
+            ? `已加载《${conv.docName}》，共 ${conv.vectorChunks.length} 个文本块，将基于文档进行 RAG 问答；也可不依赖文档直接对话`
+            : "在下方输入框直接提问即可开始对话；若上传文档，将进入基于文档的 RAG 问答模式"}
         </p>
 
         {!hasDoc && (

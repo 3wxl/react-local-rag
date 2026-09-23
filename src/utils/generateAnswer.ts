@@ -188,10 +188,23 @@ export function generateAnswer(
  * 调用本地模型生成滚动摘要（非流式）。
  * 复用共享常驻 LLM Worker（split/evaluate/summarize/generate 同一实例，模型只加载一次）。
  * 失败时抛出异常，由调用方决定是否放弃本轮压缩（不阻断问答）。
+ *
+ * 超时上限 20s：摘要任务对时延不敏感，模型卡死时快速失败让上层降级云端 LLM，
+ * 不无限占用推理锁阻塞后续问答。
+ *
+ * 优先级 low：摘要是回答结束后的后台任务，队列中给实时问答（split/evaluate/generate、
+ * BGE 检索/校验）让路，绝不抢占用户正在等待的推理。
  */
+const SUMMARY_TIMEOUT_MS = 20_000;
+
 export function summarizeHistory(
   text: string,
   onLoadProgress?: (progress: number) => void,
 ): Promise<string> {
-  return callWorker({ type: "summarize", text }, onLoadProgress);
+  return callWorker(
+    { type: "summarize", text },
+    onLoadProgress,
+    SUMMARY_TIMEOUT_MS,
+    "low",
+  );
 }

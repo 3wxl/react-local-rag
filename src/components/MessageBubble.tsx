@@ -3,12 +3,16 @@ import type { AnswerSource, ChatMessage } from "../types/chat";
 import { statusToTip } from "../utils/chat";
 import { splitSentences, type VerificationResult } from "../utils/verifyAnswer";
 import { AgentStepPanel } from "./AgentStepPanel";
-import { CLOUD_NO_EVIDENCE_WARNING } from "../agent/mergeResult";
+import {
+  CLOUD_NO_EVIDENCE_WARNING,
+  CLOUD_RAG_WARNING,
+} from "../agent/mergeResult";
 import { Spinner } from "./Spinner";
 import {
   AiIcon,
   CheckCircleIcon,
   ChevronRightIcon,
+  CloseIcon,
   DocIcon,
   RobotIcon,
   UserIcon,
@@ -43,6 +47,14 @@ function AnswerSourceBadge({ source }: { source: AnswerSource }) {
       </span>
     );
   }
+  if (source === "cloud-only") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/30">
+        <AiIcon className="w-3 h-3" />
+        纯云端
+      </span>
+    );
+  }
   return (
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-bg-hover text-ink-muted border border-line">
       <DocIcon className="w-3 h-3" />
@@ -52,16 +64,21 @@ function AnswerSourceBadge({ source }: { source: AnswerSource }) {
 }
 
 /**
- * 云端回答块（混合 Agent 的云端直答 / 云端拓展）。
- * 紫色虚线边框与本地答案气泡视觉分区，头部固定展示
- * ⚠️「无本地文档依据，不执行幻觉校验」，该部分不做逐句高亮。
+ * 云端回答块（混合 Agent 的云端直答 / 云端拓展 / cloud-only 的云端 RAG）。
+ * 紫色虚线边框与本地答案气泡视觉分区，头部固定展示警示文案（说明此部分不做幻觉校验）。
  */
-function CloudAnswerBlock({ text }: { text: string }) {
+function CloudAnswerBlock({
+  text,
+  warning,
+}: {
+  text: string;
+  warning: string;
+}) {
   return (
     <div className="mt-2 rounded-2xl rounded-tl-md border border-dashed border-purple-400/60 bg-purple-500/5 overflow-hidden">
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-purple-400/30 text-xs font-medium text-purple-600 dark:text-purple-400">
         <WarningIcon className="w-3.5 h-3.5 shrink-0" />
-        <span>云端回答 · {CLOUD_NO_EVIDENCE_WARNING}</span>
+        <span>云端回答 · {warning}</span>
       </div>
       <div className="px-4 py-2.5 text-sm text-ink leading-7 whitespace-pre-wrap break-words">
         {text}
@@ -303,8 +320,8 @@ export function MessageBubble({
           <ThinkingBlock message={message} />
         )}
 
-        {/* 状态横幅（尚无答案内容时） */}
-        {!hasContent && tip && (
+        {/* 状态横幅（尚无答案内容时）；error 状态由下方错误块单独展示，不在这里显示 spinner */}
+        {!hasContent && tip && message.status !== "error" && (
           <div className="flex items-center gap-2 text-sm text-accent py-1">
             <Spinner className="w-3.5 h-3.5" />
             <span>{tip}</span>
@@ -338,15 +355,32 @@ export function MessageBubble({
           <VerificationBanner result={message.verification} />
         )}
 
-        {/* 云端回答块（直答/拓展）：独立分区，固定「无本地依据」警示，不做幻觉高亮 */}
-        {hasCloudContent && message.status === "done" && (
-          <CloudAnswerBlock text={message.cloudContent!} />
-        )}
+        {/* 云端回答块（直答/拓展）：独立分区，固定「无本地依据」警示，不做幻觉高亮。
+            cloud-only 模式下流式期间也渲染（追加流式光标），让用户看到 token 实时增加 */}
+        {hasCloudContent &&
+          (message.status === "done" ||
+            (message.answerSource === "cloud-only" &&
+              message.status === "generating")) && (
+            <CloudAnswerBlock
+              text={message.cloudContent!}
+              warning={
+                message.answerSource === "cloud-only"
+                  ? CLOUD_RAG_WARNING
+                  : CLOUD_NO_EVIDENCE_WARNING
+              }
+            />
+          )}
+        {hasCloudContent &&
+          message.answerSource === "cloud-only" &&
+          message.status === "generating" && (
+            <span className="inline-block w-1.5 h-4 bg-purple-500 ml-0.5 align-middle animate-pulse rounded-sm" />
+          )}
 
         {/* 错误提示 */}
         {message.status === "error" && (
-          <div className="mt-1 text-sm text-red-500">
-            {message.error || "生成失败"}
+          <div className="mt-1 flex items-center gap-1.5 text-sm text-red-500">
+            <CloseIcon className="w-3.5 h-3.5 shrink-0" />
+            <span>{message.error || "生成失败"}</span>
           </div>
         )}
 

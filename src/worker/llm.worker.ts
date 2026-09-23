@@ -1,16 +1,27 @@
 import { pipeline, env, TextStreamer } from "@huggingface/transformers";
+import type {
+  PretrainedModelOptions,
+  ProgressInfo,
+  TextGenerationPipeline,
+} from "@huggingface/transformers";
 
 //模型从本地 /models 加载,禁止远程，避免走 HF 官网
 env.localModelPath = "/models";
 env.allowLocalModels = true;
 env.allowRemoteModels = false;
 
+/** Chrome 非标准 performance.memory 字段（其他浏览器无此字段，访问前先探测） */
+interface ChromeMemoryInfo {
+  jsHeapSizeLimit: number;
+  usedJSHeapSize: number;
+}
+
 //核心设计：惰性加载 + Promise 缓存（单例模式）
-let generatorPromise: Promise<any> | null = null;
+let generatorPromise: Promise<TextGenerationPipeline> | null = null;
 //存的是 Promise，不是模型实例本身。好处：就算多个请求同时调用 `getGenerator`，也只会触发一次 pipeline 加载。
 async function getGenerator(
   onProgress: (progress: number) => void,
-): Promise<any> {
+): Promise<TextGenerationPipeline> {
   if (!generatorPromise) {
     // 加载前检查内存（WASM 模型可能需数百 MB，提前预判）
     if (!checkMemoryBudget()) {
@@ -24,12 +35,12 @@ async function getGenerator(
       "onnx-community/Qwen2.5-0.5B-Instruct",
       {
         dtype: "q4",
-        progress_callback: (info: any) => {
+        progress_callback: (info: ProgressInfo) => {
           if (info.status === "progress" && typeof info.progress === "number") {
             onProgress(info.progress);
           }
         },
-      } as any,
+      } as unknown as PretrainedModelOptions,
     );
     // 加载失败清空缓存，允许下次重试，避免永久卡死在 rejected Promise 上
     generatorPromise.catch(() => {
@@ -44,7 +55,8 @@ async function getGenerator(
  * performance.memory 是 Chrome 非标准 API，有则用，无则跳过（不阻塞）。
  */
 function checkMemoryBudget(): boolean {
-  const mem = (performance as any).memory;
+  const perf = performance as unknown as { memory?: ChromeMemoryInfo };
+  const mem = perf.memory;
   if (!mem) return true; // 无法检测，放行
   // jsHeapSizeLimit：浏览器分配给 JS 堆的上限；usedJSHeapSize：当前已用
   // 注意：WASM/ArrayBuffer 往往不计入 usedJSHeapSize，此检查只能粗筛，不能保证加载成功
@@ -56,6 +68,8 @@ function checkMemoryBudget(): boolean {
 self.onmessage = async (e: MessageEvent) => {
   //`self` 在 Web Worker 里面代表 worker 全局对象，相当于主线程的 `window`。
   const data = e.data as {
+    /** 请求 id：主线程 agentPlanner 用它路由响应 */
+    id?: number;
     question?: string;
     contextChunks?: string[];
     history?: { role: "user" | "assistant"; content: string }[];
@@ -86,8 +100,9 @@ ${data.text}<|im_end|>
         id,
         text: String(output[0].generated_text ?? "").trim(),
       });
-    } catch (err: any) {
-      self.postMessage({ type: "error", id, error: err?.message || String(err) });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      self.postMessage({ type: "error", id, error: message });
     }
     return;
   }
@@ -123,8 +138,9 @@ ${data.text}<|im_end|>
         id,
         text: String(output[0].generated_text ?? "").trim(),
       });
-    } catch (err: any) {
-      self.postMessage({ type: "error", id, error: err?.message || String(err) });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      self.postMessage({ type: "error", id, error: message });
     }
     return;
   }
@@ -165,8 +181,9 @@ ${context}<|im_end|>
         id,
         text: String(output[0].generated_text ?? "").trim(),
       });
-    } catch (err: any) {
-      self.postMessage({ type: "error", id, error: err?.message || String(err) });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      self.postMessage({ type: "error", id, error: message });
     }
     return;
   }
@@ -254,8 +271,9 @@ ${question}<|im_end|>
 
     const finalText: string = output[0].generated_text;
     self.postMessage({ type: "done", id, text: finalText });
-  } catch (err: any) {
-    self.postMessage({ type: "error", id, error: err?.message || String(err) });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    self.postMessage({ type: "error", id, error: message });
   }
 };
 

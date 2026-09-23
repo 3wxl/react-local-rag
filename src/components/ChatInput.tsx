@@ -5,10 +5,10 @@ import { SendIcon, StopIcon } from "./icons";
 interface ChatInputProps {
   value: string;
   busy: boolean;
-  /** 当前会话是否已挂载文档（决定能否发送） */
-  canSend: boolean;
   /** 文档处理中的提示文案，空串表示不处理中 */
   docLoading: string;
+  /** 文档未就绪（pending/processing）：禁用提问，提示等待向量化完成 */
+  docBlocked: boolean;
   onChange: (value: string) => void;
   onSend: () => void;
   onStop: () => void;
@@ -18,8 +18,8 @@ interface ChatInputProps {
 export function ChatInput({
   value,
   busy,
-  canSend,
   docLoading,
+  docBlocked,
   onChange,
   onSend,
   onStop,
@@ -46,6 +46,7 @@ export function ChatInput({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (docBlocked) return; // 文档向量化中，禁止发送
       onSend();
     }
   };
@@ -61,6 +62,14 @@ export function ChatInput({
           </div>
         )}
 
+        {/* 文档未就绪提示：替代进度条位置（进度条显示时二者并存不冲突） */}
+        {docBlocked && !docLoading && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-amber-600 dark:text-amber-400 px-3 py-2 rounded-lg bg-amber-400/10">
+            <Spinner className="w-3.5 h-3.5" />
+            文档正在解析向量化，暂时无法检索此文档内容，请等待处理完成…
+          </div>
+        )}
+
         <div className="relative flex items-end gap-2 rounded-2xl border border-line bg-bg-elevated shadow-sm focus-within:border-accent focus-within:ring-2 focus-within:ring-accent-soft transition">
           <textarea
             ref={textareaRef}
@@ -69,9 +78,9 @@ export function ChatInput({
             onKeyDown={handleKeyDown}
             rows={1}
             placeholder={
-              canSend
-                ? "输入问题，Enter 发送，Shift+Enter 换行"
-                : "请先上传文档后提问"
+              docBlocked
+                ? "文档正在解析向量化，暂时无法提问，请等待处理完成…"
+                : "输入问题，Enter 发送，Shift+Enter 换行"
             }
             className="flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-6 outline-none placeholder:text-ink-faint max-h-[200px]"
           />
@@ -86,9 +95,9 @@ export function ChatInput({
           ) : (
             <button
               onClick={onSend}
-              disabled={!value.trim() || !canSend}
+              disabled={!value.trim() || docBlocked}
               className="m-1 inline-flex items-center justify-center w-9 h-9 rounded-xl bg-accent hover:bg-accent-hover disabled:bg-bg-hover disabled:text-ink-faint text-white transition"
-              title="发送"
+              title={docBlocked ? "文档处理中，暂不可提问" : "发送"}
             >
               <SendIcon className="w-4 h-4" />
             </button>

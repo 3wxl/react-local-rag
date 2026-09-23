@@ -5,8 +5,8 @@ import type { AgentStep } from "../agent/types";
 /** 消息角色 */
 export type Role = "user" | "assistant";
 
-/** 回答来源：普通 RAG / Self-RAG Agent / 混合 Agent（仅 assistant 消息） */
-export type AnswerSource = "normal-rag" | "self-rag" | "hybrid-agent";
+/** 回答来源：普通 RAG / Self-RAG Agent / 混合 Agent / 纯云端（仅 assistant 消息） */
+export type AnswerSource = "normal-rag" | "self-rag" | "hybrid-agent" | "cloud-only";
 
 /** 单条消息的运行状态 */
 export type MessageStatus =
@@ -47,12 +47,24 @@ export interface ChatMessage {
   createdAt: number;
 }
 
+/** 文档处理状态（UI 层管控：未 ready 不允许针对该文档提问） */
+export type DocStatus =
+  | "pending" // 已选文件，等待处理
+  | "processing" // 解析 / 分块 / 向量化进行中
+  | "ready" // 向量化全部完成并挂载，可参与 topK 检索
+  | "failed"; // 处理失败（该文档不可检索，但不阻塞普通对话）
+
 /** 一次会话（包含独立文档上下文 + 消息列表） */
 export interface Conversation {
   id: string;
   title: string;
   /** 关联的文档名 */
   docName?: string;
+  /**
+   * 关联文档的处理状态。可选：旧数据 / 导入备份无此字段，视为 ready
+   * （vectorChunks 仅在 ready 时写入，有分块即可检索）。
+   */
+  docStatus?: DocStatus;
   /** 关联文档的分块向量（检索用） */
   vectorChunks: VectorChunk[];
   messages: ChatMessage[];

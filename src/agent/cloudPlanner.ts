@@ -14,13 +14,16 @@
  */
 
 import {
-  CLOUD_ROUTE_SYSTEM_PROMPT,
   CLOUD_GENERAL_ANSWER_PROMPT,
   CLOUD_MIXED_ANSWER_PROMPT,
+  CLOUD_RAG_ANSWER_PROMPT,
+  CLOUD_ROUTE_SYSTEM_PROMPT,
+  SUMMARIZE_VIA_CLOUD_PROMPT,
 } from "./promptTemplates";
 import { DEFAULT_AGENT_CONFIG } from "./types";
 import type { CloudAgentCommand } from "./types";
 import type { HistoryTurn } from "../utils/history";
+import { MAX_SUMMARY_CHARS } from "../utils/history";
 import { DEFAULT_CLOUD_MODEL } from "./useAgentSettings";
 
 export { DEFAULT_CLOUD_MODEL };
@@ -115,6 +118,76 @@ export function filterHistoryForCloud(history: HistoryTurn[]): HistoryTurn[] {
         : turn.content;
     return { role: turn.role, content };
   });
+}
+
+/**
+ * 用户提问发送云端前的全局上下文过滤。
+ *
+ * 防御性工具：即便上游误把 chunk 片段、文档引用、上下文块拼到用户问题里，
+ * 这里也是发往云端的最后一道闸门 —— 剥除任何可能携带文档原文的内容，
+ * 只保留用户纯净的提问。
+ *
+ * 当前过滤规则（按风险从高到低）：
+ * 1. 剥除 ```代码块/引用块```：用户从文档片段复制粘贴时常见的泄露形态
+ * 2. 剥除行首显式标记的引用块：以「文档原文:」「引用:」「context:」「片段:」「chunk:」开头（中英文 + 大小写）的整行
+ * 3. 剥除显式 chunk 标记：形如 #chunk-1 / 片段#2 / chunk[0] 等片段引用标记
+ * 4. 单条硬截断：超过 MAX_USER_QUESTION_CHARS（2000）字符视为异常输入，直接截断
+ * 5. 折叠多余空白行
+ *
+ * 红线：调用此函数后，发送给云端的 user 消息不应包含任何 chunk 原文 / 文档引用片段。
+ * 单元测试（cloudPlanner.test.ts「filterContextForCloud 红线」）会断言
+ * 过滤后序列化字符串不含 chunks / contextChunks / documents 字段名。
+ */
+const MAX_USER_QUESTION_CHARS = 2000;
+
+const REFERENCE_LINE_PREFIXES = [
+  "文档原文",
+  "文档内容",
+  "原文",
+  "引用",
+  "参考",
+  "context",
+  "chunk",
+  "片段",
+  "检索结果",
+  "evidence",
+  "source",
+  "document",
+  "documents",
+];
+
+const CHUNK_REF_PATTERN = /#chunk-?\d+|chunk\[\d+\]|片段[#[]\d+|chunk-\d+/gi;
+
+export function filterContextForCloud(userText: string): string {
+  if (!userText) return "";
+  let text = userText;
+
+  // 1. 剥除代码块/引用块（用户可能从文档片段复制粘贴）
+  text = text.replace(/```[\s\S]*?```/g, "");
+
+  // 2. 逐行过滤：剥除行首显式标记的引用块
+  text = text
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trimStart().toLowerCase();
+      // 容忍冒号前后空格
+      const stripped = trimmed.replace(/[:：]\s.*$/, "").trim();
+      return !REFERENCE_LINE_PREFIXES.some((p) => stripped.startsWith(p));
+    })
+    .join("\n");
+
+  // 3. 剥除显式 chunk 标记（如 #chunk-1 / 片段#2）
+  text = text.replace(CHUNK_REF_PATTERN, "");
+
+  // 4. 硬截断
+  if (text.length > MAX_USER_QUESTION_CHARS) {
+    text = text.slice(0, MAX_USER_QUESTION_CHARS);
+  }
+
+  // 5. 折叠多余空白行 + 首尾 trim
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+
+  return text;
 }
 
 /**
@@ -538,7 +611,8 @@ export async function requestCloudAnswer(
     if (isAbortError(err)) {
       // 区分用户取消与超时：外部信号已中止 → 取消，中断整个 Agent
       if (options.externalSignal?.aborted) {
-        throw new Error("Agent 已取消");
+        // 用户主动取消：中断整个 Agent（底层 abort 错误挂到 cause 便于排查）
+        throw new Error("Agent 已取消", { cause: err });
       }
       return { text: "", fallback: true, fallbackReason: "timeout" };
     }
@@ -546,5 +620,293 @@ export async function requestCloudAnswer(
   } finally {
     clearTimeout(timer);
     options.externalSignal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 流式云端直答（cloud-only 模式专用）                                  */
+/* ------------------------------------------------------------------ */
+
+export interface StreamCloudAnswerOptions {
+  /** 超时毫秒，默认 DEFAULT_CLOUD_ANSWER_TIMEOUT */
+  timeoutMs?: number;
+  /** 注入 fetch 实现（单元测试用） */
+  fetchImpl?: FetchLike;
+  /** 外部取消信号（用户点停止按钮）；触发后 promise 以取消错误 reject */
+  externalSignal?: AbortSignal;
+  /** 流式 token 回调（每收到一段 delta 触发一次） */
+  onToken?: (delta: string) => void;
+}
+
+export interface StreamCloudAnswerResult {
+  /** 累积的完整回答文本 */
+  text: string;
+  /** 是否降级（true 时调用方应展示 fallbackReason 文案） */
+  fallback: boolean;
+  fallbackReason?: CloudFallbackReason;
+  httpStatus?: number;
+}
+
+/**
+ * 流式请求云端大模型作答（cloud-only 模式专用）。
+ *
+ * 与 requestCloudAnswer 区别：
+ * - 请求体加 stream: true，按 SSE 解析增量 token
+ * - 每个 delta 经 onToken 回调实时推到 UI，体验像本地流式回答
+ * - 接收 contextChunks（本地文档片段）：拼到 system prompt 的 {context} 占位符
+ *   注意：cloud-only 模式用户已明确知情同意文档原文发送云端，区别于 hybrid-agent 的红线
+ *
+ * 红线变化：cloud-only 模式下文档 chunks 是有意发送的（用户知情）；
+ * 但用户问题仍走 filterContextForCloud 剥除任何「用户从外部复制粘贴的 chunk 片段」
+ * （防止历史消息或用户输入意外泄露 chunk，仅保留用户纯净问题）
+ *
+ * 失败契约与 requestCloudAnswer 一致：
+ * - 用户主动取消 → throw new Error("Agent 已取消")，与本地 Agent 语义对齐
+ * - config / timeout / network / auth / http 故障 → fallback 结果返回（不抛异常），
+ *   调用方据此向用户展示错误（cloud-only 不回退本地，因为用户显式选择云端）
+ */
+export async function streamCloudAnswer(
+  question: string,
+  history: HistoryTurn[],
+  config: CloudPlannerConfig,
+  options: StreamCloudAnswerOptions,
+  contextChunks: string[] = [],
+): Promise<StreamCloudAnswerResult> {
+  const apiKey = config.apiKey?.trim();
+  const baseUrl = config.baseUrl?.trim();
+  if (!apiKey || !baseUrl) {
+    return { text: "", fallback: true, fallbackReason: "config" };
+  }
+
+  // 全局上下文过滤：剥除任何可能的 chunk 片段，只发纯问题
+  // （cloud-only 模式下 chunks 由 contextChunks 参数显式传入，用户问题里仍要剥除）
+  const safeQuestion = filterContextForCloud(question);
+  const safeHistory = filterHistoryForCloud(history);
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CLOUD_ANSWER_TIMEOUT;
+  const fetchImpl: FetchLike = options.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const onExternalAbort = () => controller.abort();
+  if (options.externalSignal?.aborted) controller.abort();
+  options.externalSignal?.addEventListener("abort", onExternalAbort);
+
+  // System prompt：把 contextChunks 拼到 {context} 占位符
+  // 无 chunks 时退化为通用问答 prompt（兼容未上传文档的边界场景）
+  const contextText = contextChunks.length > 0 ? contextChunks.join("\n\n") : "";
+  const systemContent =
+    contextText.length > 0
+      ? CLOUD_RAG_ANSWER_PROMPT.replace("{context}", contextText)
+      : CLOUD_GENERAL_ANSWER_PROMPT;
+
+  const messages: CloudChatMessage[] = [
+    { role: "system", content: systemContent },
+    ...safeHistory.map(
+      (turn): CloudChatMessage => ({ role: turn.role, content: turn.content }),
+    ),
+    { role: "user", content: safeQuestion },
+  ];
+
+  let httpStatus: number | undefined;
+  try {
+    const response = await fetchImpl(buildEndpoint(baseUrl), {
+      method: "POST",
+      headers: buildCloudHeaders({
+        apiKey,
+        upstreamBaseUrl: config.upstreamBaseUrl,
+      }),
+      body: JSON.stringify({
+        model: config.model?.trim() || DEFAULT_CLOUD_MODEL,
+        temperature: 0.7,
+        max_tokens: CLOUD_ANSWER_MAX_TOKENS,
+        stream: true,
+        messages,
+      }),
+      signal: controller.signal,
+    });
+
+    httpStatus = response.status;
+    if (response.status === 401 || response.status === 403) {
+      return { text: "", fallback: true, fallbackReason: "auth", httpStatus };
+    }
+    if (!response.ok) {
+      return { text: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+
+    // SSE 流式解析：按 \n\n 分割事件，每事件一行 data: {...}
+    const reader = response.body?.getReader();
+    if (!reader) {
+      // 非 ReadableStream 环境降级为非流式（一次性读 JSON）
+      const data = (await response.json()) as ChatCompletionResponse;
+      const content = data.choices?.[0]?.message?.content;
+      const text = typeof content === "string" ? content.trim() : "";
+      if (text && options.onToken) options.onToken(text);
+      return { text, fallback: !text, fallbackReason: text ? undefined : "http", httpStatus };
+    }
+
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let accumulated = "";
+    let sawDone = false;
+
+    while (!sawDone) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // 按行处理 SSE 事件
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const rawLine = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.startsWith(":")) continue; // SSE 注释
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") {
+          sawDone = true;
+          break;
+        }
+        try {
+          const chunk = JSON.parse(payload) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+          };
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) {
+            accumulated += delta;
+            options.onToken?.(delta);
+          }
+        } catch {
+          // 单行解析失败忽略，等下一行
+        }
+      }
+    }
+
+    if (!accumulated) {
+      return { text: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+    return { text: accumulated, fallback: false, httpStatus };
+  } catch (err) {
+    if (isAbortError(err)) {
+      if (options.externalSignal?.aborted) {
+        // 用户主动取消：中断整个 Agent（底层 abort 错误挂到 cause 便于排查）
+        throw new Error("Agent 已取消", { cause: err });
+      }
+      return { text: "", fallback: true, fallbackReason: "timeout" };
+    }
+    return { text: "", fallback: true, fallbackReason: "network" };
+  } finally {
+    clearTimeout(timer);
+    options.externalSignal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 云端摘要降级：本地 Qwen 摘要失败时的兜底路径                          */
+/* ------------------------------------------------------------------ */
+
+/** 云端摘要请求的可调参数 */
+export interface SummarizeViaCloudOptions {
+  /** 超时毫秒，默认 30s（摘要任务比问答轻，给个宽时限） */
+  timeoutMs?: number;
+  /** 注入 fetch 实现（单元测试用） */
+  fetchImpl?: FetchLike;
+}
+
+/** 云端摘要结果：与降级契约一致，失败通过 fallback 表达，不抛异常 */
+export interface SummarizeViaCloudResult {
+  /** 摘要文本（fallback 时为空串） */
+  summary: string;
+  fallback: boolean;
+  fallbackReason?: CloudFallbackReason;
+  httpStatus?: number;
+}
+
+/**
+ * 调用云端 LLM 把对话历史压缩成滚动摘要。
+ *
+ * 触发场景：本地 Qwen2.5-0.5B 摘要推理失败（20s 超时 / bad_alloc / 模型崩溃），
+ * 当前模式已配置云端 API Key + Base URL 时，用云端大模型兜底完成摘要。
+ *
+ * 红线：text 只含对话历史 user/assistant 文本（由 renderSummaryInput 构造），
+ * 不含任何文档 chunk 原文，不会触碰 hybrid-agent 的「chunk 不上传云端」红线。
+ * 这里直接写 fetch 而不复用 buildPlannerRequestBody，避免误传检索信号 / chunks。
+ *
+ * 失败契约：config 缺失 / 超时 / 网络 / auth / http / 空响应 → fallback=true 返回，
+ * 调用方据此放弃本轮压缩（不阻断问答，下一轮自动重试）。
+ */
+export async function summarizeHistoryViaCloud(
+  text: string,
+  config: CloudPlannerConfig,
+  options: SummarizeViaCloudOptions = {},
+): Promise<SummarizeViaCloudResult> {
+  const apiKey = config.apiKey?.trim();
+  const baseUrl = config.baseUrl?.trim();
+  if (!apiKey || !baseUrl) {
+    return { summary: "", fallback: true, fallbackReason: "config" };
+  }
+
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const fetchImpl: FetchLike = options.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let httpStatus: number | undefined;
+  try {
+    const response = await fetchImpl(buildEndpoint(baseUrl), {
+      method: "POST",
+      headers: buildCloudHeaders({
+        apiKey,
+        upstreamBaseUrl: config.upstreamBaseUrl,
+      }),
+      body: JSON.stringify({
+        model: config.model?.trim() || DEFAULT_CLOUD_MODEL,
+        temperature: 0, // 摘要要确定性
+        max_tokens: 512, // 摘要 200 字以内，512 token 足够
+        messages: [
+          {
+            role: "system",
+            content: SUMMARIZE_VIA_CLOUD_PROMPT.replace("{input}", text),
+          },
+          { role: "user", content: "请输出摘要" },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    httpStatus = response.status;
+    if (response.status === 401 || response.status === 403) {
+      return { summary: "", fallback: true, fallbackReason: "auth", httpStatus };
+    }
+    if (!response.ok) {
+      return { summary: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+
+    let data: ChatCompletionResponse;
+    try {
+      data = (await response.json()) as ChatCompletionResponse;
+    } catch {
+      return { summary: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+
+    const content = data.choices?.[0]?.message?.content;
+    const summary = typeof content === "string" ? content.trim() : "";
+    if (!summary) {
+      return { summary: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+    return {
+      summary: summary.slice(0, MAX_SUMMARY_CHARS),
+      fallback: false,
+      httpStatus,
+    };
+  } catch (err) {
+    if (isAbortError(err)) {
+      return { summary: "", fallback: true, fallbackReason: "timeout" };
+    }
+    return { summary: "", fallback: true, fallbackReason: "network" };
+  } finally {
+    clearTimeout(timer);
   }
 }

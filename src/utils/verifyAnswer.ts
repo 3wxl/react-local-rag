@@ -159,7 +159,7 @@ export async function verifyAnswer(
   const contextTokens = tokenize(contextText);
   const contextNumbers = new Set(extractNumbers(contextText));
 
-  let semanticMap = new Map<string, number>();
+  const semanticMap = new Map<string, number>();
   let source: "semantic" | "lexical" = "semantic";
   try {
     const scores = await verifySentences(indexId, claimTexts);

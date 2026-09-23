@@ -1,12 +1,43 @@
 import { CheckCircleIcon, MenuIcon, UploadIcon } from "./icons";
 
+export type AgentModeBanner = "local-rag" | "hybrid-agent" | "cloud-only";
+
 interface ChatHeaderProps {
   title: string;
   docName?: string;
   chunkCount: number;
   docLoading: boolean;
+  /** 当前 Agent 模式（用于顶部状态横幅提示） */
+  modeBanner?: AgentModeBanner;
   onOpenSidebar: () => void;
   onUploadClick: () => void;
+}
+
+/** 模式状态横幅：纯本地 / 混合 / 纯云端 三态提示 */
+function ModeBanner({ mode }: { mode: AgentModeBanner }) {
+  if (mode === "local-rag") {
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+        <span>✅</span>
+        <span>离线模式，全部计算在浏览器</span>
+      </div>
+    );
+  }
+  if (mode === "hybrid-agent") {
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/30">
+        <span>⚠️</span>
+        <span>云端仅任务规划，文档原文不会上传</span>
+      </div>
+    );
+  }
+  // cloud-only：本地检索 Top-K 分片，仅将相关分片发送云端生成
+  return (
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/30">
+      <span>📄</span>
+      <span>云端 RAG：本地检索分片发送云端作答</span>
+    </div>
+  );
 }
 
 /** 主区域顶栏：菜单 / 会话标题与文档状态 / 上传文档 */
@@ -15,6 +46,7 @@ export function ChatHeader({
   docName,
   chunkCount,
   docLoading,
+  modeBanner,
   onOpenSidebar,
   onUploadClick,
 }: ChatHeaderProps) {
@@ -28,8 +60,11 @@ export function ChatHeader({
         <MenuIcon className="w-5 h-5" />
       </button>
 
-      <div className="flex-1 min-w-0">
-        <h1 className="text-sm font-semibold truncate">{title}</h1>
+      <div className="flex-1 min-w-0 flex flex-col gap-1">
+        <div className="flex items-center gap-2 min-w-0">
+          <h1 className="text-sm font-semibold truncate">{title}</h1>
+          {modeBanner && <ModeBanner mode={modeBanner} />}
+        </div>
         {docName ? (
           <p className="text-xs text-ink-faint truncate flex items-center gap-1">
             <CheckCircleIcon className="w-3 h-3 text-emerald-500" />

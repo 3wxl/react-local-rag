@@ -16,21 +16,17 @@ export const THEME_META: Record<
   sepia: { label: "护眼", icon: "eye", class: "theme-sepia" },
 };
 
+/** 初始主题：本地偏好优先，缺省跟随系统 prefers-color-scheme（惰性初始化，不在 effect 里 setState） */
+function readInitialTheme(): ThemeMode {
+  const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
+  if (stored && ORDER.includes(stored)) return stored;
+  if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) return "dark";
+  return "light";
+}
+
 /** 主题状态管理：localStorage 持久化 + 根元素 class 同步 */
 export function useTheme() {
-  const [theme, setTheme] = useState<ThemeMode>("light");
-
-  /* 初始化：读取本地偏好，缺省跟随系统 prefers-color-scheme */
-  useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
-    if (stored && ORDER.includes(stored)) {
-      setTheme(stored);
-      return;
-    }
-    if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
-      setTheme("dark");
-    }
-  }, []);
+  const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
 
   /* 同步：把主题 class 写到 <html> 根元素，全 App 自动生效 */
   useEffect(() => {

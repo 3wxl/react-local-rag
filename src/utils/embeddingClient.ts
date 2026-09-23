@@ -1,6 +1,10 @@
 import EmbeddingWorker from "../worker/embedding.worker?worker";
 import type { VectorChunk } from "../types/doc";
 import { embeddingError, workerCrashError, workerTimeoutError } from "./errors";
+import { acquireInferenceLock } from "./inferenceLock";
+
+/** 文档向量化的客户端切批大小：每批独立持锁，使实时问答能在批次间插入 */
+const EMBED_BATCH_SIZE = 8;
 
 /**
  * embedding worker 的主线程客户端（Promise 化请求/响应）：
@@ -10,7 +14,7 @@ import { embeddingError, workerCrashError, workerTimeoutError } from "./errors";
  */
 
 interface PendingEntry {
-  resolve: (value: any) => void;
+  resolve: (value: unknown) => void;
   reject: (err: Error) => void;
   onProgress?: (done: number, total: number) => void;
 }
@@ -46,6 +50,20 @@ export interface SentenceScore {
   score: number;
 }
 
+/** embedding worker 回传消息的统一形态（按 type 判别，字段可选） */
+interface WorkerMessage {
+  type: string;
+  id?: number;
+  progress?: number;
+  error?: string;
+  done?: number;
+  total?: number;
+  vectors?: Float32Array[];
+  /** search-result 时为 SearchHit[]，verify-result 时为 SentenceScore[] */
+  results?: unknown;
+  mode?: string;
+}
+
 /* ---------- 全局单例 worker ---------- */
 
 let worker: Worker | null = null;
@@ -71,9 +89,9 @@ function getWorker(): Worker {
     worker = new EmbeddingWorker();
 
     worker.onmessage = (e: MessageEvent) => {
-      const msg = e.data as any;
+      const msg = e.data as WorkerMessage;
       if (msg?.type === "load-progress") {
-        loadListeners.forEach((fn) => fn(msg.progress));
+        loadListeners.forEach((fn) => fn(msg.progress ?? 0));
         return;
       }
       const entry = msg?.id != null ? pending.get(msg.id) : undefined;
@@ -89,42 +107,42 @@ function getWorker(): Worker {
         return;
       }
 
-      if (!entry) return;
+      // entry 存在 ⇒ 必有 id（pending 一律带 id 注册）
+      if (!entry || msg.id == null) return;
+      const id = msg.id;
       // 收到任意响应都清除超时
-      const timer = timeouts.get(msg.id);
+      const timer = timeouts.get(id);
       if (timer) {
         clearTimeout(timer);
-        timeouts.delete(msg.id);
+        timeouts.delete(id);
       }
 
       switch (msg.type) {
         case "embed-progress":
-          entry.onProgress?.(msg.done, msg.total);
+          entry.onProgress?.(msg.done ?? 0, msg.total ?? 0);
           break;
         case "embed-result":
-          entry.resolve(
-            (msg.vectors as Float32Array[]).map((v) => Array.from(v)),
-          );
-          pending.delete(msg.id);
+          entry.resolve((msg.vectors ?? []).map((v) => Array.from(v)));
+          pending.delete(id);
           break;
         case "search-result":
           entry.resolve({
             mode: (msg.mode as SearchMode) ?? "hybrid",
-            hits: msg.results as SearchHit[],
+            hits: (msg.results ?? []) as SearchHit[],
           } as SearchResult);
-          pending.delete(msg.id);
+          pending.delete(id);
           break;
         case "verify-result":
-          entry.resolve(msg.results as SentenceScore[]);
-          pending.delete(msg.id);
+          entry.resolve((msg.results ?? []) as SentenceScore[]);
+          pending.delete(id);
           break;
         case "unloaded":
           entry.resolve(undefined);
-          pending.delete(msg.id);
+          pending.delete(id);
           break;
         case "error":
           entry.reject(embeddingError(new Error(msg.error || "向量模型线程出错")));
-          pending.delete(msg.id);
+          pending.delete(id);
           break;
       }
     };
@@ -154,7 +172,11 @@ function request<T>(
   const w = getWorker();
   const id = nextId++;
   return new Promise<T>((resolve, reject) => {
-    pending.set(id, { resolve, reject, ...entry });
+    pending.set(id, {
+      resolve: (v: unknown) => resolve(v as T),
+      reject,
+      ...entry,
+    });
     // 超时兜底：模型加载卡死/消息丢失
     const timer = setTimeout(() => {
       if (pending.has(id)) {
@@ -186,6 +208,11 @@ async function withLoadListener<T>(
 /**
  * 批量文档 chunk 向量化（passage 前缀），worker 内缓存索引。
  * 返回的向量仅用于 IndexedDB 持久化，检索时不再依赖主线程持有向量。
+ *
+ * 优先级与分批让出：文档向量化是后台任务（low），客户端按 EMBED_BATCH_SIZE(8)
+ * 切批，每批独立 acquire/release 推理锁；用户实时问答（high）可在任意两批之间
+ * 插入优先执行，不必等整篇文档向量化完成。worker 端以 append 模式累积索引。
+ * 单批失败会留下部分索引，但文档不会挂载；下次重新上传首批 append=false 自动覆盖。
  */
 export function embedPassages(
   indexId: string,
@@ -193,13 +220,39 @@ export function embedPassages(
   options: EmbedOptions = {},
 ): Promise<number[][]> {
   if (texts.length === 0) return Promise.resolve([]);
-  return withLoadListener(options.onLoadProgress, () =>
-    request<number[][]>(
-      { type: "embed-passages", indexId, texts },
-      { onProgress: options.onBatchProgress },
-      LOAD_TIMEOUT, // 首次加载模型可能很久
-    ),
-  );
+
+  return (async (): Promise<number[][]> => {
+    const all: number[][] = new Array(texts.length);
+
+    await withLoadListener(options.onLoadProgress, async () => {
+      for (let start = 0; start < texts.length; start += EMBED_BATCH_SIZE) {
+        const slice = texts.slice(start, start + EMBED_BATCH_SIZE);
+        const batchEnd = Math.min(start + EMBED_BATCH_SIZE, texts.length);
+        const release = await acquireInferenceLock("bge:embed-passages", "low");
+        try {
+          // 首批覆盖（顺带承担模型首次加载，给长超时）；后续批 append 累积
+          const batchVectors = await request<number[][]>(
+            {
+              type: "embed-passages",
+              indexId,
+              texts: slice,
+              append: start > 0,
+            },
+            undefined,
+            start === 0 ? LOAD_TIMEOUT : DEFAULT_TIMEOUT,
+          );
+          for (let j = 0; j < batchVectors.length; j++) {
+            all[start + j] = batchVectors[j];
+          }
+          options.onBatchProgress?.(batchEnd, texts.length);
+        } finally {
+          release();
+        }
+      }
+    });
+
+    return all;
+  })();
 }
 
 /**
@@ -231,6 +284,8 @@ export function removeVectorIndex(indexId: string): void {
  * 混合检索：worker 内分别对向量余弦和 BM25 关键词分排名，用 RRF 倒数排名融合后返回 topK。
  * 向量模型不可用时自动降级为纯 BM25（mode="bm25"），不阻断问答。
  * 请求体不含任何向量，检索结果也不回传向量。
+ *
+ * 推理锁：query 向量化是 ORT 推理，与本地 LLM 互斥，防止 WASM 堆冲突。
  */
 export function searchTopK(
   indexId: string,
@@ -238,21 +293,41 @@ export function searchTopK(
   topK = 3,
   options: EmbedOptions = {},
 ): Promise<SearchResult> {
-  return withLoadListener(options.onLoadProgress, () =>
-    request<SearchResult>({ type: "search", indexId, query, topK }),
-  );
+  return (async (): Promise<SearchResult> => {
+    const release = await acquireInferenceLock("bge:search");
+    try {
+      return await withLoadListener(options.onLoadProgress, () =>
+        request<SearchResult>({ type: "search", indexId, query, topK }),
+      );
+    } finally {
+      release();
+    }
+  })();
 }
 
 /**
  * 幻觉校验：worker 内逐句生成向量，与全索引算最大余弦相似度。
  * 纯向量数学判定，不调用大模型、不传输向量，只返回每句的依据分。
+ *
+ * 推理锁：逐句向量化是 ORT 推理，与本地 LLM 互斥。
  */
 export function verifySentences(
   indexId: string,
   sentences: string[],
 ): Promise<SentenceScore[]> {
   if (sentences.length === 0) return Promise.resolve([]);
-  return request<SentenceScore[]>({ type: "verify", indexId, sentences });
+  return (async (): Promise<SentenceScore[]> => {
+    const release = await acquireInferenceLock("bge:verify");
+    try {
+      return await request<SentenceScore[]>({
+        type: "verify",
+        indexId,
+        sentences,
+      });
+    } finally {
+      release();
+    }
+  })();
 }
 
 /**
