@@ -1,13 +1,28 @@
-import { splitQuestion, isEnoughInfo } from "./agentPlanner";
-import { searchTopK } from "../utils/embeddingClient";
+import { splitQuestion, isEnoughInfo, condenseQuery } from "./agentPlanner";
+import {
+  searchTopK,
+  releaseReranker,
+  unloadEmbeddingModel,
+} from "../utils/embeddingClient";
+import type { SearchHit } from "../utils/retrieval";
+import {
+  buildEvidence,
+  toVerifyPassages,
+  type ContextRef,
+} from "../utils/citation";
 import {
   generateAnswer,
   type GenerateCallbacks,
   type GenerateHandle,
 } from "../utils/generateAnswer";
-import { verifyAnswer, type VerificationResult } from "../utils/verifyAnswer";
+import {
+  verifyAnswer,
+  buildRefusalResult,
+  NO_RELEVANT_ANSWER,
+  type VerificationResult,
+} from "../utils/verifyAnswer";
 import type { HistoryTurn } from "../utils/history";
-import { startTimer } from "../utils/perf";
+import { startTimer, recordSearchResult } from "../utils/perf";
 import {
   requestCloudPlanner,
   requestCloudAnswer,
@@ -29,6 +44,8 @@ export interface SelfRagAgentResult {
   steps: AgentStep[];
   /** 实际用于生成的去重后片段（也是校验上下文） */
   chunks: string[];
+  /** 编号引用卡片（与答案角标 [n] 一一对应，供 UI 渲染与点击定位） */
+  contexts: ContextRef[];
   /** 实际执行的「检索-判断」轮数 */
   iterations: number;
   /** 是否达到最大轮次仍判为不足（强制终止） */
@@ -62,6 +79,13 @@ export interface SelfRagOptions {
   history?: HistoryTurn[];
   /** 多轮对话：滚动摘要 */
   historySummary?: string;
+  /** 是否启用 reranker 两阶段精排（默认关闭，见 useAgentSettings.DEFAULT_ENABLE_RERANK） */
+  rerank?: boolean;
+  /**
+   * 已改写好的检索用问题。由上层（Hybrid Agent）先改写后透传，
+   * 避免同一问题被重复改写两次（多一次 LLM 推理）。
+   */
+  retrievalQuery?: string;
 }
 
 /**
@@ -108,9 +132,31 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
   }; //每次异步操作前调用，一旦用户取消，直接抛异常中断整个流程
 
   const promise = (async (): Promise<SelfRagAgentResult> => {
+    // 0. 多轮追问改写：把「它的参数呢？」补全成独立问题，**只用于检索**
+    //    （生成仍用原问题：用户看到的答案要对应用户真正问的那句话）
+    //    无历史 / 问题本身已独立时 condenseQuery 内部直接短路，不额外推理
+    //    上层（Hybrid）已改写时直接用透传结果，不重复改写
+    let retrievalQuestion = options.retrievalQuery;
+    if (!retrievalQuestion) {
+      const condensed = await condenseQuery(
+        question,
+        options.history ?? [],
+        callbacks.onLoadProgress,
+      );
+      ensureAlive();
+      if (!condensed.fallback && condensed.query !== question) {
+        emit({
+          type: "plan",
+          subQuestion: question,
+          thinking: `追问改写：结合最近对话把问题补全为「${condensed.query}」（仅用于检索）`,
+        });
+      }
+      retrievalQuestion = condensed.query;
+    }
+
     // 1. 拆分子问题（0.5B 乱格式时 splitQuestion 内部兜底为 [原问题]）
     const tPlan = startTimer("agent-plan");
-    const split = await splitQuestion(question, callbacks.onLoadProgress); //调用`agentPlanner.splitQuestion`，传入用户问题，模型加载进度回调透传
+    const split = await splitQuestion(retrievalQuestion, callbacks.onLoadProgress); //调用`agentPlanner.splitQuestion`，传入用户问题（已改写则用改写句），模型加载进度回调透传
     ensureAlive();
     // 子问题数同时受拆分上限（3）与最大迭代轮次约束
     const subQuestions = split.subQuestions.slice(0, maxIterations); //限制子问题数量，不会超过最大检索轮次，防止子问题太多
@@ -127,7 +173,9 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
     });
 
     // 2. 逐子问题：检索 → 收集 → 充足性判断
-    const collected = new Set<string>(); // **chunk 去重**。按文本内容去重，避免多次检索拿到一模一样的片段，浪费上下文窗口。
+    //    按文本内容去重，避免多次检索拿到一模一样的片段浪费上下文窗口；
+    //    保留整条命中（而非只留文本），后面要拿它的 chunkIds/页码/章节做引用与校验范围
+    const collected = new Map<string, SearchHit>();
     let enough = false;
     let iterations = 0;
 
@@ -139,13 +187,15 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
       // 2a. 混合检索（向量 + BM25 RRF；向量不可用时 embeddingClient 内部降级纯 BM25）
       const search = await searchTopK(indexId, subQ, topK, {
         onLoadProgress: callbacks.onLoadProgress,
+        rerank: options.rerank,
       });
       ensureAlive();
+      recordSearchResult(search);
 
       const newChunks: string[] = [];
       for (const hit of search.hits) {
         if (!collected.has(hit.content)) {
-          collected.add(hit.content);
+          collected.set(hit.content, hit);
           newChunks.push(hit.content);
         }
       }
@@ -157,7 +207,7 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
       }); //emit `retrieve`步骤：UI 展示当前子问题检索结果、命中片段数量、新增片段数量。
 
       // 2b. 信息充足性判断（本地模型，JS 兜底提取「足够/不足」）
-      const chunksArr = [...collected];
+      const chunksArr = [...collected.keys()];
       const judge = await isEnoughInfo(
         question,
         chunksArr,
@@ -188,7 +238,44 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
 
     // 达到最大轮次仍不足：强制终止，用已收集的全部片段作答（模型会据此拒答或部分回答）
     const forcedStop = !enough;
-    const chunks = [...collected];
+    const hits = [...collected.values()];
+    const chunks = hits.map((h) => h.content);
+
+    // 相关度门限把全部候选都滤掉了：直接走「文档未提及」拒答分支，
+    // 不再硬喂噪声片段给模型（省一次完整生成，也避免模型被无关片段带偏）
+    if (chunks.length === 0) {
+      emit({
+        type: "synthesize",
+        thinking:
+          "全部子问题检索后无相关片段（相关度低于门限），直接按「文档中没有找到相关内容」拒答，不再调用模型生成",
+      });
+      return {
+        answer: NO_RELEVANT_ANSWER,
+        verification: buildRefusalResult(NO_RELEVANT_ANSWER),
+        steps,
+        chunks: [],
+        contexts: [],
+        iterations,
+        forcedStop: true,
+        splitFallback: split.fallback,
+      };
+    }
+
+    // 检索已结束、马上加载本地 Qwen：先释放精排模型（常驻 300~400MB），
+    // 避免与 Qwen 争 WASM 堆触发 OrtRun std::bad_alloc
+    if (options.rerank) await releaseReranker().catch(() => {});
+
+    // 检索全部结束、chunk 已拿到：卸载向量模型（BGE）权重，把 WASM 堆让给本地 Qwen。
+    // 此刻起只依赖 LLM 流式生成，不再需要向量模型，卸载不影响继续吐 token。
+    // clearIndex=false 只释放权重、保留向量索引；生成结束后的 verifyAnswer 再用时
+    // getEmbedder 会按需自动重新加载模型（索引无需重建），而那时流式回答已输出完毕。
+    // 卸载失败不阻断生成。
+    try {
+      await unloadEmbeddingModel(false);
+    } catch {
+      /* 卸载失败不阻断生成 */
+    }
+
     emit({
       type: "synthesize",
       thinking: forcedStop
@@ -196,11 +283,12 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
         : `信息充足，汇总 ${chunks.length} 条片段生成最终答案`,
     });
 
-    // 3. 汇总片段调 LLM 流式生成最终答案（沿用原普通 RAG 的生成器与思考流）
+    // 3. 汇总命中转编号段落（每段带 [n] 文件名·章节·页码），调 LLM 流式生成最终答案
+    const { passages, contexts } = buildEvidence(hits);
     emit({ type: "generate", subQuestion: question });
     genHandle = generateAnswer(
       question,
-      chunks,
+      passages,
       {
         onLoadProgress: callbacks.onLoadProgress,
         onGenerating: callbacks.onGenerating,
@@ -213,14 +301,18 @@ splitQuestion /isEnoughInfo 调用的 llm worker 都是**一次性短任务**，
     genHandle = null;
     ensureAlive();
 
-    // 4. 幻觉后处理校验（确定性 JS 校验，不靠模型自觉）
-    const verification = await verifyAnswer(indexId, answer, chunks.join("\n"));
+    // 4. 幻觉后处理校验（确定性 JS 校验，不靠模型自觉）。
+    //    语义比对范围收敛到「答案实际引用的段落 + 其窗口」，不再对全篇索引取 max。
+    const verification = await verifyAnswer(indexId, answer, chunks.join("\n"), {
+      passages: toVerifyPassages(contexts),
+    });
 
     return {
       answer,
       verification,
       steps,
       chunks,
+      contexts,
       iterations,
       forcedStop,
       splitFallback: split.fallback,
@@ -259,6 +351,8 @@ export interface HybridAgentResult {
   verification?: VerificationResult;
   /** 本地实际使用的片段（context 展示；纯云端时为空数组） */
   chunks: string[];
+  /** 本地答案的编号引用卡片（纯云端时为空数组） */
+  contexts: ContextRef[];
   /** 完整步骤链 */
   steps: AgentStep[];
   /** 本地 Self-RAG 实际迭代轮数（纯云端为 0） */
@@ -308,6 +402,8 @@ export function runHybridAgent(
   let cancelled = false;
   let subHandle: SelfRagAgentHandle | null = null;
   const cloudAbort = new AbortController();
+  /** 本层已改写好的检索用问题（在 promise 内赋值，供 runLocal 透传给子 Agent） */
+  let hybridRetrievalQuery: string | undefined;
 
   const ensureAlive = () => {
     if (cancelled) throw new Error("Agent 已取消");
@@ -339,6 +435,9 @@ export function runHybridAgent(
         maxIterations: options.maxIterations,
         history: options.history,
         historySummary: options.historySummary,
+        rerank: options.rerank,
+        // 改写已在 Hybrid 层做过，透传给子 Agent 避免重复推理
+        retrievalQuery: hybridRetrievalQuery,
       },
     );
     subHandle = handle;
@@ -355,6 +454,7 @@ export function runHybridAgent(
     answer: local.answer,
     verification: local.verification,
     chunks: local.chunks,
+    contexts: local.contexts,
     steps,
     iterations: local.iterations,
     plannerFallback: false,
@@ -362,6 +462,16 @@ export function runHybridAgent(
   });
 
   const promise = (async (): Promise<HybridAgentResult> => {
+    // 0. 追问改写：本地预检索用改写句（含代词时），生成阶段仍用原问题
+    const condensed = await condenseQuery(
+      question,
+      options.history ?? [],
+      callbacks.onLoadProgress,
+    );
+    ensureAlive();
+    const retrievalQuestion = condensed.query;
+    hybridRetrievalQuery = retrievalQuestion;
+
     // 1. 本地轻量检索：只用 RRF 分数构造数字信号，片段原文不进入云端请求
     //    无文档/索引未同步时 searchTopK 会失败，兜底为空信号，让云端规划走 GENERAL_KNOWLEDGE
     let signals: { hitCount: number; topScore: number; mode: string } = {
@@ -370,14 +480,16 @@ export function runHybridAgent(
       mode: "empty",
     };
     try {
-      const search = await searchTopK(indexId, question, topK, {
+      const search = await searchTopK(indexId, retrievalQuestion, topK, {
         onLoadProgress: callbacks.onLoadProgress,
+        rerank: options.rerank,
       });
       ensureAlive();
+      recordSearchResult(search);
       const topHit = search.hits[0];
       signals = {
         hitCount: search.hits.length,
-        topScore: topHit?.score ?? 0,
+        topScore: topHit?.rrfScore ?? 0,
         mode: search.mode,
       };
     } catch (searchErr) {
@@ -474,6 +586,7 @@ export function runHybridAgent(
         answer: cloud.text,
         cloudContent: cloud.text,
         chunks: [],
+        contexts: [],
         steps,
         iterations: 0,
         plannerFallback: false,
@@ -533,6 +646,7 @@ export function runHybridAgent(
       cloudContent: merged.cloud.text,
       verification: merged.local?.verification,
       chunks: local.chunks,
+      contexts: local.contexts,
       steps,
       iterations: local.iterations,
       plannerFallback: false,

@@ -1,0 +1,104 @@
+{
+  "name": "幻觉校验阈值标注集",
+  "description": "人工标注：每句是否真有原文依据。supported=true 的句子取材自 corpus 原文（含改写），false 的是合理但不存在的说法（多为改动数字或张冠李戴）。用于量化 verifyAnswer 的 P/R，并校准 supported/weak 阈值。",
+  "corpusDir": "corpus",
+  "docs": [
+    {
+      "doc": "技术方案.md",
+      "samples": [
+        { "id": "t01", "sentence": "文档分块使用 bge-small-zh-v1.5 模型进行向量化。", "supported": true },
+        { "id": "t02", "sentence": "向量维度为 512 维。", "supported": true },
+        { "id": "t03", "sentence": "系统采用本地优先的混合检索架构，同时建立向量索引与 BM25 关键词索引。", "supported": true },
+        { "id": "t04", "sentence": "检索阶段使用 RRF 倒数排名融合算法合并两路结果，融合常数 k 取 60。", "supported": true },
+        { "id": "t05", "sentence": "语义证据权重为 0.75，词法证据权重为 0.25。", "supported": true },
+        { "id": "t06", "sentence": "向量模型加载失败时，检索会自动降级为纯关键词检索。", "supported": true },
+        { "id": "t07", "sentence": "系统内存峰值控制在 800MB 以内。", "supported": true },
+        { "id": "t08", "sentence": "文档分块的最大长度为 200 个 token，整句重叠 2 句。", "supported": true },
+        { "id": "t09", "sentence": "向量模型采用量化方式加载，内存占用约 150MB。", "supported": true },
+        { "id": "t10", "sentence": "系统采用三路检索架构，同时使用向量、关键词与图数据库。", "supported": false },
+        { "id": "t11", "sentence": "向量维度为 1024 维，使用 bge-large 模型。", "supported": false },
+        { "id": "t12", "sentence": "融合常数 k 取 100，以获得更平滑的排名。", "supported": false },
+        { "id": "t13", "sentence": "语义证据权重为 0.5，词法证据权重为 0.5。", "supported": false },
+        { "id": "t14", "sentence": "系统支持 GPU 加速，推理速度提升 5 倍。", "supported": false },
+        { "id": "t15", "sentence": "云端接口超时设置为 30 秒。", "supported": false },
+        { "id": "t16", "sentence": "历史对话超过 5000 字符时触发自动摘要压缩。", "supported": false }
+      ]
+    },
+    {
+      "doc": "员工手册.md",
+      "samples": [
+        { "id": "e01", "sentence": "员工入职满一年可享受 5 天带薪年假。", "supported": true },
+        { "id": "e02", "sentence": "年假上限为 15 天，须在次年 3 月底前使用完毕。", "supported": true },
+        { "id": "e03", "sentence": "周末加班按 1.5 倍工资计算加班费，法定节假日按 3 倍计算。", "supported": true },
+        { "id": "e04", "sentence": "出差住宿标准为一线城市每晚 500 元。", "supported": true },
+        { "id": "e05", "sentence": "年度绩效为 A 及以上的员工可获得 2 个月工资的年终奖。", "supported": true },
+        { "id": "e06", "sentence": "报销单须在出差结束后 15 个工作日内提交。", "supported": true },
+        { "id": "e07", "sentence": "员工入职满三个月即可享受 10 天带薪年假。", "supported": false },
+        { "id": "e08", "sentence": "出差住宿标准为一线城市每晚 800 元。", "supported": false },
+        { "id": "e09", "sentence": "年度绩效为 B 及以上的员工可获得 3 个月工资的年终奖。", "supported": false },
+        { "id": "e10", "sentence": "公司为员工提供免费午餐与班车服务。", "supported": false },
+        { "id": "e11", "sentence": "调休申请须在加班发生后 7 天内提出。", "supported": false },
+        { "id": "e12", "sentence": "员工每年可报销 2000 元的学习培训费用。", "supported": false }
+      ]
+    },
+    {
+      "doc": "产品手册.md",
+      "samples": [
+        { "id": "p01", "sentence": "标准版单台售价为 3980 元，包含一年保修。", "supported": true },
+        { "id": "p02", "sentence": "专业版单台售价为 5980 元，包含三年保修。", "supported": true },
+        { "id": "p03", "sentence": "批量采购 100 台以上可享受 8.5 折优惠。", "supported": true },
+        { "id": "p04", "sentence": "设备工作温度为负 20 摄氏度至 70 摄氏度。", "supported": true },
+        { "id": "p05", "sentence": "整机功耗峰值为 15 瓦，待机功耗为 3 瓦。", "supported": true },
+        { "id": "p06", "sentence": "保修期内非人为损坏免费更换。", "supported": true },
+        { "id": "p07", "sentence": "设备支持 Modbus、MQTT 与 OPC UA 三种工业协议。", "supported": true },
+        { "id": "p08", "sentence": "固件升级失败时设备会自动回滚到上一个稳定版本。", "supported": true },
+        { "id": "p09", "sentence": "标准版单台售价为 4980 元，包含两年保修。", "supported": false },
+        { "id": "p10", "sentence": "批量采购 200 台以上可享受 7 折优惠。", "supported": false },
+        { "id": "p11", "sentence": "设备工作温度为零下 40 摄氏度至 85 摄氏度。", "supported": false },
+        { "id": "p12", "sentence": "整机功耗峰值为 25 瓦，待机功耗为 5 瓦。", "supported": false },
+        { "id": "p13", "sentence": "设备支持 5G 与蓝牙两种无线接入方式。", "supported": false },
+        { "id": "p14", "sentence": "产品通过 IP68 防水认证，可长期水下作业。", "supported": false }
+      ]
+    },
+    {
+      "doc": "会议纪要.md",
+      "samples": [
+        { "id": "m01", "sentence": "第一季度完成数据中台 2.0 版本上线。", "supported": true },
+        { "id": "m02", "sentence": "移动端改版目标是将移动端日活提升 30%。", "supported": true },
+        { "id": "m03", "sentence": "第四季度进行年度技术债务清理，预算为 200 万元。", "supported": true },
+        { "id": "m04", "sentence": "市场推广预算全年为 500 万元，其中线上投放占 60%。", "supported": true },
+        { "id": "m05", "sentence": "数据中台架构评审定于 3 月 20 日进行。", "supported": true },
+        { "id": "m06", "sentence": "移动端设计稿需在 4 月 1 日前完成终稿确认。", "supported": true },
+        { "id": "m07", "sentence": "数据中台 2.0 依赖云厂商新发布的流式计算引擎。", "supported": true },
+        { "id": "m08", "sentence": "移动端改版目标是将移动端日活提升 50%。", "supported": false },
+        { "id": "m09", "sentence": "技术债务清理预算为 300 万元。", "supported": false },
+        { "id": "m10", "sentence": "市场推广预算全年为 800 万元。", "supported": false },
+        { "id": "m11", "sentence": "数据中台架构评审定于 4 月 20 日进行。", "supported": false },
+        { "id": "m12", "sentence": "国际化首批覆盖欧洲与北美市场。", "supported": false }
+      ]
+    },
+    {
+      "doc": "实验室化学品安全管理办法.md",
+      "samples": [
+        { "id": "c01", "sentence": "化学品按危险特性分为爆炸品、压缩气体、易燃液体、氧化剂、毒害品与腐蚀品六类。", "supported": true },
+        { "id": "c02", "sentence": "剧毒、易制毒化学品实行双人双锁管理。", "supported": true },
+        { "id": "c03", "sentence": "单次采购量不得超过 30 天使用量。", "supported": true },
+        { "id": "c04", "sentence": "氧化剂与还原剂的物理间距不得小于 2 米。", "supported": true },
+        { "id": "c05", "sentence": "易燃液体库房温度不得超过 30 摄氏度。", "supported": true },
+        { "id": "c06", "sentence": "库房相对湿度控制在 45% 至 75% 之间。", "supported": true },
+        { "id": "c07", "sentence": "剧毒化学品每周盘点一次，盘点差异超过 0.5% 时须当日报告。", "supported": true },
+        { "id": "c08", "sentence": "废液桶装载量不得超过容积的 80%，暂存时间不得超过 90 天。", "supported": true },
+        { "id": "c09", "sentence": "小量泄漏指少于 100 毫升，处理时须从上风向接近。", "supported": true },
+        { "id": "c10", "sentence": "通风柜有效控制风速区间为 0.3 至 0.5 米每秒。", "supported": true },
+        { "id": "c11", "sentence": "氧气与可燃气体钢瓶间距不小于 6 米。", "supported": true },
+        { "id": "c12", "sentence": "新进实验室人员须完成 16 学时培训并经 85 分闭卷考试合格。", "supported": true },
+        { "id": "c13", "sentence": "氧化剂与还原剂的物理间距不得小于 5 米。", "supported": false },
+        { "id": "c14", "sentence": "易燃液体库房温度不得超过 40 摄氏度。", "supported": false },
+        { "id": "c15", "sentence": "废液暂存时间不得超过 180 天。", "supported": false },
+        { "id": "c16", "sentence": "泄漏量超过 1 升时，500 米范围内人员撤至集合点。", "supported": false },
+        { "id": "c17", "sentence": "新进人员须完成 24 学时培训并经 90 分考试合格。", "supported": false },
+        { "id": "c18", "sentence": "气体钢瓶存放间换气次数不低于每小时 12 次。", "supported": false }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,9 @@ import {
 } from "../utils/errors";
 import { stripThinkTags } from "../utils/verifyAnswer";
 import { acquireInferenceLock, type InferencePriority } from "../utils/inferenceLock";
+import { reportDevice } from "../utils/perf";
+import type { DeviceKind } from "../utils/deviceAccel";
+import type { LlmRequest } from "../worker/llm.worker";
 
 const LLM_IDLE_TIMEOUT = 120_000;
 
@@ -18,6 +21,8 @@ const LLM_IDLE_TIMEOUT = 120_000;
 let sharedWorker: Worker | null = null; // 全局唯一LLM Worker实例
 let workerCrashed = false; // 标记worker是否崩溃，崩溃后会重建
 let msgSeq = 0; // 自增任务ID，用来区分多个排队任务
+/** 设备偏好（WebGPU/WASM）：worker 可能尚未创建或已被卸载，先记下，创建时立刻下发 */
+let pendingDevice: DeviceKind | null = null;
 
 interface PendingTask {
   resolve: (text: string) => void;
@@ -53,10 +58,20 @@ function getSharedWorker(): Worker {
   // 崩溃后重建
   workerCrashed = false;
   sharedWorker = new LlmWorker();
+  // 新实例按当前设备偏好加载（worker 内模型是惰性的，这里只下发偏好）
+  if (pendingDevice) {
+    sharedWorker.postMessage({ type: "set-device", device: pendingDevice });
+  }
 
   sharedWorker.onmessage = (e: MessageEvent) => {
     const msg = e.data;
     const id = msg.id;
+
+    // 设备回报（无 id 广播）：模型真正加载 + 预热成功后通告实际生效设备
+    if (msg.type === "device") {
+      reportDevice("llm", msg.device, msg.fallbackReason ?? null);
+      return;
+    }
 
     // load-progress / loading：重置超时 + 路由进度回调
     if (msg.type === "load-progress" || msg.type === "loading") {
@@ -144,7 +159,7 @@ function getSharedWorker(): Worker {
  * 路径统一释放（见 PendingTask.releaseLock）。
  */
 export function callWorker(
-  payload: Record<string, unknown>,
+  payload: LlmRequest,
   onLoadProgress?: (progress: number) => void,
   timeoutMs: number = LLM_IDLE_TIMEOUT,
   priority: InferencePriority = "high",
@@ -192,7 +207,7 @@ export interface StreamingHandle {
  * "等待锁期间被取消" 的边界 —— 通过 task.cancelled 标记，acquire 完成时立即 release。
  */
 export function callWorkerStreaming(
-  payload: Record<string, unknown>,
+  payload: LlmRequest,
   callbacks: StreamingCallbacks = {},
   timeoutMs: number = LLM_IDLE_TIMEOUT,
   priority: InferencePriority = "high",
@@ -249,6 +264,19 @@ export function callWorkerStreaming(
       reject(new Error("用户取消生成"));
     },
   };
+}
+
+/**
+ * 下发本地 LLM 的推理设备偏好（WebGPU / WASM）。
+ *
+ * worker 尚未创建时只记下偏好（不在设置变更时提前创建 worker），
+ * 已存在则直接下发；worker 内若设备真的变了会释放当前模型，下次请求重新加载。
+ */
+export function setLlmDevice(device: DeviceKind): void {
+  pendingDevice = device;
+  if (sharedWorker && !workerCrashed) {
+    sharedWorker.postMessage({ type: "set-device", device });
+  }
 }
 
 /**
@@ -356,6 +384,97 @@ export function parseSubQuestions(raw: string): string[] {
 
   // 4. 全部失败
   return [];
+}
+
+// ──────────────────────────────────────────────
+//  condenseQuery：多轮追问的查询改写
+// ──────────────────────────────────────────────
+
+export interface CondenseResult {
+  /** 改写后用于检索的独立问题（失败时为原问题） */
+  query: string;
+  /** 是否走了兜底（模型输出不可用 / 无历史） */
+  fallback: boolean;
+}
+
+/** 改写任务超时：短输出任务，模型卡死时快速回退原问题，不阻塞问答 */
+const CONDENSE_TIMEOUT_MS = 15_000;
+
+/** 改写结果长度上限（超过视为模型跑偏，回退原问题） */
+const MAX_CONDENSED_CHARS = 120;
+/** 触发改写的条件：问题短或含指代词时才有改写价值 */
+const PRONOUN_RE =
+  /(它|他|她|这个|那个|这些|那些|该|此|上述|上面|前面|其|这里|那里|它俩|两者)/;
+
+/**
+ * 多轮追问的查询改写：用最近 1~2 轮对话把「它的参数呢？」补全成独立问题，**只用于检索**。
+ *
+ * 何时改写：
+ * - 无历史 → 直接返回原问题（无上下文可补）
+ * - 问题较长且不含指代词 → 大概率已独立，跳过改写省一次推理
+ * 何时不改写：模型输出为空/过长/含拒绝语时回退原问题（fallback=true）
+ *
+ * 生成阶段仍用原问题：用户看到的回答要对应用户真正问的那句话。
+ */
+export async function condenseQuery(
+  question: string,
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+  onLoadProgress?: (progress: number) => void,
+): Promise<CondenseResult> {
+  // 只取最近 2 轮（最多 4 条），更早的语境对指代消解无益且拖慢推理
+  const recent = history.slice(-4);
+  if (recent.length === 0) return { query: question, fallback: true };
+  if (question.length > 30 && !PRONOUN_RE.test(question)) {
+    return { query: question, fallback: true };
+  }
+
+  // 任何错误（超时/worker 崩溃/取消）都静默回退原问题，不阻断问答
+  // —— condenseQuery 是辅助任务，失败时上层仍用原问题检索
+  let raw: string;
+  try {
+    raw = await callWorker(
+      { type: "condense", text: question, history: recent },
+      onLoadProgress,
+      CONDENSE_TIMEOUT_MS,
+      "low", // 改写是检索前的辅助任务，不抢占用户等待的推理
+    );
+  } catch (err) {
+    console.warn(
+      "[condense] 改写失败，回退原问题：",
+      err instanceof Error ? err.message : err,
+    );
+    return { query: question, fallback: true };
+  }
+  return parseCondensedQuery(raw, question);
+}
+
+/**
+ * 纯函数：清洗模型输出的改写问题，不可用时回退原问题。
+ * export 供单元测试。
+ */
+export function parseCondensedQuery(
+  raw: string,
+  original: string,
+): CondenseResult {
+  let text = stripThinkTags(raw ?? "").trim();
+  if (!text) return { query: original, fallback: true };
+
+  // 去掉引号/前缀（模型常自作主张加「改后问题：」或引号）
+  text = text.replace(/^["“'「【]|["”'」】]$/g, "").trim();
+  text = text.replace(/^(改写后的问题|改写问题|问题|检索问题)\s*[:：]\s*/, "").trim();
+  // 只保留第一行（模型可能附解释）
+  text = (text.split(/\n/)[0] ?? "").trim();
+  text = text.replace(/^["“'「【]|["”'」】]$/g, "").trim();
+
+  if (!text) return { query: original, fallback: true };
+  if (text.length > MAX_CONDENSED_CHARS) {
+    return { query: original, fallback: true };
+  }
+  // 含拒答/寒暄语说明模型没按指令输出
+  if (/(无法|不能|抱歉|没有足够|请提供)/.test(text)) {
+    return { query: original, fallback: true };
+  }
+  return { query: text, fallback: false };
 }
 
 // ──────────────────────────────────────────────

@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+coverage
 *.local
 
 # Editor directories and files
@@ -38,3 +39,7 @@ public/models/
 
 # vite缓存
 .vite/
+
+docs/eval/results/
+# 答案级评测产物（需本地 Qwen 才能生成，不是 CI 输入；指标记录在 docs/eval/README.md）
+public/eval/answer-eval.json

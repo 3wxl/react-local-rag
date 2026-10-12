@@ -1,0 +1,511 @@
+{
+  "generatedAt": "2026-10-03T12:27:33.273Z",
+  "generator": "scripts/calibrate-verify.ts",
+  "note": "逐条打分固化，供 CI 在无模型环境下复算 P/R。改标注集后必须重新生成。",
+  "samples": [
+    {
+      "id": "t01",
+      "supported": true,
+      "semantic": 0.6698869166792417,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t02",
+      "supported": true,
+      "semantic": 0.5704033441583758,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t03",
+      "supported": true,
+      "semantic": 0.7003132719631624,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t04",
+      "supported": true,
+      "semantic": 0.635414756592574,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t05",
+      "supported": true,
+      "semantic": 0.6379767957065559,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t06",
+      "supported": true,
+      "semantic": 0.7470114213116551,
+      "lexical": 0.85,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t07",
+      "supported": true,
+      "semantic": 0.6219173734023785,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t08",
+      "supported": true,
+      "semantic": 0.6233241496343229,
+      "lexical": 0.8235294117647058,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t09",
+      "supported": true,
+      "semantic": 0.7237503019052247,
+      "lexical": 0.875,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t10",
+      "supported": false,
+      "semantic": 0.6739280931021109,
+      "lexical": 0.5238095238095238,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t11",
+      "supported": false,
+      "semantic": 0.6275421635713803,
+      "lexical": 0.8,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "t12",
+      "supported": false,
+      "semantic": 0.5249883996107713,
+      "lexical": 0.42857142857142855,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "t13",
+      "supported": false,
+      "semantic": 0.6139450988854244,
+      "lexical": 0.8888888888888888,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "t14",
+      "supported": false,
+      "semantic": 0.502087142622473,
+      "lexical": 0.08333333333333333,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "t15",
+      "supported": false,
+      "semantic": 0.5768097315368266,
+      "lexical": 0.9,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "t16",
+      "supported": false,
+      "semantic": 0.6546968930872378,
+      "lexical": 0.9375,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "e01",
+      "supported": true,
+      "semantic": 0.655725972189811,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e02",
+      "supported": true,
+      "semantic": 0.5929609782803167,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e03",
+      "supported": true,
+      "semantic": 0.6778263396464251,
+      "lexical": 0.8888888888888888,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e04",
+      "supported": true,
+      "semantic": 0.5355057123749137,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e05",
+      "supported": true,
+      "semantic": 0.6098499843987986,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e06",
+      "supported": true,
+      "semantic": 0.6056078230127002,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e07",
+      "supported": false,
+      "semantic": 0.6432846561596076,
+      "lexical": 0.6875,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "e08",
+      "supported": false,
+      "semantic": 0.5139412517346361,
+      "lexical": 0.9285714285714286,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "e09",
+      "supported": false,
+      "semantic": 0.6201313540607011,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e10",
+      "supported": false,
+      "semantic": 0.4332532781698171,
+      "lexical": 0.06666666666666667,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e11",
+      "supported": false,
+      "semantic": 0.6224514872661829,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "e12",
+      "supported": false,
+      "semantic": 0.4739200881089273,
+      "lexical": 0.2857142857142857,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "p01",
+      "supported": true,
+      "semantic": 0.6700595984794778,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p02",
+      "supported": true,
+      "semantic": 0.6430256789085697,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p03",
+      "supported": true,
+      "semantic": 0.505952009251482,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p04",
+      "supported": true,
+      "semantic": 0.47621538104225347,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p05",
+      "supported": true,
+      "semantic": 0.5756839411696975,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p06",
+      "supported": true,
+      "semantic": 0.7031927898191221,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p07",
+      "supported": true,
+      "semantic": 0.5606661094516067,
+      "lexical": 0.9230769230769231,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p08",
+      "supported": true,
+      "semantic": 0.6738605945886468,
+      "lexical": 0.9523809523809523,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p09",
+      "supported": false,
+      "semantic": 0.6585203952901693,
+      "lexical": 0.7857142857142857,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "p10",
+      "supported": false,
+      "semantic": 0.5369616795211362,
+      "lexical": 0.8333333333333334,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "p11",
+      "supported": false,
+      "semantic": 0.4914728457988605,
+      "lexical": 0.6923076923076923,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "p12",
+      "supported": false,
+      "semantic": 0.5447145261512553,
+      "lexical": 0.8181818181818182,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "p13",
+      "supported": false,
+      "semantic": 0.5277315150120152,
+      "lexical": 0.2857142857142857,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "p14",
+      "supported": false,
+      "semantic": 0.48588208405877975,
+      "lexical": 0,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "m01",
+      "supported": true,
+      "semantic": 0.5631207021574429,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m02",
+      "supported": true,
+      "semantic": 0.5316843248949947,
+      "lexical": 0.7857142857142857,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m03",
+      "supported": true,
+      "semantic": 0.5356419998605021,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m04",
+      "supported": true,
+      "semantic": 0.5857747776966052,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m05",
+      "supported": true,
+      "semantic": 0.7321278414142022,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m06",
+      "supported": true,
+      "semantic": 0.7035124856333568,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m07",
+      "supported": true,
+      "semantic": 0.6299051385238422,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m08",
+      "supported": false,
+      "semantic": 0.5462738228585677,
+      "lexical": 0.7142857142857143,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "m09",
+      "supported": false,
+      "semantic": 0.47264274938330103,
+      "lexical": 0.8,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "m10",
+      "supported": false,
+      "semantic": 0.4965329132423541,
+      "lexical": 0.9,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "m11",
+      "supported": false,
+      "semantic": 0.7327197235428474,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "m12",
+      "supported": false,
+      "semantic": 0.43182888409623155,
+      "lexical": 0.46153846153846156,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c01",
+      "supported": true,
+      "semantic": 0.7068533363666399,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c02",
+      "supported": true,
+      "semantic": 0.6723396460077521,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c03",
+      "supported": true,
+      "semantic": 0.5658146726166912,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c04",
+      "supported": true,
+      "semantic": 0.5881742857649128,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c05",
+      "supported": true,
+      "semantic": 0.5831991513376161,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c06",
+      "supported": true,
+      "semantic": 0.510285803470736,
+      "lexical": 0.9166666666666666,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c07",
+      "supported": true,
+      "semantic": 0.6941571073285573,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c08",
+      "supported": true,
+      "semantic": 0.6624291443146968,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c09",
+      "supported": true,
+      "semantic": 0.6457916896702306,
+      "lexical": 0.8823529411764706,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c10",
+      "supported": true,
+      "semantic": 0.6327369532775435,
+      "lexical": 0.9375,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c11",
+      "supported": true,
+      "semantic": 0.5415290444898719,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c12",
+      "supported": true,
+      "semantic": 0.6257960530771414,
+      "lexical": 0.8181818181818182,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c13",
+      "supported": false,
+      "semantic": 0.5798760430904343,
+      "lexical": 1,
+      "fabricatedNumber": false
+    },
+    {
+      "id": "c14",
+      "supported": false,
+      "semantic": 0.5893679450351583,
+      "lexical": 0.9285714285714286,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "c15",
+      "supported": false,
+      "semantic": 0.6102555867973298,
+      "lexical": 0.8181818181818182,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "c16",
+      "supported": false,
+      "semantic": 0.6452737741625947,
+      "lexical": 0.8235294117647058,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "c17",
+      "supported": false,
+      "semantic": 0.6242650358556653,
+      "lexical": 0.7647058823529411,
+      "fabricatedNumber": true
+    },
+    {
+      "id": "c18",
+      "supported": false,
+      "semantic": 0.5802480470507231,
+      "lexical": 0.9444444444444444,
+      "fabricatedNumber": false
+    }
+  ]
+}

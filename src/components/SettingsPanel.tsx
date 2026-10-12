@@ -12,6 +12,8 @@ import {
 } from "../agent/useAgentSettings";
 import type { AgentMode } from "../agent/types";
 import { requestCloudPlanner } from "../agent/cloudPlanner";
+import { getDeviceStates } from "../utils/perf";
+import { DEVICE_LABELS } from "../utils/deviceAccel";
 
 interface SettingsPanelProps {
   open: boolean;
@@ -24,12 +26,18 @@ interface SettingsPanelProps {
   onAgentSettingsChange: (patch: Partial<AgentSettings>) => void;
   /** 是否正在生成回答（流式中），用于禁用模式切换 */
   busy: boolean;
+  /** WebGPU 加速开关（可选，失败自动回退 WASM） */
+  webgpuEnabled: boolean;
+  onWebgpuChange: (on: boolean) => void;
+  /** 浏览器是否支持 WebGPU：null = 检测中 */
+  webgpuSupported: boolean | null;
 }
 
 const MODE_LABELS: Record<AgentMode, string> = {
   "local-rag": "纯本地 RAG",
   "hybrid-agent": "混合 Agent",
   "cloud-only": "云端 RAG",
+  "tool-agent": "工具智能体",
 };
 
 /**
@@ -44,6 +52,9 @@ export function SettingsPanel({
   agentSettings,
   onAgentSettingsChange,
   busy,
+  webgpuEnabled,
+  onWebgpuChange,
+  webgpuSupported,
 }: SettingsPanelProps) {
   // 连通性测试状态
   const [testing, setTesting] = useState<"idle" | "testing" | "ok" | "fail">(
@@ -54,25 +65,40 @@ export function SettingsPanel({
   const [pendingCloudOnly, setPendingCloudOnly] = useState(false);
   // 用户是否已同意 cloud-only；同意过本轮不再弹（同一会话期间）
   const cloudOnlyAcceptedRef = useRef(false);
+  // 工具智能体「同意模式」开关的确认弹窗：开启前必须显式同意片段上云
+  const [pendingToolConsent, setPendingToolConsent] = useState(false);
+  const toolConsentAcceptedRef = useRef(false);
 
   if (!open) return null;
 
   const {
     agentMode,
     enableSelfRag,
+    enableRerank,
     cloudApiKey,
     cloudBaseUrl,
     cloudUpstreamUrl,
     cloudModel,
+    allowToolChunksToCloud,
   } = agentSettings;
 
   const activeProvider = matchCloudProvider(cloudUpstreamUrl);
 
+  // 当前生效设备（worker 加载 + 预热成功后回报，非用户开关；打开面板时读取一次）
+  const deviceStates = getDeviceStates();
+  const embedState = deviceStates.embed;
+  const llmState = deviceStates.llm;
+  /** 发生回退时的原因（任一路有就展示；正常情况下两路一致） */
+  const fallbackReason =
+    embedState.fallbackReason ?? llmState.fallbackReason ?? null;
+
   // 仅纯本地 RAG 模式显示 Self-RAG 复选框
   const showSelfRag = agentMode === "local-rag";
-  // 混合 Agent 与纯云端模式都需要云端配置区（API Key + Base URL）
+  // 混合 Agent / 纯云端 / 工具智能体都需要云端配置区（API Key + Base URL）
   const showCloudConfig =
-    agentMode === "hybrid-agent" || agentMode === "cloud-only";
+    agentMode === "hybrid-agent" ||
+    agentMode === "cloud-only" ||
+    agentMode === "tool-agent";
   // 纯云端才显示隐私提示
   const showCloudOnlyHint = agentMode === "cloud-only";
 
@@ -189,6 +215,7 @@ export function SettingsPanel({
               <option value="local-rag">{MODE_LABELS["local-rag"]}</option>
               <option value="hybrid-agent">{MODE_LABELS["hybrid-agent"]}</option>
               <option value="cloud-only">{MODE_LABELS["cloud-only"]}</option>
+              <option value="tool-agent">{MODE_LABELS["tool-agent"]}</option>
             </select>
             <p className="text-xs text-ink-faint mt-2 leading-relaxed">
               {busy
@@ -197,9 +224,53 @@ export function SettingsPanel({
                   ? "纯本地运行：向量+BM25 检索 + Qwen 本地推理，零外部服务，隐私安全。"
                   : agentMode === "hybrid-agent"
                     ? "混合模式：本地检索 + 云端规划（问题路由），按需调用云端大模型。"
-                    : "云端 RAG：本地检索 Top-K 分片，仅将相关分片发送云端生成（无文档时云端基于通用知识回答）。"}
+                    : agentMode === "tool-agent"
+                      ? "工具智能体：云端模型按需调用本地工具（检索 / 文档大纲 / 计算器）多轮规划，默认只回传元数据、正文不上云。"
+                      : "云端 RAG：本地检索 Top-K 分片，仅将相关分片发送云端生成（无文档时云端基于通用知识回答）。"}
             </p>
           </div>
+
+          {/* ── 工具智能体：隐私模式开关 + 说明（仅 tool-agent 模式） ── */}
+          {agentMode === "tool-agent" && (
+            <div className="rounded-lg border border-indigo-400/40 bg-indigo-400/10 px-3 py-2.5 space-y-2">
+              <div className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  id="allowToolChunks"
+                  checked={allowToolChunksToCloud}
+                  disabled={busy}
+                  onChange={(e) => {
+                    if (e.target.checked && !toolConsentAcceptedRef.current) {
+                      setPendingToolConsent(true);
+                      return;
+                    }
+                    if (!e.target.checked) toolConsentAcceptedRef.current = false;
+                    onAgentSettingsChange({
+                      allowToolChunksToCloud: e.target.checked,
+                    });
+                  }}
+                  className="mt-0.5 accent-[var(--accent)] cursor-pointer"
+                />
+                <div>
+                  <label
+                    htmlFor="allowToolChunks"
+                    className="text-sm text-ink cursor-pointer select-none"
+                  >
+                    允许检索片段随工具结果发送云端（同意模式）
+                  </label>
+                  <p className="text-[11px] text-ink-faint mt-0.5 leading-relaxed">
+                    {allowToolChunksToCloud
+                      ? "已开启：search_docs 返回的编号段落原文会随工具结果发送云端，由云端模型直接作答（本地仍做幻觉校验）。"
+                      : "当前为元数据模式（默认）：工具结果只有命中数/文档名/章节/页码，正文不上云；云端只规划检索，答案由本地 Qwen 生成。"}
+                  </p>
+                </div>
+              </div>
+              <p className="text-[10px] text-ink-faint leading-relaxed">
+                工具白名单：search_docs（混合检索）· doc_outline（文档大纲）· calculator（算术）。
+                代理侧对 /v1/agent/step 有独立闸门：轮次上限 + 元数据模式下拒绝非 JSON 的工具结果。
+              </p>
+            </div>
+          )}
 
           {/* ── Self-RAG 复选框（仅纯本地模式） ── */}
           {showSelfRag && (
@@ -222,6 +293,36 @@ export function SettingsPanel({
                 </label>
                 <p className="text-[11px] text-ink-faint mt-0.5 leading-relaxed">
                   模型对检索片段进行相关性打分，过滤低质量片段后再回答，减少噪声干扰。
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* ── 两阶段精排（读本地文档的模式才有意义） ── */}
+          {agentMode !== "cloud-only" && (
+            <div className="flex items-start gap-2 rounded-lg bg-bg-hover px-3 py-2.5">
+              <input
+                type="checkbox"
+                id="rerank"
+                checked={enableRerank}
+                onChange={(e) =>
+                  onAgentSettingsChange({ enableRerank: e.target.checked })
+                }
+                className="mt-0.5 accent-[var(--accent)] cursor-pointer"
+              />
+              <div>
+                <label
+                  htmlFor="rerank"
+                  className="text-sm text-ink cursor-pointer select-none"
+                >
+                  两阶段精排（bge-reranker）
+                </label>
+                <p className="text-[11px] text-ink-faint mt-0.5 leading-relaxed">
+                  召回 20 条后用交叉编码器精排到 Top-K，相关性更准。
+                  <span className="text-amber-600">
+                    精排模型常驻约 300~400MB 内存，与本地 Qwen 同时加载易触发
+                    std::bad_alloc，低配机器请保持关闭。
+                  </span>
                 </p>
               </div>
             </div>
@@ -409,6 +510,59 @@ export function SettingsPanel({
             </div>
           )}
 
+          {/* ── WebGPU 加速（可选，失败自动回退 WASM） ── */}
+          <div>
+            <div className="flex items-start gap-2 rounded-lg bg-bg-hover px-3 py-2.5">
+              <input
+                type="checkbox"
+                id="webgpu"
+                checked={webgpuEnabled}
+                disabled={webgpuSupported === false}
+                onChange={(e) => onWebgpuChange(e.target.checked)}
+                className="mt-0.5 accent-[var(--accent)] cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <div>
+                <label
+                  htmlFor="webgpu"
+                  className="text-sm text-ink cursor-pointer select-none"
+                >
+                  WebGPU 加速（实验性）
+                </label>
+                <p className="text-[11px] text-ink-faint mt-0.5 leading-relaxed">
+                  向量模型与本地 LLM 优先用显卡推理（量化权重 q4），
+                  加载或预热失败自动回退 WASM，权重文件与检索逻辑不变。
+                  加速前后耗时在<b>性能埋点 → 设备加速</b>里对比。
+                </p>
+                <p className="text-[11px] mt-1 leading-relaxed">
+                  {webgpuSupported === null ? (
+                    <span className="text-ink-faint">
+                      正在检测浏览器 WebGPU 支持…
+                    </span>
+                  ) : webgpuSupported ? (
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      ✓ 本机支持 WebGPU
+                    </span>
+                  ) : (
+                    <span className="text-amber-600 dark:text-amber-400">
+                      ⚠ 当前浏览器/显卡不支持 WebGPU（无 navigator.gpu 或适配器不可用），保持
+                      WASM
+                    </span>
+                  )}
+                </p>
+                <p className="text-[11px] text-ink-faint mt-0.5 leading-relaxed">
+                  当前生效：向量模型{" "}
+                  <b className="text-ink-muted">
+                    {DEVICE_LABELS[embedState.device]}
+                  </b>
+                  {" · "}本地 LLM{" "}
+                  <b className="text-ink-muted">{DEVICE_LABELS[llmState.device]}</b>
+                  {fallbackReason ? `（已回退：${fallbackReason}）` : ""}
+                  ，切换后下次加载模型时生效。
+                </p>
+              </div>
+            </div>
+          </div>
+
           {/* ── Top-K 设置（原有，不受影响） ── */}
           <div className="pt-2 border-t border-line">
             <div className="flex items-center justify-between mb-2">
@@ -503,6 +657,60 @@ export function SettingsPanel({
                   cloudOnlyAcceptedRef.current = true;
                   setPendingCloudOnly(false);
                   onAgentSettingsChange({ agentMode: "cloud-only" });
+                }}
+                className="flex-1 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:opacity-90 transition"
+              >
+                我已了解，同意
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 工具智能体「同意模式」确认弹窗：开启后工具结果含片段原文并发送云端 */}
+      {pendingToolConsent && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-md">
+          <div
+            style={{ backgroundColor: "var(--bg-elevated)" }}
+            className="border-2 border-amber-400/50 rounded-2xl shadow-2xl max-w-sm w-full mx-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-line">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">⚠️</span>
+                <span className="font-semibold text-ink text-sm">
+                  工具智能体：允许片段上云
+                </span>
+              </div>
+            </div>
+            <div className="px-5 py-4 space-y-2">
+              <p className="text-sm text-ink leading-relaxed">
+                开启后，工具智能体在检索时，<b>命中的文档片段原文</b>会作为工具结果随对话发送给你所选的云端大模型作答。
+              </p>
+              <p className="text-xs text-amber-600 dark:text-amber-400 leading-relaxed">
+                · 只有 search_docs 命中的少量片段会上传，全量文档仍留在本地<br />
+                · 与「云端 RAG」模式性质相同，属于知情同意下的上传<br />
+                · 不开此开关 = 元数据模式：正文不上云，答案由本地 Qwen 生成
+              </p>
+              <p className="text-[11px] text-ink-faint">
+                如不希望任何片段上传云端，请保持关闭（默认）。
+              </p>
+            </div>
+            <div className="flex gap-2 px-5 py-3 border-t border-line">
+              <button
+                onClick={() => {
+                  setPendingToolConsent(false);
+                  toolConsentAcceptedRef.current = false;
+                }}
+                className="flex-1 py-2 rounded-lg border border-line text-sm text-ink-muted hover:bg-bg-hover transition"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  toolConsentAcceptedRef.current = true;
+                  setPendingToolConsent(false);
+                  onAgentSettingsChange({ allowToolChunksToCloud: true });
                 }}
                 className="flex-1 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:opacity-90 transition"
               >

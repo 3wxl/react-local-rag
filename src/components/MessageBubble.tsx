@@ -1,7 +1,13 @@
-import { useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { AnswerSource, ChatMessage } from "../types/chat";
 import { statusToTip } from "../utils/chat";
 import { splitSentences, type VerificationResult } from "../utils/verifyAnswer";
+import {
+  headingLabel,
+  pageLabel,
+  splitByCitations,
+  type ContextRef,
+} from "../utils/citation";
 import { AgentStepPanel } from "./AgentStepPanel";
 import {
   CLOUD_NO_EVIDENCE_WARNING,
@@ -52,6 +58,14 @@ function AnswerSourceBadge({ source }: { source: AnswerSource }) {
       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/30">
         <AiIcon className="w-3 h-3" />
         纯云端
+      </span>
+    );
+  }
+  if (source === "tool-agent") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30">
+        <AiIcon className="w-3 h-3" />
+        工具智能体
       </span>
     );
   }
@@ -141,7 +155,7 @@ function ThinkingBlock({ message }: { message: ChatMessage }) {
   );
 }
 
-/** 引用文档片段折叠块 */
+/** 引用文档片段折叠块（旧数据：只有一整段文本） */
 function ContextBlock({ context }: { context: string }) {
   const [open, setOpen] = useState(false);
   return (
@@ -160,6 +174,162 @@ function ContextBlock({ context }: { context: string }) {
           {context}
         </div>
       )}
+    </div>
+  );
+}
+
+/** 把窗口全文按「精确命中」拆成三段，命中段加高亮底色（引用回跳的可视落点） */
+function HighlightedWindow({
+  content,
+  matched,
+}: {
+  content: string;
+  matched: string;
+}) {
+  const idx = matched ? content.indexOf(matched) : -1;
+  if (idx < 0) {
+    return <>{content}</>;
+  }
+  return (
+    <>
+      {content.slice(0, idx)}
+      <mark className="bg-accent/20 text-ink rounded px-0.5">
+        {content.slice(idx, idx + matched.length)}
+      </mark>
+      {content.slice(idx + matched.length)}
+    </>
+  );
+}
+
+/** 答案角标与引用卡片之间的 DOM 锚点 id */
+function citationAnchorId(messageId: string, index: number): string {
+  return `cite-${messageId}-${index}`;
+}
+
+/** 单张引用卡片：文件名 · 章节 · 页码 + 命中分，可展开看原文并高亮命中段 */
+function CitationCard({
+  ref_,
+  cited,
+  messageId,
+}: {
+  ref_: ContextRef;
+  /** 答案是否引用了该编号（未引用的卡片弱化显示） */
+  cited: boolean;
+  messageId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [expandedWindow, setExpandedWindow] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  // 展开后滚动到卡片可见位置：从答案角标点进来时，用户视线要跟着走
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) {
+      requestAnimationFrame(() =>
+        boxRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }),
+      );
+    }
+  };
+
+  const scorePct = Math.round((ref_.relevance || ref_.score) * 100);
+  const pageText = pageLabel(ref_.pageStart, ref_.pageEnd);
+
+  return (
+    <div
+      ref={boxRef}
+      id={citationAnchorId(messageId, ref_.index)}
+      className={`rounded-lg border text-xs overflow-hidden transition ${
+        cited
+          ? "border-accent/40 bg-accent/5"
+          : "border-line bg-bg-hover/50 opacity-70"
+      }`}
+    >
+      <button
+        onClick={toggle}
+        className="w-full flex items-center gap-2 px-2.5 py-2 text-left hover:bg-bg-hover transition"
+      >
+        <span
+          className={`shrink-0 w-5 h-5 rounded flex items-center justify-center text-[10px] font-semibold ${
+            cited ? "bg-accent/20 text-accent" : "bg-bg-hover text-ink-faint"
+          }`}
+        >
+          {ref_.index}
+        </span>
+        <span className="flex-1 min-w-0 truncate text-ink-muted">
+          {ref_.docName || "未命名文档"} · {headingLabel(ref_.headingPath)} ·{" "}
+          {pageText}
+        </span>
+        <span className="shrink-0 text-ink-faint" title="相关度">
+          {scorePct}%
+        </span>
+        <ChevronRightIcon
+          className={`shrink-0 w-3 h-3 text-ink-faint transition-transform ${
+            open ? "rotate-90" : ""
+          }`}
+        />
+      </button>
+      {open && (
+        <div className="px-2.5 pb-2.5">
+          <div
+            className={`rounded border border-line/60 bg-bg px-2 py-1.5 text-ink-muted leading-relaxed whitespace-pre-wrap ${
+              expandedWindow ? "max-h-72 overflow-y-auto" : "max-h-24 overflow-hidden"
+            }`}
+          >
+            <HighlightedWindow
+              content={ref_.content}
+              matched={ref_.matchedContent}
+            />
+          </div>
+          <div className="mt-1.5 flex items-center gap-3 text-[11px] text-ink-faint">
+            <button
+              onClick={() => setExpandedWindow((v) => !v)}
+              className="hover:text-ink-muted"
+            >
+              {expandedWindow ? "收起上下文" : "展开完整上下文"}
+            </button>
+            <span>
+              命中 {ref_.chunkIds.length} 块 · 上下文 {ref_.windowChunkIds.length} 块
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 引用卡片列表：与答案角标 [n] 一一对应 */
+function ContextCards({
+  contexts,
+  citedIndexes,
+  messageId,
+}: {
+  contexts: ContextRef[];
+  /** 答案实际引用到的编号集合 */
+  citedIndexes: Set<number>;
+  messageId: string;
+}) {
+  if (contexts.length === 0) return null;
+  const citedCount = contexts.filter((c) => citedIndexes.has(c.index)).length;
+  return (
+    <div className="mt-2">
+      <div className="flex items-center gap-1.5 text-xs text-ink-faint mb-1.5">
+        <DocIcon className="w-3 h-3" />
+        <span>
+          引用来源 {contexts.length} 处
+          {citedCount > 0 ? ` · 答案引用 ${citedCount} 处` : ""}
+        </span>
+      </div>
+      <div className="space-y-1.5">
+        {contexts.map((c) => (
+          <CitationCard
+            key={c.index}
+            ref_={c}
+            cited={citedIndexes.has(c.index)}
+            messageId={messageId}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -210,24 +380,52 @@ function VerificationBanner({ result }: { result: VerificationResult }) {
 function VerifiedContent({
   content,
   result,
+  messageId,
 }: {
   content: string;
   result: VerificationResult;
+  /** 用于把角标点击定位到本消息的引用卡片 */
+  messageId: string;
 }) {
   const segments = splitSentences(content);
   // 校验结果与切分必须同源对齐；对不齐（历史数据等）则降级为纯文本
   const aligned = segments.length === result.sentences.length;
-  if (!aligned) return <>{content}</>;
+
+  /** 角标 [n] 渲染成可点上标：点击滚动到对应引用卡片 */
+  const renderWithCitations = (seg: string) => {
+    const parts = splitByCitations(seg);
+    if (parts.length === 1 && parts[0].citation === undefined) return seg;
+    return parts.map((p, i) => {
+      if (p.citation === undefined) return <span key={i}>{p.text}</span>;
+      return (
+        <button
+          key={i}
+          onClick={() =>
+            document
+              .getElementById(citationAnchorId(messageId, p.citation!))
+              ?.scrollIntoView({ block: "nearest", behavior: "smooth" })
+          }
+          className="align-super text-[10px] px-1 rounded bg-accent/15 text-accent hover:bg-accent/25 transition"
+          title={`跳转到引用 [${p.citation}]`}
+        >
+          {p.citation}
+        </button>
+      );
+    });
+  };
+
+  if (!aligned) return <>{renderWithCitations(content)}</>;
 
   return (
     <>
       {segments.map((seg, i) => {
         const v = result.sentences[i];
-        if (!v || v.level === "supported") return <span key={i}>{seg}</span>;
+        const rendered = renderWithCitations(seg);
+        if (!v || v.level === "supported") return <span key={i}>{rendered}</span>;
         if (v.level === "weak") {
           return (
             <span key={i} className="bg-amber-400/30 rounded px-0.5" title="文档依据较弱">
-              {seg}
+              {rendered}
             </span>
           );
         }
@@ -237,7 +435,7 @@ function VerifiedContent({
             className="bg-red-500/25 rounded px-0.5 underline decoration-red-600 decoration-wavy underline-offset-4"
             title={`文档中找不到依据（依据分 ${v.score.toFixed(2)}）`}
           >
-            {seg}
+            {rendered}
           </span>
         );
       })}
@@ -254,6 +452,17 @@ export function MessageBubble({
   const isUser = message.role === "user";
   const isStreaming =
     busy && message.status !== "done" && message.status !== "error";
+  // 答案实际用到的引用编号：把未被引用的引用卡片弱化显示。
+  // 必须在 isUser 提前 return 之前调用（Hooks 不能条件执行）
+  const citedIndexes = useMemo(() => {
+    const set = new Set<number>();
+    for (const s of message.verification?.sentences ?? []) {
+      // 历史消息（旧版 verifyAnswer 产出）没有 citations/invalidCitations 字段，
+      // 读出来是 undefined，for...of 会抛；这里兜底空数组，旧消息只是不显示角标跳转
+      for (const c of s.citations ?? []) set.add(c);
+    }
+    return set;
+  }, [message.verification]);
 
   if (isUser) {
     return (
@@ -279,6 +488,7 @@ export function MessageBubble({
   const hasThinking = (message.thinking || "").trim().length > 0;
   const hasContent = (message.content || "").trim().length > 0;
   const hasCloudContent = (message.cloudContent || "").trim().length > 0;
+  const hasContexts = (message.contexts?.length ?? 0) > 0;
   const hasAgentSteps = (message.agentSteps?.length ?? 0) > 0;
   // 有 Agent 步骤时优先展示步骤面板；模型 think 标签内容仍可单独折叠展示
   const showThinking =
@@ -332,7 +542,11 @@ export function MessageBubble({
         {hasContent && (
           <div className="px-4 py-2.5 rounded-2xl rounded-tl-md bg-bg-elevated text-ink text-sm leading-7 whitespace-pre-wrap break-words border border-line">
             {message.verification ? (
-              <VerifiedContent content={message.content} result={message.verification} />
+              <VerifiedContent
+                content={message.content}
+                result={message.verification}
+                messageId={message.id}
+              />
             ) : (
               message.content
             )}
@@ -384,8 +598,17 @@ export function MessageBubble({
           </div>
         )}
 
-        {/* 引用片段 */}
-        {hasContent && message.context && (
+        {/* 引用卡片（新数据）：文件名 · 章节 · 页码 · 命中分，可展开原文并高亮命中段 */}
+        {hasContent && hasContexts && (
+          <ContextCards
+            contexts={message.contexts!}
+            citedIndexes={citedIndexes}
+            messageId={message.id}
+          />
+        )}
+
+        {/* 引用片段（旧数据兼容：只有一整段文本时走这里） */}
+        {hasContent && !hasContexts && message.context && (
           <ContextBlock context={message.context} />
         )}
       </div>

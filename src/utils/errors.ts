@@ -96,6 +96,34 @@ export function embeddingError(err: unknown): AppError {
   return new AppError("embedding", `向量化或检索失败：${msg}`, { cause: err });
 }
 
+/**
+ * 检索线程里没有该会话的索引。
+ *
+ * 通常不是真错误：Worker 内索引缓存有 LRU 上限（INDEX_CACHE_LIMIT），
+ * 会话切得多了会把最久未用的那份淘汰掉。主线程内存里仍持有 vectorChunks，
+ * 因此不会主动重同步，此时提问就会撞上这个状态。
+ *
+ * 所以这个错误必须**可被识别**，让客户端能从 IndexedDB 重同步后自动重试一次，
+ * 而不是直接甩一句「请重新上传文档」把用户逼去重传。
+ */
+export const INDEX_MISSING_CODE = "index-missing";
+
+export function indexMissingError(err: unknown): AppError {
+  const msg = err instanceof Error ? err.message : String(err);
+  const error = new AppError("embedding", `文档索引不在检索线程：${msg}`, {
+    cause: err,
+    hint: "首次遇到会自动从本地存储恢复，无需重新上传。",
+  });
+  // 附上机器可读标记：客户端据此决定是否走「重同步 + 重试」
+  (error as AppError & { code?: string }).code = INDEX_MISSING_CODE;
+  return error;
+}
+
+/** 判断错误是否是「索引不在检索线程」（可自愈，非致命） */
+export function isIndexMissingError(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === INDEX_MISSING_CODE;
+}
+
 /** Worker 线程崩溃 */
 export function workerCrashError(workerName: string, err: unknown): AppError {
   const msg = err instanceof Error ? err.message : String(err);

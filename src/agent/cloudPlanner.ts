@@ -100,10 +100,37 @@ export type FetchLike = (
 /* 纯函数：请求体构造（export 供单元测试验证红线：body 中无 chunk 原文） */
 /* ------------------------------------------------------------------ */
 
-/** OpenAI 兼容 ChatCompletion 的消息结构 */
+/** OpenAI 兼容 ChatCompletion 的消息结构（含 tool-calls 协议字段） */
 export interface CloudChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** assistant 消息中模型发起的工具调用（原样回传给下一轮） */
+  tool_calls?: CloudToolCall[];
+  /** role="tool" 的结果消息：对应哪一次调用 */
+  tool_call_id?: string;
+}
+
+/** OpenAI tools 协议：工具声明（发给模型供其选择） */
+export interface CloudToolSpec {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    /** JSON Schema 参数定义 */
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** OpenAI tools 协议：模型返回的一次工具调用 */
+export interface CloudToolCall {
+  id: string;
+  /** 目前只有 "function"（保留字段以兼容上游） */
+  type?: string;
+  function: {
+    name: string;
+    /** 参数是 JSON 字符串（模型的原始输出，需 parse 后校验） */
+    arguments: string;
+  };
 }
 
 /**
@@ -797,6 +824,179 @@ export async function streamCloudAnswer(
       return { text: "", fallback: true, fallbackReason: "timeout" };
     }
     return { text: "", fallback: true, fallbackReason: "network" };
+  } finally {
+    clearTimeout(timer);
+    options.externalSignal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 工具智能体：单步 tool-call 请求（/agent/step，经本机代理策略转发）      */
+/* ------------------------------------------------------------------ */
+
+/** 工具步超时：比路由宽（模型可能多轮思考），比长回答略窄 */
+export const DEFAULT_TOOL_STEP_TIMEOUT = 45_000;
+
+export interface RequestToolStepOptions {
+  /** 当前轮次（从 1 开始；代理侧据此执行最大轮次上限） */
+  round: number;
+  /**
+   * 隐私模式（经 X-Agent-Privacy 传给代理，代理侧做上传闸门的兜底校验）：
+   * - metadata：工具结果只含元数据摘要（默认，片段原文不上云）
+   * - consent：用户已显式同意片段随工具结果上云
+   */
+  privacy: "metadata" | "consent";
+  /** 超时毫秒，默认 DEFAULT_TOOL_STEP_TIMEOUT */
+  timeoutMs?: number;
+  /** 注入 fetch 实现（单元测试用） */
+  fetchImpl?: FetchLike;
+  /** 外部取消信号（用户点停止）；触发后 promise 以取消错误 reject */
+  externalSignal?: AbortSignal;
+}
+
+/** 单步工具请求结果：永远 resolve，失败通过 fallback 表达 */
+export interface ToolStepResult {
+  /** assistant 文本内容（无工具调用时即最终答案/规划结论） */
+  content: string;
+  /** 模型请求的工具调用（可能为空数组） */
+  toolCalls: CloudToolCall[];
+  /** 推理模型的思考文本（调试与 UI 展示用） */
+  reasoning: string;
+  fallback: boolean;
+  fallbackReason?: CloudFallbackReason;
+  httpStatus?: number;
+}
+
+/** 拼接代理的工具步端点：{base}/agent/step */
+function buildAgentEndpoint(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  return `${trimmed}/agent/step`;
+}
+
+/** 解析响应 message 里的 tool_calls（结构防御：字段缺失/类型不对一律忽略） */
+function parseToolCalls(raw: unknown): CloudToolCall[] {
+  if (!Array.isArray(raw)) return [];
+  const calls: CloudToolCall[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const c = item as {
+      id?: unknown;
+      type?: unknown;
+      function?: { name?: unknown; arguments?: unknown };
+    };
+    const name = c.function?.name;
+    if (typeof c.id !== "string" || typeof name !== "string") continue;
+    calls.push({
+      id: c.id,
+      type: typeof c.type === "string" ? c.type : "function",
+      function: {
+        name,
+        arguments:
+          typeof c.function?.arguments === "string" ? c.function.arguments : "",
+      },
+    });
+  }
+  return calls;
+}
+
+/**
+ * 请求一次「工具步」：带 tools 声明的非流式 ChatCompletion。
+ *
+ * 与 requestCloudPlanner 相同的失败契约：配置缺失 / 超时 / 网络 / auth / http
+ * 一律降级返回（fallback=true），调用方据此回退；仅用户主动取消会抛 "Agent 已取消"。
+ *
+ * 红线：本函数只做传输，不做内容过滤 —— 进什么 messages 就发什么 messages。
+ * 「工具结果里能不能有片段原文」由上层 toolAgent 按隐私模式构造，
+ * 代理侧还会以 X-Agent-Privacy 做第二道闸门（见 proxy.mjs validateAgentStep）。
+ */
+export async function requestToolStep(
+  messages: CloudChatMessage[],
+  tools: CloudToolSpec[],
+  config: CloudPlannerConfig,
+  options: RequestToolStepOptions,
+): Promise<ToolStepResult> {
+  const apiKey = config.apiKey?.trim();
+  const baseUrl = config.baseUrl?.trim();
+  if (!apiKey || !baseUrl) {
+    return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "config" };
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_STEP_TIMEOUT;
+  const fetchImpl: FetchLike = options.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (options.externalSignal?.aborted) controller.abort();
+  options.externalSignal?.addEventListener("abort", onExternalAbort);
+
+  let httpStatus: number | undefined;
+  try {
+    const response = await fetchImpl(buildAgentEndpoint(baseUrl), {
+      method: "POST",
+      headers: {
+        ...buildCloudHeaders({
+          apiKey,
+          upstreamBaseUrl: config.upstreamBaseUrl,
+        }),
+        "X-Agent-Round": String(options.round),
+        "X-Agent-Privacy": options.privacy,
+      },
+      body: JSON.stringify({
+        model: config.model?.trim() || DEFAULT_CLOUD_MODEL,
+        // 工具选择需要稳定复现：温度取低值，减少同问题抖动
+        temperature: 0.2,
+        max_tokens: CLOUD_ANSWER_MAX_TOKENS,
+        messages,
+        tools,
+        tool_choice: "auto",
+      }),
+      signal: controller.signal,
+    });
+
+    httpStatus = response.status;
+    if (response.status === 401 || response.status === 403) {
+      return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "auth", httpStatus };
+    }
+    if (!response.ok) {
+      return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+
+    let data: {
+      choices?: Array<{
+        message?: {
+          content?: string | null;
+          reasoning_content?: string | null;
+          tool_calls?: unknown;
+        };
+      }>;
+    };
+    try {
+      data = (await response.json()) as typeof data;
+    } catch {
+      return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+
+    const message = data.choices?.[0]?.message;
+    if (!message) {
+      return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "http", httpStatus };
+    }
+    const content = typeof message.content === "string" ? message.content : "";
+    const reasoning =
+      typeof message.reasoning_content === "string" ? message.reasoning_content : "";
+    const toolCalls = parseToolCalls(message.tool_calls);
+    // 合法响应：要么有内容，要么有工具调用（两者都空说明上游异常）
+    if (!content.trim() && toolCalls.length === 0) {
+      return { content: "", toolCalls: [], reasoning, fallback: true, fallbackReason: "http", httpStatus };
+    }
+    return { content, toolCalls, reasoning, fallback: false, httpStatus };
+  } catch (err) {
+    if (isAbortError(err)) {
+      if (options.externalSignal?.aborted) {
+        throw new Error("Agent 已取消", { cause: err });
+      }
+      return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "timeout" };
+    }
+    return { content: "", toolCalls: [], reasoning: "", fallback: true, fallbackReason: "network" };
   } finally {
     clearTimeout(timer);
     options.externalSignal?.removeEventListener("abort", onExternalAbort);

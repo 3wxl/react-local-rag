@@ -1,5 +1,6 @@
 import { modelLoadError } from "./errors";
 import type { HistoryTurn } from "./history";
+import type { AnswerPassage } from "./citation";
 import {
   callWorker,
   callWorkerStreaming,
@@ -130,10 +131,13 @@ export interface GenerateOptions {
  * 流式调用 LLM 生成回答，复用共享常驻 Worker 实例。
  * 模型只加载一次：split/evaluate/summarize/generate 全部走同一 worker。
  * cancel 不 terminate worker，只标记取消 + reject promise，worker 继续服务其他任务。
+ *
+ * @param passages 编号段落（[1] 文件名·章节·页码 + 正文）。模型被要求逐句带角标，
+ *                 角标是后续「校验范围收敛」与「引用卡片」的对接点。
  */
 export function generateAnswer(
   question: string,
-  contextChunks: string[],
+  passages: AnswerPassage[],
   callbacks: GenerateCallbacks = {},
   options: GenerateOptions = {},
 ): GenerateHandle {
@@ -144,8 +148,9 @@ export function generateAnswer(
 
   const handle = callWorkerStreaming(
     {
+      type: "generate", // 协议判别字段：worker 据此收窄到生成分支
       question,
-      contextChunks,
+      passages,
       history: options.history,
       historySummary: options.historySummary,
     },

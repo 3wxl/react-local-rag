@@ -6,9 +6,12 @@ import {
   buildPlannerRequestBody,
   filterHistoryForCloud,
   filterContextForCloud,
+  requestToolStep,
   streamCloudAnswer,
   DEFAULT_CLOUD_MODEL,
+  type CloudChatMessage,
   type CloudPlannerConfig,
+  type CloudToolSpec,
   type FetchLike,
   type LocalRetrievalSignals,
 } from "./cloudPlanner";
@@ -758,5 +761,150 @@ describe("streamCloudAnswer", () => {
     const result = await streamCloudAnswer("Q", [], CONFIG, { fetchImpl });
     expect(result.fallback).toBe(true);
     expect(result.fallbackReason).toBe("http");
+  });
+});
+
+/* ---------------- 工具智能体：requestToolStep ---------------- */
+
+const TOOLS: CloudToolSpec[] = [
+  {
+    type: "function",
+    function: { name: "search_docs", description: "检索", parameters: {} },
+  },
+];
+
+const TOOL_MESSAGES: CloudChatMessage[] = [
+  { role: "system", content: "你是检索规划助手" },
+  { role: "user", content: "标准版售价多少？" },
+];
+
+describe("requestToolStep", () => {
+  it("POST 到 /agent/step，带轮次与隐私头，body 含 tools 声明", async () => {
+    const { fetchImpl, calls } = capturingFetch(200, {
+      choices: [{ message: { role: "assistant", content: "DONE" } }],
+    });
+    const result = await requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 3,
+      privacy: "metadata",
+      fetchImpl,
+    });
+    expect(result.fallback).toBe(false);
+    expect(result.content).toBe("DONE");
+
+    const { url, init } = calls[0];
+    expect(url).toBe("https://api.example.com/v1/agent/step");
+    const headers = init?.headers as Record<string, string>;
+    expect(headers["X-Agent-Round"]).toBe("3");
+    expect(headers["X-Agent-Privacy"]).toBe("metadata");
+    const body = JSON.parse(String(init?.body));
+    expect(body.tools).toHaveLength(1);
+    expect(body.tool_choice).toBe("auto");
+    expect(body.messages).toEqual(TOOL_MESSAGES);
+  });
+
+  it("解析响应中的 tool_calls（含 JSON 字符串参数）", async () => {
+    const result = await requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 1,
+      privacy: "metadata",
+      fetchImpl: fakeFetch(200, {
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "call-9",
+                  type: "function",
+                  function: {
+                    name: "search_docs",
+                    arguments: '{"query":"售价"}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    });
+    expect(result.fallback).toBe(false);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0].id).toBe("call-9");
+    expect(JSON.parse(result.toolCalls[0].function.arguments)).toEqual({
+      query: "售价",
+    });
+  });
+
+  it("畸形 tool_calls 项被忽略，不炸整个响应", async () => {
+    const result = await requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 1,
+      privacy: "metadata",
+      fetchImpl: fakeFetch(200, {
+        choices: [
+          {
+            message: {
+              content: "ok",
+              tool_calls: [{ id: 5, function: { name: 7 } }, null, "junk"],
+            },
+          },
+        ],
+      }),
+    });
+    expect(result.fallback).toBe(false);
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  it("内容与工具调用都为空 → http 降级", async () => {
+    const result = await requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 1,
+      privacy: "metadata",
+      fetchImpl: fakeFetch(200, { choices: [{ message: { content: "" } }] }),
+    });
+    expect(result.fallback).toBe(true);
+    expect(result.fallbackReason).toBe("http");
+  });
+
+  it("401 → auth 降级", async () => {
+    const result = await requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 1,
+      privacy: "consent",
+      fetchImpl: fakeFetch(401, { error: "invalid" }),
+    });
+    expect(result.fallback).toBe(true);
+    expect(result.fallbackReason).toBe("auth");
+  });
+
+  it("配置缺失不发请求", async () => {
+    const fetchImpl = vi.fn() as unknown as FetchLike;
+    const result = await requestToolStep(
+      TOOL_MESSAGES,
+      TOOLS,
+      { apiKey: "", baseUrl: "" },
+      { round: 1, privacy: "metadata", fetchImpl },
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result.fallbackReason).toBe("config");
+  });
+
+  it("用户主动取消 → throw Agent 已取消", async () => {
+    const hangFetch = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    }) as unknown as FetchLike;
+
+    const external = new AbortController();
+    const pending = requestToolStep(TOOL_MESSAGES, TOOLS, CONFIG, {
+      round: 2,
+      privacy: "metadata",
+      fetchImpl: hangFetch,
+      externalSignal: external.signal,
+    });
+    external.abort();
+    await expect(pending).rejects.toThrow("Agent 已取消");
   });
 });

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      # 检索评测基线（读固化向量/精排分，确定性、无模型依赖），防止回归
+      - name: Retrieval eval baseline
+        run: npm run eval
+
+      # 幻觉校验组件的 P/R（读固化打分，无模型依赖）
+      - name: Verify component P/R
+        run: npm run eval:verify -- --check

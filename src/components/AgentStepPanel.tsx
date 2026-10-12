@@ -28,12 +28,14 @@ const STEP_META: Record<
   synthesize: { label: "汇总", thinking: true },
   "cloud-route": { label: "云端规划", thinking: true },
   "cloud-execute": { label: "云端执行", thinking: true },
+  "tool-call": { label: "工具调用", thinking: true },
+  "tool-result": { label: "工具结果", thinking: true },
   generate: { label: "最终回答", thinking: false },
 };
 
 /**
- * 步骤来源标记（混合 Agent）：
- * 🟦 云端规划 / 🟩 本地 Self-RAG / 🟪 MIXED 子任务
+ * 步骤来源标记：
+ * 🟦 云端规划 / 🟩 本地 Self-RAG / 🟪 MIXED 子任务 / 🟪 工具智能体（靛蓝）
  * 用色块 + 文字标签，与面板整体的 SVG/小圆点风格保持一致。
  */
 const ORIGIN_META: Record<
@@ -54,6 +56,11 @@ const ORIGIN_META: Record<
     label: "MIXED 子任务",
     square: "bg-purple-500",
     text: "text-purple-600 dark:text-purple-400",
+  },
+  "tool-agent": {
+    label: "工具智能体",
+    square: "bg-indigo-500",
+    text: "text-indigo-600 dark:text-indigo-400",
   },
 };
 
@@ -114,6 +121,12 @@ function StepRow({
           {meta.label}
         </span>
         {step.origin && <OriginBadge origin={step.origin} />}
+        {step.tool && (
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30 flex-shrink-0">
+            {step.tool.name}
+            {step.type === "tool-result" && (step.tool.ok ? " ✓" : " ✗")}
+          </span>
+        )}
         {resultIcon}
         {step.subQuestion && (
           <span className="text-ink truncate flex-1 text-left">
@@ -130,6 +143,13 @@ function StepRow({
           {step.thinking && (
             <div className="text-xs text-ink-muted whitespace-pre-wrap leading-relaxed">
               {step.thinking}
+            </div>
+          )}
+
+          {/* 工具调用参数（tool-call 步骤） */}
+          {step.tool?.args && (
+            <div className="p-2 rounded bg-bg border border-line text-[11px] font-mono text-ink-faint break-all">
+              {step.tool.args}
             </div>
           )}
 

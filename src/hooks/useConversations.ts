@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMessage, Conversation } from "../types/chat";
-import type { VectorChunk } from "../types/doc";
+import type { TextChunk, VectorChunk } from "../types/doc";
 import {
   removeVectorIndex,
   syncVectorIndex,
@@ -9,12 +9,15 @@ import { ACTIVE_KEY, STORAGE_KEY, makeTitle, uid } from "../utils/chat";
 import {
   deleteConversationData,
   importConversations,
+  isDbAvailable,
   loadAllConversations,
-  loadAllVectorIndexes,
+  loadVectorIndex,
+  onDbAvailabilityChange,
   saveConversationRecord,
   saveVectorIndex,
   type ConversationRecord,
 } from "../utils/db";
+import { CURRENT_INDEX_VERSION, fillChunkDefaults } from "../utils/chunk";
 import {
   exportBackupFile,
   parseBackupFile,
@@ -31,42 +34,44 @@ function toRecord(c: Conversation): ConversationRecord {
     messages: c.messages,
     historySummary: c.historySummary,
     historySummaryUpToId: c.historySummaryUpToId,
+    indexVersion: c.indexVersion,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
 }
 
-/** 读库 + 合并向量，返回按创建时间倒序的会话列表 */
+/**
+ * 读库返回按创建时间倒序的会话列表。
+ * 懒加载：向量索引不在此处读取（首屏内存不再随会话总数 × 向量总量线性膨胀），
+ * 切到哪个会话才拉哪个会话的索引（见 ensureConvIndexLoaded）。
+ */
 async function readMergedConversations(): Promise<Conversation[]> {
-  const [records, vecMap] = await Promise.all([
-    loadAllConversations(),
-    loadAllVectorIndexes(),
-  ]);
+  const records = await loadAllConversations();
   return records
     .map((r) => ({
       id: r.id,
       title: r.title,
       docName: r.docName,
-      vectorChunks: vecMap.get(r.id) ?? [],
+      vectorChunks: [] as VectorChunk[], // 懒加载：占位，切会话时再拉
       messages: r.messages ?? [],
       historySummary: r.historySummary,
       historySummaryUpToId: r.historySummaryUpToId,
+      indexVersion: r.indexVersion,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
     }))
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
-/** 把会话向量索引同步到 embedding worker（检索在 worker 内进行，主线程不搬运向量） */
-function syncWorkerIndexes(convs: Conversation[]) {
-  for (const c of convs) {
-    if (c.vectorChunks.length > 0) syncVectorIndex(c.id, c.vectorChunks);
-  }
-}
-
 /** 导入备份结果 */
 export type ImportResult =
-  | { status: "done"; total: number; overwritten: number }
+  | {
+      status: "done";
+      total: number;
+      overwritten: number;
+      /** 旧版本备份（1.0）：向量保留但索引需重建，UI 应提示重新上传文档 */
+      needsRebuild: boolean;
+    }
   | { status: "cancelled" };
 
 /**
@@ -80,6 +85,12 @@ export type ImportResult =
 export function useConversations() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string>("");
+  /**
+   * 当前环境能否持久化数据。
+   * false（无痕模式 / 禁用 IndexedDB / 配额耗尽）= 关掉页面数据就丢，
+   * 必须让用户看到，而不是静默地读写变 no-op。
+   */
+  const [persistAvailable, setPersistAvailable] = useState(isDbAvailable);
 
   /** 初始化（含旧数据迁移）是否完成，完成前不回写 IndexedDB */
   const hydratedRef = useRef(false);
@@ -91,6 +102,12 @@ export function useConversations() {
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
+
+  /* ---------- 持久化可用性：IndexedDB 不可用时全局提示 ---------- */
+  useEffect(() => {
+    // 初始值由 useState 惰性读取；这里只订阅后续变化（切到不可用是异步发生的）
+    return onDbAvailabilityChange(setPersistAvailable);
+  }, []);
 
   /* ---------- 初始化：从 IndexedDB 读取，必要时迁移旧 localStorage 数据 ---------- */
   useEffect(() => {
@@ -112,17 +129,25 @@ export function useConversations() {
             const legacy = JSON.parse(raw) as Conversation[];
             if (Array.isArray(legacy) && legacy.length > 0) {
               const records = legacy.map(toRecord);
-              const withVectors = legacy.filter(
-                (c) => c.vectorChunks && c.vectorChunks.length > 0,
-              );
-              await importConversations(
-                records,
-                withVectors.map((c) => ({
+              // 旧分块缺身份字段：补默认值 + number[] 向量转 Float32Array
+              const withVectors = legacy
+                .filter((c) => c.vectorChunks && c.vectorChunks.length > 0)
+                .map((c) => ({
                   convId: c.id,
-                  chunks: c.vectorChunks,
-                })),
-              );
-              merged = legacy.slice().sort((a, b) => b.createdAt - a.createdAt);
+                  chunks: c.vectorChunks.map((raw, i) => ({
+                    ...fillChunkDefaults(
+                      raw as Partial<TextChunk>,
+                      raw.docId ?? c.id,
+                      c.docName ?? "",
+                      i,
+                    ),
+                    vector: new Float32Array(raw.vector),
+                  })),
+                }));
+              await importConversations(records, withVectors);
+              merged = legacy
+                .map((c) => ({ ...c, vectorChunks: [] }))
+                .sort((a, b) => b.createdAt - a.createdAt);
               localStorage.removeItem(STORAGE_KEY);
             }
           }
@@ -135,8 +160,7 @@ export function useConversations() {
 
       hydratedRef.current = true;
       setConversations(merged);
-      // 恢复的向量索引同步到 embedding worker，供检索使用
-      syncWorkerIndexes(merged);
+      // 向量索引不再全量同步：切到哪个会话，懒加载 effect 拉哪个并同步 worker
 
       const stored = localStorage.getItem(ACTIVE_KEY);
       if (stored && merged.some((c) => c.id === stored)) {
@@ -157,13 +181,35 @@ export function useConversations() {
     // 这些数据本就来自数据库，登记快照避免触发无意义的回写
     merged.forEach((c) => savedSnapshotRef.current.set(c.id, c.updatedAt));
     setConversations(merged);
-    // 导入恢复的数据同步到 embedding worker
-    syncWorkerIndexes(merged);
+    // 向量索引懒加载：activeId 确定后由 ensureConvIndexLoaded 拉取并同步 worker
     setActiveId((prev) => {
       if (prev && merged.some((c) => c.id === prev)) return prev;
       return merged.length > 0 ? merged[0].id : "";
     });
   }, []);
+
+  /* ---------- 懒加载当前会话向量索引（切会话再拉，worker 端 LRU 管缓存上限） ---------- */
+  useEffect(() => {
+    if (!activeId) return;
+    let cancelled = false;
+    const conv = conversations.find((c) => c.id === activeId);
+    // 已持有向量（本次会话内加载过）或会话不存在：跳过
+    if (!conv || conv.vectorChunks.length > 0) return;
+    loadVectorIndex(activeId)
+      .then((chunks) => {
+        if (cancelled || chunks.length === 0) return;
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === activeId ? { ...c, vectorChunks: chunks } : c,
+          ),
+        );
+        syncVectorIndex(activeId, chunks);
+      })
+      .catch((err) => console.warn("加载会话向量索引失败", err));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, conversations]);
 
   /* ---------- 持久化：仅写入发生变化的会话（updatedAt 变化或新增） ---------- */
   useEffect(() => {
@@ -299,6 +345,8 @@ export function useConversations() {
                 ...c,
                 docName,
                 vectorChunks,
+                // 记录本次向量化所用的索引版本（分块参数/前缀方案/模型名变了就提示重建）
+                indexVersion: CURRENT_INDEX_VERSION,
                 title: c.title === "新会话" ? makeTitle(docName) : c.title,
                 updatedAt: Date.now(),
               }
@@ -378,6 +426,7 @@ export function useConversations() {
         status: "done",
         total: parsed.data.conversations.length,
         overwritten: conflicts.length,
+        needsRebuild: parsed.needsRebuild,
       };
     },
     [refresh],
@@ -387,6 +436,8 @@ export function useConversations() {
     conversations,
     activeId,
     activeConv,
+    /** false = 当前环境存不下数据（无痕模式/禁用 IndexedDB/配额耗尽） */
+    persistAvailable,
     setActiveId,
     createConversation,
     deleteConversation,

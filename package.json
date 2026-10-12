@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -10,20 +13,29 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
-    "eval": "node scripts/eval.mjs",
+    "eval": "tsx scripts/eval.ts",
     "preview": "vite preview",
-    "proxy": "node proxy.mjs"
+    "proxy": "node proxy.mjs",
+    "tune:retrieval": "tsx scripts/tune.ts",
+    "gen:embeddings": "tsx scripts/gen-embeddings.ts",
+    "gen:rerank": "tsx scripts/gen-rerank-scores.ts",
+    "eval:verify": "tsx scripts/calibrate-verify.ts",
+    "eval:answers": "tsx scripts/eval-answers.ts",
+    "eval:all": "npm run eval && npm run eval:verify -- --check && npm run eval:answers",
+    "mcp": "tsx scripts/mcp/server.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "lodash": "^4.18.1",
     "mammoth": "^1.12.3",
+    "onnxruntime-node": "^1.30.0",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "@types/lodash": "^4.17.25",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
@@ -41,9 +53,11 @@
     "postcss": "^8.5.28",
     "rollup": "^4.63.1",
     "tailwindcss": "^3.4.19",
+    "tsx": "^4.23.15",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.67.0",
     "vite": "^8.2.2",
-    "vitest": "^5.0.1"
+    "vitest": "^5.0.1",
+    "zod": "^4.6.5"
   }
 }

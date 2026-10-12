@@ -1,12 +1,18 @@
-import { CheckCircleIcon, MenuIcon, UploadIcon } from "./icons";
+import { CheckCircleIcon, MenuIcon, UploadIcon, WarningIcon } from "./icons";
 
-export type AgentModeBanner = "local-rag" | "hybrid-agent" | "cloud-only";
+export type AgentModeBanner =
+  | "local-rag"
+  | "hybrid-agent"
+  | "cloud-only"
+  | "tool-agent";
 
 interface ChatHeaderProps {
   title: string;
   docName?: string;
   chunkCount: number;
   docLoading: boolean;
+  /** 索引版本与当前分块参数/模型不符（旧数据）：提示重新上传重建索引 */
+  indexOutdated?: boolean;
   /** 当前 Agent 模式（用于顶部状态横幅提示） */
   modeBanner?: AgentModeBanner;
   onOpenSidebar: () => void;
@@ -31,6 +37,14 @@ function ModeBanner({ mode }: { mode: AgentModeBanner }) {
       </div>
     );
   }
+  if (mode === "tool-agent") {
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30">
+        <span>🧰</span>
+        <span>工具智能体：云端规划检索，默认正文不上传</span>
+      </div>
+    );
+  }
   // cloud-only：本地检索 Top-K 分片，仅将相关分片发送云端生成
   return (
     <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/30">
@@ -46,6 +60,7 @@ export function ChatHeader({
   docName,
   chunkCount,
   docLoading,
+  indexOutdated,
   modeBanner,
   onOpenSidebar,
   onUploadClick,
@@ -67,8 +82,19 @@ export function ChatHeader({
         </div>
         {docName ? (
           <p className="text-xs text-ink-faint truncate flex items-center gap-1">
-            <CheckCircleIcon className="w-3 h-3 text-emerald-500" />
-            {docName} · {chunkCount} 块
+            {indexOutdated ? (
+              <WarningIcon className="w-3 h-3 text-amber-500 shrink-0" />
+            ) : (
+              <CheckCircleIcon className="w-3 h-3 text-emerald-500" />
+            )}
+            <span className="truncate">
+              {docName} · {chunkCount} 块
+            </span>
+            {indexOutdated && (
+              <span className="text-amber-600 shrink-0">
+                索引已过期，请重新上传文档
+              </span>
+            )}
           </p>
         ) : (
           <p className="text-xs text-ink-faint truncate">尚未上传文档</p>

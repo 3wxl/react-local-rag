@@ -3,8 +3,16 @@
  * - local-rag：纯本地 RAG（向量+BM25 检索 + Qwen 本地推理）
  * - hybrid-agent：混合模式（本地检索 + 云端规划 + 本地/云端执行）
  * - cloud-only：纯云端（跳过本地检索，直接走云端大模型）
+ * - tool-agent：工具智能体（云端模型走 OpenAI tool-calls 协议驱动循环，
+ *   工具在本地执行：search_docs / doc_outline / calculator。
+ *   默认「元数据模式」工具结果不含片段原文、答案本地生成；
+ *   显式开启后「同意模式」片段随 tool 消息上云、云端作答）
  */
-export type AgentMode = "local-rag" | "hybrid-agent" | "cloud-only";
+export type AgentMode =
+  | "local-rag"
+  | "hybrid-agent"
+  | "cloud-only"
+  | "tool-agent";
 
 /**
  * 云端 Agent 下发的指令类型
@@ -23,7 +31,8 @@ export type CloudAgentCommand = "LOCAL_KNOWLEDGE" | "GENERAL_KNOWLEDGE" | "MIXED
 export type AgentStepOrigin =
   | "cloud-plan"
   | "local-selfrag"
-  | "mixed-cloud";
+  | "mixed-cloud"
+  | "tool-agent";
 
 /**
  * Agent 执行中的一步记录（用于展示思考链 / 调试 / 性能埋点）
@@ -41,6 +50,14 @@ export interface AgentStep {
   retrievedChunks?: string[];
   /** 本步思考过程文本（模型推理 / 规划推理） */
   thinking?: string;
+  /** 工具智能体：本步调用的工具名与参数摘要（tool-call / tool-result 步骤用） */
+  tool?: {
+    name: string;
+    /** 参数摘要（已截断，仅展示用） */
+    args?: string;
+    /** 执行是否成功（tool-result 步骤用） */
+    ok?: boolean;
+  };
   /** 时间戳 */
   timestamp: number;
 }
@@ -52,6 +69,8 @@ export type AgentStepType =
   | "generate" // 最终回答生成
   | "cloud-route" // 云端指令下发
   | "cloud-execute" // 云端执行
+  | "tool-call" // 工具智能体：发起工具调用
+  | "tool-result" // 工具智能体：工具执行结果
   | "synthesize"; // 多子问题结果合并
 
 /**

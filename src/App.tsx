@@ -1,17 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { parseFile } from "./utils/pdfParse";
-import { createTextChunkStream } from "./utils/chunk";
+import { createTextChunkStream, CURRENT_INDEX_VERSION } from "./utils/chunk";
 import {
   embedPassages,
   searchTopK,
+  setEmbedDevice,
   unloadEmbeddingModel,
 } from "./utils/embeddingClient";
-import { disposeSharedLlmWorker } from "./agent/agentPlanner";
+import {
+  disposeSharedLlmWorker,
+  condenseQuery,
+  setLlmDevice,
+} from "./agent/agentPlanner";
+import { resolvePreferredDevice } from "./utils/deviceAccel";
+import { useWebGPU } from "./hooks/useDeviceAccel";
 import {
   generateAnswer,
   summarizeHistory,
 } from "./utils/generateAnswer";
 import { runSelfRagAgent, runHybridAgent, runCloudOnlyChat } from "./agent/agentRunner";
+import { runToolAgent } from "./agent/toolAgent";
 import type { AgentStep } from "./agent/types";
 import { summarizeHistoryViaCloud } from "./agent/cloudPlanner";
 import {
@@ -20,8 +28,19 @@ import {
   renderSummaryInput,
   MAX_SUMMARY_CHARS,
 } from "./utils/history";
-import { stripThinkTags, verifyAnswer } from "./utils/verifyAnswer";
-import { startTimer } from "./utils/perf";
+import {
+  stripThinkTags,
+  verifyAnswer,
+  buildRefusalResult,
+  NO_RELEVANT_ANSWER,
+} from "./utils/verifyAnswer";
+import {
+  buildEvidence,
+  toVerifyPassages,
+  type AnswerPassage,
+  type ContextRef,
+} from "./utils/citation";
+import { startTimer, recordSearchResult } from "./utils/perf";
 import type { AppError } from "./utils/errors";
 import type { VectorChunk } from "./types/doc";
 import type { ChatMessage } from "./types/chat";
@@ -39,9 +58,13 @@ import { WelcomeState } from "./components/WelcomeState";
 import { PerfPanel } from "./components/PerfPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useAgentSettings } from "./agent/useAgentSettings";
+import { WarningIcon } from "./components/icons";
 
 /** 允许上传的文档后缀 */
 const DOC_SUFFIX_RE = /\.(pdf|txt|md|markdown|mdown|mkd|docx)$/i;
+
+/** 空闲多久后自动卸载向量模型（5 分钟）。模块级常量，避免进 useCallback 依赖数组 */
+const IDLE_TIMEOUT = 5 * 60 * 1000;
 
 function App() {
   const {
@@ -59,11 +82,28 @@ function App() {
     finishStreaming,
     exportBackup,
     importBackup,
+    persistAvailable,
   } = useConversations();
 
   const { theme, setTheme } = useTheme();
   const [topK, setTopK] = useTopK();
   const [agentSettings, setAgentSettings] = useAgentSettings();
+  const {
+    enabled: webgpuEnabled,
+    setEnabled: setWebgpuEnabled,
+    supported: webgpuSupported,
+  } = useWebGPU();
+
+  /**
+   * 设备偏好下发：开关变化或探测完成后，把「期望设备」推给两个 worker。
+   * worker 未创建时只是记下（不提前拉起线程）；真正生效设备由 worker
+   * 加载 + 预热成功后回报（性能埋点面板显示，含回退原因）。
+   */
+  useEffect(() => {
+    const device = resolvePreferredDevice(webgpuEnabled);
+    setEmbedDevice(device);
+    setLlmDevice(device);
+  }, [webgpuEnabled, webgpuSupported]);
 
   /* 仅容器层保留的运行态 */
   const [input, setInput] = useState("");
@@ -79,15 +119,20 @@ function App() {
 
   /* ---------- 后台任务/最新状态的 ref（供延迟回调读取，避免闭包陈旧） ---------- */
   const busyRef = useRef(busy);
-  busyRef.current = busy;
   const conversationsRef = useRef(conversations);
-  conversationsRef.current = conversations;
   const agentSettingsRef = useRef(agentSettings);
-  agentSettingsRef.current = agentSettings;
+  // React 19 规范：ref 写入只允许在 effect，渲染期写 ref 会踩 react-hooks/refs 规则
+  useEffect(() => {
+    busyRef.current = busy;
+  });
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  });
+  useEffect(() => {
+    agentSettingsRef.current = agentSettings;
+  });
 
   /* ---------- 空闲自动卸载向量模型，减少浏览器内存占用 ---------- */
-  /** 空闲多久后自动卸载向量模型（5 分钟） */
-  const IDLE_TIMEOUT = 5 * 60 * 1000;
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 标记卸载中，避免 unload 期间触发新一轮卸载 */
   const unloadingRef = useRef(false);
@@ -95,7 +140,9 @@ function App() {
   const resetIdleTimer = useCallback(() => {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     idleTimerRef.current = setTimeout(async () => {
-      if (unloadingRef.current || busy) return;
+      // 用 busyRef.current 读取最新值，避免闭包捕获陈旧 busy 导致生成期间误触发卸载
+      // （setBusy(true) 后到 React commit+effect 之间有时间差，但 timer 触发时 ref 已是最新值）
+      if (unloadingRef.current || busyRef.current) return;
       unloadingRef.current = true;
       try {
         // 只释放模型权重，保留索引缓存（下次检索无需重新向量化）
@@ -109,7 +156,8 @@ function App() {
         unloadingRef.current = false;
       }
     }, IDLE_TIMEOUT);
-  }, [busy]);
+    // 依赖空数组：闭包改用 busyRef.current，函数身份稳定，不再随 busy 变化重建
+  }, []);
 
   /** 手动释放向量模型内存 */
   const handleUnloadModel = useCallback(async () => {
@@ -155,9 +203,9 @@ function App() {
         setDocLoading("正在解析文档...");
         const tParse = startTimer("parse");
         const tChunk = startTimer("chunk");
-        // 流式链路：PDF 逐页解析 → 每页立即分块，全文长字符串不落内存
-        const chunker = createTextChunkStream("pdf-001");
-        await parseFile(file, (pageText) => chunker.push(pageText));
+        // 流式链路：PDF 逐页解析 → 结构化块（页码/标题路径）→ 每块立即分块，全文长字符串不落内存
+        const chunker = createTextChunkStream(convId, file.name);
+        await parseFile(file, (block) => chunker.push(block));
         tParse.done({ sizeKB: Math.round(chunker.totalChars / 1024) });
 
         setDocLoading("正在文本分块...");
@@ -165,10 +213,10 @@ function App() {
         tChunk.done({ chunkCount: chunks.length });
 
         setDocLoading("正在向量化（本地模型计算）...");
-        const texts = chunks.map((c) => c.content);
         let embedLoaded = false;
         const tEmbed = startTimer("embed");
-        const vectors = await embedPassages(convId, texts, {
+        // 分块身份元数据（docName/ord/页码/章节）随向量一起进 worker 索引，检索结果才能做来源引用
+        const vectors = await embedPassages(convId, chunks, {
           onLoadProgress: (p) => {
             if (!embedLoaded) {
               embedLoaded = true;
@@ -183,7 +231,7 @@ function App() {
 
         const vecChunks: VectorChunk[] = chunks.map((chunk, idx) => ({
           ...chunk,
-          vector: vectors[idx],
+          vector: new Float32Array(vectors[idx]),
         }));
 
         attachDocument(convId, file.name, vecChunks);
@@ -361,22 +409,30 @@ function App() {
       thinking: "",
       status: "pending",
       createdAt: now + 1,
-      // 回答来源标记：四种模式
+      // 回答来源标记：五种模式
       answerSource:
         agentSettings.agentMode === "cloud-only"
           ? "cloud-only"
-          : agentSettings.agentMode === "hybrid-agent"
-            ? "hybrid-agent"
-            : agentSettings.agentMode === "local-rag" &&
-                agentSettings.enableSelfRag
-              ? "self-rag"
-              : "normal-rag",
+          : agentSettings.agentMode === "tool-agent"
+            ? "tool-agent"
+            : agentSettings.agentMode === "hybrid-agent"
+              ? "hybrid-agent"
+              : agentSettings.agentMode === "local-rag" &&
+                  agentSettings.enableSelfRag
+                ? "self-rag"
+                : "normal-rag",
     };
 
     addMessages(convId, [userMsg, assistantMsg], text);
     setInput("");
     setBusy(true);
     setLoadProgress(0);
+    // 立即清掉空闲卸载 timer：流式生成期间绝不允许 idleTimer 触发 disposeSharedLlmWorker
+    // 把 worker terminate 掉导致 token 中断（busyRef 守卫已是兜底，这里显式清掉更稳）
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
     // 用户开始提问：取消任何待执行的后台摘要，实时问答优先；本轮结束后会重新调度
     if (idleSummaryTimerRef.current) {
       clearTimeout(idleSummaryTimerRef.current);
@@ -397,7 +453,107 @@ function App() {
       const useSelfRag =
         agentSettings.agentMode === "local-rag" && agentSettings.enableSelfRag;
 
-      if (agentSettings.agentMode === "cloud-only") {
+      if (agentSettings.agentMode === "tool-agent") {
+        // 工具智能体分支：云端模型经 tool-calls 协议多轮调用本地工具
+        // （search_docs / doc_outline / calculator），工具结果按隐私模式构造：
+        // 默认元数据模式只回摘要、答案本地生成；同意模式片段随工具结果上云、云端作答
+        patchMessage(convId, assistantMsg.id, {
+          status: "thinking",
+          agentSteps: [],
+        });
+        const liveSteps: AgentStep[] = [];
+        let llmLoaded = false;
+        const tInfer = startTimer("llm-infer");
+
+        const handle = runToolAgent(
+          {
+            indexId: convId,
+            question: text,
+            history: historyTurns,
+            historySummary: prevSummary,
+            topK,
+            rerank: agentSettings.enableRerank,
+            cloud: {
+              apiKey: agentSettings.cloudApiKey,
+              baseUrl: agentSettings.cloudBaseUrl,
+              upstreamBaseUrl: agentSettings.cloudUpstreamUrl,
+              model: agentSettings.cloudModel,
+            },
+            allowChunksToCloud: agentSettings.allowToolChunksToCloud,
+          },
+          {
+            onLoadProgress: (progress) => {
+              if (!llmLoaded) {
+                llmLoaded = true;
+                startTimer("llm-load").done({ progress: Math.round(progress) });
+              }
+              setLoadProgress(progress);
+              patchMessage(convId, assistantMsg.id, { status: "loading-model" });
+            },
+            onGenerating: () => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+            },
+            onThinking: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "thinking" });
+              appendToMessage(convId, assistantMsg.id, "thinking", delta);
+            },
+            onToken: (delta) => {
+              patchMessage(convId, assistantMsg.id, { status: "generating" });
+              appendToMessage(convId, assistantMsg.id, "content", delta);
+            },
+            onStep: (step) => {
+              liveSteps.push(step);
+              const status =
+                step.type === "generate"
+                  ? "generating"
+                  : step.type === "retrieve" || step.type === "tool-call"
+                    ? "retrieving"
+                    : "thinking";
+              patchMessage(convId, assistantMsg.id, {
+                agentSteps: [...liveSteps],
+                status,
+              });
+            },
+          },
+        );
+        currentHandleRef.current = handle;
+
+        const result = await handle.promise;
+        tInfer.done({
+          tokens: (result.answer?.length || 0) + (result.cloudContent?.length || 0),
+          rounds: result.rounds,
+          mode: result.mode,
+        });
+        if (result.fallback && result.fallbackReason) {
+          // 工具模式依赖云端驱动循环，云端失败不回退本地，直接在气泡展示原因
+          const reasonMap: Record<string, string> = {
+            config: "未配置云端 API Key 或 Base URL",
+            timeout: "云端请求超时",
+            network: "网络故障或 CORS 被拦截（请确认已 npm run proxy）",
+            auth: "API Key 无效或无权限",
+            http: "云端服务异常",
+            format: "云端返回格式异常",
+          };
+          patchMessage(convId, assistantMsg.id, {
+            status: "error",
+            error: `工具智能体失败：${reasonMap[result.fallbackReason] || result.fallbackReason}`,
+            agentSteps: result.steps,
+          });
+        } else {
+          patchMessage(convId, assistantMsg.id, {
+            status: "done",
+            // 元数据模式：answer 为本地生成结果；同意模式：cloudContent 为云端答案
+            content: stripThinkTags(result.answer || ""),
+            cloudContent: result.cloudContent
+              ? stripThinkTags(result.cloudContent)
+              : undefined,
+            context: result.chunks.join("\n\n"),
+            contexts: result.contexts,
+            verification: result.verification,
+            agentSteps: result.steps,
+          });
+        }
+      } else if (agentSettings.agentMode === "cloud-only") {
         // 云端 RAG 分支：本地检索 Top-K 分片 → 只把 Top-K 分片发送云端生成
         // 检索在本地完成（向量+BM25 RRF），云端只看到与问题最相关的少量片段，减少隐私暴露与 token 消耗
         patchMessage(convId, assistantMsg.id, {
@@ -407,13 +563,23 @@ function App() {
         let topChunks: string[] = [];
         if (hasDoc) {
           const tSearch = startTimer("search");
-          const search = await searchTopK(convId, text, topK);
+          const search = await searchTopK(convId, text, topK, {
+            rerank: agentSettings.enableRerank,
+          });
           tSearch.done({
             topK,
             hitCount: search.hits.length,
             mode: search.mode,
           });
+          recordSearchResult(search);
           topChunks = search.hits.map((h) => h.content);
+          // chunk 已拿到、后续走云端作答（cloud-only 不做本地幻觉校验，本轮不再用向量模型）：
+          // 立即释放 BGE 权重（保留索引），云端流式回答不依赖向量模型，卸载不影响输出
+          try {
+            await unloadEmbeddingModel(false);
+          } catch {
+            /* 卸载失败不阻断作答 */
+          }
         }
 
         const liveSteps: AgentStep[] = [];
@@ -530,6 +696,7 @@ function App() {
             topK,
             history: historyTurns,
             historySummary: prevSummary,
+            rerank: agentSettings.enableRerank,
             cloud: {
               apiKey: agentSettings.cloudApiKey,
               baseUrl: agentSettings.cloudBaseUrl,
@@ -554,6 +721,7 @@ function App() {
             ? stripThinkTags(result.cloudContent)
             : undefined,
           context: result.chunks.join("\n\n"),
+          contexts: result.contexts,
           verification: result.verification,
           agentSteps: result.steps,
         });
@@ -608,6 +776,7 @@ function App() {
             topK,
             history: historyTurns,
             historySummary: prevSummary,
+            rerank: agentSettings.enableRerank,
           },
         );
         currentHandleRef.current = handle;
@@ -622,32 +791,50 @@ function App() {
           status: "done",
           content: stripThinkTags(result.answer || ""),
           context: ctx,
+          contexts: result.contexts,
           verification: result.verification,
           agentSteps: result.steps,
         });
       } else {
         // 普通本地 RAG 分支（原有流水线）：有文档走检索 → 流式生成 → 校验；无文档直接走 LLM 对话
-        let resultChunks: { content: string }[] = [];
+        let resultPassages: AnswerPassage[] = [];
+        let resultContexts: ContextRef[] = [];
         let ctx = "";
         if (hasDoc) {
           patchMessage(convId, assistantMsg.id, { status: "retrieving" });
+          // 多轮追问改写：含代词的问题先用最近对话补全成独立问题再检索（生成仍用原问题）
+          const condensed = await condenseQuery(text, historyTurns);
           const tSearch = startTimer("search");
-          const search = await searchTopK(convId, text, topK);
+          const search = await searchTopK(convId, condensed.query, topK, {
+            rerank: agentSettings.enableRerank,
+          });
           tSearch.done({
             topK,
             hitCount: search.hits.length,
             mode: search.mode,
           });
-          resultChunks = search.hits;
-          ctx = resultChunks.map((item) => item.content).join("\n\n");
+          recordSearchResult(search);
+          // 命中转编号段落：prompt 里带 [n] 角标，UI 用同一编号渲染引用卡片
+          const evidence = buildEvidence(search.hits);
+          resultPassages = evidence.passages;
+          resultContexts = evidence.contexts;
+          ctx = evidence.passages.map((p) => p.text).join("\n\n");
 
-          // 检索完成后暂时卸载向量模型，给 LLM（~300–400MB）腾出堆内存；
-          // 后续 verifyAnswer 会按需重新加载，索引仍保留在 worker 外的 IDB。
-          try {
-            await unloadEmbeddingModel(false);
-          } catch {
-            /* 卸载失败不阻断生成 */
+          // 相关度门限把候选全部滤掉：直接拒答，不调用模型生成（省一次完整推理）
+          if (resultPassages.length === 0) {
+            patchMessage(convId, assistantMsg.id, {
+              status: "done",
+              content: NO_RELEVANT_ANSWER,
+              verification: buildRefusalResult(NO_RELEVANT_ANSWER),
+              context: "",
+              contexts: [],
+            });
+            return;
           }
+
+          // 注意：这里**不**卸载向量模型。本轮检索完紧接着要跑 verifyAnswer（同样需要
+          // BGE），卸载只会造成「卸载 → 立刻重载」的抖动，白白多一次模型加载。
+          // 模型释放统一交给 5 分钟空闲定时器（resetIdleTimer）与手动释放按钮。
         } else {
           // 无文档：跳过检索与分片，直接进入本地 LLM 对话
           patchMessage(convId, assistantMsg.id, { status: "thinking" });
@@ -657,7 +844,7 @@ function App() {
         const tInfer = startTimer("llm-infer");
         const handle = generateAnswer(
           text,
-          resultChunks.map((i) => i.content),
+          resultPassages,
           {
             onLoadProgress: (progress) => {
               if (!llmLoaded) {
@@ -680,6 +867,7 @@ function App() {
               patchMessage(convId, assistantMsg.id, {
                 status: "generating",
                 context: ctx,
+                contexts: resultContexts,
               });
               appendToMessage(convId, assistantMsg.id, "content", delta);
             },
@@ -703,11 +891,18 @@ function App() {
             status: "verifying",
             content: finalText,
             context: ctx,
+            contexts: resultContexts,
           });
           try {
             const tVerify = startTimer("verify");
-            const verification = await verifyAnswer(convId, finalText, ctx);
-            tVerify.done({ sentences: verification?.sentences?.length || 0 });
+            // 语义比对范围收敛到「答案实际引用的段落 + 其窗口」
+            const verification = await verifyAnswer(convId, finalText, ctx, {
+              passages: toVerifyPassages(resultContexts),
+            });
+            tVerify.done({
+              sentences: verification?.sentences?.length || 0,
+              scopedChunks: verification?.scopedChunkCount || 0,
+            });
             patchMessage(convId, assistantMsg.id, {
               status: "done",
               verification,
@@ -718,9 +913,10 @@ function App() {
           }
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       // 用户主动取消 Agent：不显示失败标记，保留已生成的部分内容，按正常结束处理
-      if (err?.message === "Agent 已取消") {
+      if (message === "Agent 已取消") {
         patchMessage(convId, assistantMsg.id, { status: "done" });
       } else {
         console.error(err);
@@ -729,7 +925,7 @@ function App() {
         const hint = appErr?.hint ? `\n${appErr.hint}` : "";
         patchMessage(convId, assistantMsg.id, {
           status: "error",
-          error: (appErr?.userMessage || err?.message || "生成失败") + hint,
+          error: (appErr?.userMessage || message || "生成失败") + hint,
         });
       }
     } finally {
@@ -751,6 +947,7 @@ function App() {
     appendToMessage,
     resetIdleTimer,
     scheduleIdleSummary,
+    createConversation,
   ]);
 
   /* ---------- 停止生成 ---------- */
@@ -777,10 +974,15 @@ function App() {
       try {
         const result = await importBackup(file);
         if (result.status === "cancelled") return;
-        alert(
+        const base =
           result.overwritten > 0
             ? `导入成功：共 ${result.total} 个会话，其中 ${result.overwritten} 个覆盖了本地同名会话`
-            : `导入成功：恢复了 ${result.total} 个会话`,
+            : `导入成功：恢复了 ${result.total} 个会话`;
+        // 旧版本备份（1.0）：向量保留但分块身份字段是默认值，索引需重建
+        alert(
+          result.needsRebuild
+            ? `${base}\n\n注意：该备份来自旧版本，索引格式已过时，请对相关会话重新上传文档以重建索引`
+            : base,
         );
       } catch (err) {
         console.error(err);
@@ -792,7 +994,18 @@ function App() {
 
   /* ---------- 渲染：仅做布局与编排 ---------- */
   return (
-    <div className="h-screen flex bg-bg text-ink overflow-hidden">
+    <div className="h-screen flex flex-col bg-bg text-ink overflow-hidden">
+      {/* 持久化不可用横幅：环境存不下数据时必须让用户知道，而不是静默丢失 */}
+      {!persistAvailable && (
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 bg-amber-500/15 border-b border-amber-500/40 text-xs text-amber-700 dark:text-amber-400">
+          <WarningIcon className="w-3.5 h-3.5 shrink-0" />
+          <span>
+            当前环境无法持久化数据（无痕模式 / 浏览器禁用了
+            IndexedDB），本次会话的文档与对话在关闭页面后会丢失。建议导出备份留存。
+          </span>
+        </div>
+      )}
+      <div className="flex-1 flex min-h-0">
       <Sidebar
         conversations={conversations}
         activeId={activeId}
@@ -817,6 +1030,11 @@ function App() {
           docName={activeConv?.docName}
           chunkCount={activeConv?.vectorChunks.length ?? 0}
           docLoading={!!docLoading}
+          indexOutdated={
+            !!activeConv &&
+            activeConv.vectorChunks.length > 0 &&
+            activeConv.indexVersion !== CURRENT_INDEX_VERSION
+          }
           modeBanner={agentSettings.agentMode}
           onOpenSidebar={() => setSidebarOpen(true)}
           onUploadClick={handleUploadClick}
@@ -882,7 +1100,11 @@ function App() {
         agentSettings={agentSettings}
         onAgentSettingsChange={setAgentSettings}
         busy={busy}
+        webgpuEnabled={webgpuEnabled}
+        onWebgpuChange={setWebgpuEnabled}
+        webgpuSupported={webgpuSupported}
       />
+      </div>
     </div>
   );
 }

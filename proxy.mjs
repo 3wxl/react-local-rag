@@ -16,12 +16,20 @@
  * 前端：
  *   Base URL（代理）= http://localhost:8787/v1
  *   上游地址通过设置面板选择，经 X-Upstream-Base-Url 按请求切换，无需重启代理
+ *
+ * 工具智能体（tool-agent 模式）：POST /v1/agent/step
+ *   与 /v1/chat/completions 的区别是**请求体会被解析并做策略校验**（其余路由仍是字节透传）：
+ *   - tools 白名单：只放行 search_docs / doc_outline / calculator
+ *   - X-Agent-Round 轮次上限（防失控循环）
+ *   - X-Agent-Privacy=metadata（默认）时，role="tool" 的消息必须是 JSON 摘要且长度受限 ——
+ *     这是防呆闸门（拦截浏览器侧代码 bug 把片段原文塞进元数据模式），
+ *     真正的「不发送」保证在浏览器侧（toolAgent 按模式构造工具结果）。
  */
 
 import { createServer } from "node:http"; //`createServer`：创建 Node 原生 HTTP 服务，端口 8787
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http"; //同时引入`http`/`https`：支持转发 http/https 两种上游接口
-import { URL } from "node:url";
+import { URL, pathToFileURL } from "node:url";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const DEFAULT_TARGET_BASE_URL =
@@ -52,9 +60,103 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*", //本地开发允许`localhost:5173`跨域（**公网绝对不能用`*`**）
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, X-User-Api-Key, X-Upstream-Base-Url, X-Request-Id", //告诉浏览器预检请求允许这几个自定义 Header
+    "Content-Type, X-User-Api-Key, X-Upstream-Base-Url, X-Request-Id, X-Agent-Round, X-Agent-Privacy", //告诉浏览器预检请求允许这几个自定义 Header
   "Access-Control-Max-Age": "86400", //浏览器缓存预检请求 24 小时，减少 OPTIONS 请求次数
 };
+
+/* ------------------------------------------------------------------ */
+/* 工具智能体（/v1/agent/step）策略校验                                 */
+/* ------------------------------------------------------------------ */
+
+/** 工具白名单：与 src/agent/toolAgent.ts 的 TOOL_SPECS 保持一致（改一处要同步另一处） */
+export const TOOL_WHITELIST = new Set([
+  "search_docs",
+  "doc_outline",
+  "calculator",
+]);
+/** 最大工具轮次：与浏览器侧 maxRounds 独立，这里是服务端硬上限（防失控循环） */
+export const MAX_AGENT_ROUNDS = 8;
+/** metadata 模式单条 tool 消息的字符上限（大纲输出上限 3500，留余量） */
+const METADATA_TOOL_CONTENT_MAX = 4000;
+
+/**
+ * 校验 /v1/agent/step 的请求体与协议头。纯函数，导出供单测。
+ *
+ * @param {unknown} payload 解析后的 JSON 请求体
+ * @param {Record<string, unknown>} headers 请求头（小写键）
+ * @returns {{ok: true, privacy: string, round: number} | {ok: false, status: number, message: string}}
+ */
+export function validateAgentStep(payload, headers) {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { ok: false, status: 400, message: "请求体必须是 JSON 对象" };
+  }
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) {
+    return { ok: false, status: 400, message: "messages 必须是数组" };
+  }
+
+  // 1. tools 白名单
+  if (payload.tools !== undefined) {
+    if (!Array.isArray(payload.tools)) {
+      return { ok: false, status: 400, message: "tools 必须是数组" };
+    }
+    for (const t of payload.tools) {
+      const name =
+        t && t.type === "function" && t.function && typeof t.function.name === "string"
+          ? t.function.name
+          : null;
+      if (!name) {
+        return { ok: false, status: 400, message: "tools 项必须是 function 类型且带 name" };
+      }
+      if (!TOOL_WHITELIST.has(name)) {
+        return { ok: false, status: 400, message: `工具不在白名单内: ${name}` };
+      }
+    }
+  }
+
+  // 2. 轮次上限
+  const round = Number.parseInt(String(headers["x-agent-round"] ?? "1"), 10);
+  if (!Number.isInteger(round) || round < 1) {
+    return { ok: false, status: 400, message: "X-Agent-Round 必须是 ≥1 的整数" };
+  }
+  if (round > MAX_AGENT_ROUNDS) {
+    return { ok: false, status: 429, message: `超出最大工具轮次（${MAX_AGENT_ROUNDS}）` };
+  }
+
+  // 3. 隐私模式（缺省 metadata：默认拒绝片段上传）
+  const privacy = String(headers["x-agent-privacy"] ?? "metadata").trim() || "metadata";
+  if (privacy !== "metadata" && privacy !== "consent") {
+    return { ok: false, status: 400, message: `未知隐私模式: ${privacy}` };
+  }
+
+  // 4. metadata 模式：tool 消息必须是 JSON 摘要（结构化元数据），不能是自由文本片段。
+  //    防呆闸门 —— 拦截浏览器侧代码 bug 把片段原文塞进元数据模式；非安全边界。
+  if (privacy === "metadata") {
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (!m || typeof m !== "object" || m.role !== "tool") continue;
+      const content = typeof m.content === "string" ? m.content : "";
+      if (content.length > METADATA_TOOL_CONTENT_MAX) {
+        return {
+          ok: false,
+          status: 403,
+          message: `metadata 模式下第 ${i} 条 tool 消息过长（${content.length} 字符），疑似携带片段原文`,
+        };
+      }
+      try {
+        JSON.parse(content);
+      } catch {
+        return {
+          ok: false,
+          status: 403,
+          message: `metadata 模式下第 ${i} 条 tool 消息不是 JSON 摘要，已拦截`,
+        };
+      }
+    }
+  }
+
+  return { ok: true, privacy, round };
+}
 
 function writeCORS(res) {
   for (const [k, v] of Object.entries(CORS_HEADERS)) {
@@ -121,6 +223,9 @@ function stripHopHeaders(headers) {
   // 自定义协议头不转发给上游
   delete out["x-user-api-key"];
   delete out["x-upstream-base-url"];
+  // 工具智能体协议头：只在「浏览器 ↔ 代理」这一跳有意义
+  delete out["x-agent-round"];
+  delete out["x-agent-privacy"];
   delete out["authorization"];
   return out;
 }
@@ -157,6 +262,28 @@ const server = createServer((req, res) => {
     if (!resolved.ok) {
       sendError(res, 400, resolved.message);
       return;
+    }
+
+    // 工具智能体路由：解析请求体并做策略校验（白名单 / 轮次上限 / 隐私闸门），
+    // 其余 /v1/* 路由保持字节透传不做任何解析
+    if (req.url.startsWith("/v1/agent/")) {
+      let payload;
+      try {
+        payload = JSON.parse(body ? body.toString("utf8") : "{}");
+      } catch {
+        sendError(res, 400, "Agent step 请求体不是合法 JSON");
+        return;
+      }
+      const verdict = validateAgentStep(payload, req.headers);
+      if (!verdict.ok) {
+        console.warn(`[proxy][agent] 拒绝：${verdict.message}`);
+        sendError(res, verdict.status, verdict.message);
+        return;
+      }
+      const toolCount = Array.isArray(payload.tools) ? payload.tools.length : 0;
+      console.log(
+        `[proxy][agent] round=${verdict.round} privacy=${verdict.privacy} tools=${toolCount}`,
+      );
     }
 
     const target = resolved.base;
@@ -225,16 +352,22 @@ const server = createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`[proxy] listening on http://localhost:${PORT}`);
-  console.log(`[proxy] default upstream → ${DEFAULT_TARGET_BASE_URL}`);
-  console.log(`[proxy] allowed hosts → ${[...ALLOWED_HOSTS].join(", ")}`);
-  console.log(`[proxy] 前端代理地址: http://localhost:${PORT}/v1`);
-  console.log(
-    `[proxy] 按请求头 X-Upstream-Base-Url 切换厂商，无需重启（须在白名单内）`,
-  );
-});
+// 仅在 `node proxy.mjs` 直接运行时监听端口；被单测 import 时不启动服务
+const isMain =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  server.listen(PORT, () => {
+    console.log(`[proxy] listening on http://localhost:${PORT}`);
+    console.log(`[proxy] default upstream → ${DEFAULT_TARGET_BASE_URL}`);
+    console.log(`[proxy] allowed hosts → ${[...ALLOWED_HOSTS].join(", ")}`);
+    console.log(`[proxy] 前端代理地址: http://localhost:${PORT}/v1`);
+    console.log(
+      `[proxy] 按请求头 X-Upstream-Base-Url 切换厂商，无需重启（须在白名单内）`,
+    );
+    console.log(`[proxy] 工具智能体端点: POST /v1/agent/step（tools 白名单 + 轮次上限 + 隐私闸门）`);
+  });
 
-process.on("SIGINT", () => {
-  server.close(() => process.exit(0));
-});
+  process.on("SIGINT", () => {
+    server.close(() => process.exit(0));
+  });
+}

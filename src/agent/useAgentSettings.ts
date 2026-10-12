@@ -8,18 +8,32 @@ import type { AgentMode } from "./types";
 
 const KEY_AGENT_MODE = "agent:mode";
 const KEY_ENABLE_SELF_RAG = "agent:selfRag";
+const KEY_ENABLE_RERANK = "agent:rerank";
 const KEY_CLOUD_API_KEY = "agent:cloudApiKey"; // 敏感：走 sessionStorage，关页清空
 const KEY_CLOUD_BASE_URL = "agent:cloudBaseUrl";
 const KEY_CLOUD_UPSTREAM_URL = "agent:cloudUpstreamUrl";
 const KEY_CLOUD_MODEL = "agent:cloudModel";
+const KEY_ALLOW_TOOL_CHUNKS = "agent:allowToolChunksToCloud";
 
 export const DEFAULT_AGENT_MODE: AgentMode = "local-rag";
 export const DEFAULT_ENABLE_SELF_RAG = true;
+/**
+ * 两阶段精排默认关闭：reranker 模型常驻会占约 300~400MB WASM 堆，
+ * 与 BGE 向量模型（约 100MB）+ 本地 Qwen（约 400MB）同时驻留会触发
+ * OrtRun std::bad_alloc。需要精排时在设置面板手动开启。
+ */
+export const DEFAULT_ENABLE_RERANK = false;
 /** 本机 CORS 代理地址（浏览器只连这个） */
 export const DEFAULT_CLOUD_BASE_URL = "http://localhost:8787/v1";
 /** 代理默认上游：DeepSeek */
 export const DEFAULT_CLOUD_UPSTREAM_URL = "https://api.deepseek.com/v1";
 export const DEFAULT_CLOUD_MODEL = "deepseek-flash";
+/**
+ * 工具智能体「同意模式」开关：允许检索片段随工具结果发送云端。
+ * 默认 false（元数据模式）：工具结果只有计数/标题/页码，答案本地生成。
+ * 打开需在设置面板经确认弹窗显式同意（与 cloud-only 同一性质的知情同意）。
+ */
+export const DEFAULT_ALLOW_TOOL_CHUNKS = false;
 
 /** 设置面板：厂商预设（一键填上游 + 推荐模型） */
 export const CLOUD_PROVIDER_PRESETS: {
@@ -76,12 +90,16 @@ export const CLOUD_PROVIDER_PRESETS: {
 export interface AgentSettings {
   agentMode: AgentMode;
   enableSelfRag: boolean;
+  /** 两阶段检索：bge-reranker 精排（显存/内存占用大，默认关闭） */
+  enableRerank: boolean;
   cloudApiKey: string;
   /** 本机代理地址，默认 http://localhost:8787/v1 */
   cloudBaseUrl: string;
   /** 真实上游 OpenAI 兼容根地址，经 X-Upstream-Base-Url 传给代理 */
   cloudUpstreamUrl: string;
   cloudModel: string;
+  /** 工具智能体：允许检索片段随工具结果上云（同意模式），默认 false */
+  allowToolChunksToCloud: boolean;
 }
 
 function readStr(key: string, fallback: string): string {
@@ -115,7 +133,12 @@ function readBool(key: string, fallback: boolean): boolean {
 function readAgentMode(key: string, fallback: AgentMode): AgentMode {
   try {
     const v = localStorage.getItem(key);
-    if (v === "local-rag" || v === "hybrid-agent" || v === "cloud-only")
+    if (
+      v === "local-rag" ||
+      v === "hybrid-agent" ||
+      v === "cloud-only" ||
+      v === "tool-agent"
+    )
       return v;
     return fallback;
   } catch {
@@ -147,6 +170,7 @@ function loadAll(): AgentSettings {
   return {
     agentMode: readAgentMode(KEY_AGENT_MODE, DEFAULT_AGENT_MODE),
     enableSelfRag: readBool(KEY_ENABLE_SELF_RAG, DEFAULT_ENABLE_SELF_RAG),
+    enableRerank: readBool(KEY_ENABLE_RERANK, DEFAULT_ENABLE_RERANK),
     cloudApiKey: readSensitive(KEY_CLOUD_API_KEY, ""),
     cloudBaseUrl: readStr(KEY_CLOUD_BASE_URL, DEFAULT_CLOUD_BASE_URL),
     cloudUpstreamUrl: readStr(
@@ -154,6 +178,10 @@ function loadAll(): AgentSettings {
       DEFAULT_CLOUD_UPSTREAM_URL,
     ),
     cloudModel: readStr(KEY_CLOUD_MODEL, DEFAULT_CLOUD_MODEL),
+    allowToolChunksToCloud: readBool(
+      KEY_ALLOW_TOOL_CHUNKS,
+      DEFAULT_ALLOW_TOOL_CHUNKS,
+    ),
   };
 }
 
@@ -173,6 +201,8 @@ export function useAgentSettings(): [
       if (patch.agentMode !== undefined) writeStr(KEY_AGENT_MODE, next.agentMode);
       if (patch.enableSelfRag !== undefined)
         writeBool(KEY_ENABLE_SELF_RAG, next.enableSelfRag);
+      if (patch.enableRerank !== undefined)
+        writeBool(KEY_ENABLE_RERANK, next.enableRerank);
       if (patch.cloudApiKey !== undefined)
         writeSensitive(KEY_CLOUD_API_KEY, next.cloudApiKey);
       if (patch.cloudBaseUrl !== undefined)
@@ -181,6 +211,8 @@ export function useAgentSettings(): [
         writeStr(KEY_CLOUD_UPSTREAM_URL, next.cloudUpstreamUrl);
       if (patch.cloudModel !== undefined)
         writeStr(KEY_CLOUD_MODEL, next.cloudModel);
+      if (patch.allowToolChunksToCloud !== undefined)
+        writeBool(KEY_ALLOW_TOOL_CHUNKS, next.allowToolChunksToCloud);
       return next;
     });
   }, []);

@@ -1,12 +1,18 @@
 import type { VectorChunk } from "./doc";
 import type { VerificationResult } from "../utils/verifyAnswer";
+import type { ContextRef } from "../utils/citation";
 import type { AgentStep } from "../agent/types";
 
 /** 消息角色 */
 export type Role = "user" | "assistant";
 
-/** 回答来源：普通 RAG / Self-RAG Agent / 混合 Agent / 纯云端（仅 assistant 消息） */
-export type AnswerSource = "normal-rag" | "self-rag" | "hybrid-agent" | "cloud-only";
+/** 回答来源：普通 RAG / Self-RAG Agent / 混合 Agent / 纯云端 / 工具智能体（仅 assistant 消息） */
+export type AnswerSource =
+  | "normal-rag"
+  | "self-rag"
+  | "hybrid-agent"
+  | "cloud-only"
+  | "tool-agent";
 
 /** 单条消息的运行状态 */
 export type MessageStatus =
@@ -27,8 +33,13 @@ export interface ChatMessage {
   content: string;
   /** 助手回答前的思考过程（仅 assistant 消息） */
   thinking?: string;
-  /** 检索到的原文片段（仅 assistant 消息，可折叠查看） */
+  /** 检索到的原文片段（旧数据/兼容用；新回答走 contexts 卡片） */
   context?: string;
+  /**
+   * 引用卡片（仅 assistant 消息）：与答案角标 [n] 一一对应。
+   * 含文件名/章节/页码/命中分/精确命中文本/窗口全文，供展开原文与点击定位。
+   */
+  contexts?: ContextRef[];
   /** Self-RAG / Agent 执行步骤链（仅 assistant，供思考面板渲染） */
   agentSteps?: AgentStep[];
   /** 回答来源标记：普通 RAG / Self-RAG Agent / 混合 Agent（仅 assistant 消息） */
@@ -65,8 +76,13 @@ export interface Conversation {
    * （vectorChunks 仅在 ready 时写入，有分块即可检索）。
    */
   docStatus?: DocStatus;
-  /** 关联文档的分块向量（检索用） */
+  /** 关联文档的分块向量（检索用；懒加载：仅当前会话持有，切会话再拉） */
   vectorChunks: VectorChunk[];
+  /**
+   * 索引版本 = hash(分块参数 + 前缀方案 + 模型名)。
+   * 缺失（旧数据）或与 CURRENT_INDEX_VERSION 不一致：索引已过期，需重新上传文档。
+   */
+  indexVersion?: string;
   messages: ChatMessage[];
   /** 长对话历史的滚动摘要（旧对话被压缩为此文本，避免 Prompt 持续膨胀） */
   historySummary?: string;

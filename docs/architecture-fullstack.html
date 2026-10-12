@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>react-local-rag → 全栈 RAG 平台 · 目标架构</title>
+<style>
+  :root {
+    --bg: #020617;
+    --card: #0b1222;
+    --border: #1e293b;
+    --ink: #e2e8f0;
+    --muted: #94a3b8;
+    --dim: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 24px 48px;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .wrap { max-width: 1360px; margin: 0 auto; }
+  .head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #34d399;
+    box-shadow: 0 0 0 0 rgba(52,211,153,.7);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(52,211,153,.6); }
+    70%  { box-shadow: 0 0 0 12px rgba(52,211,153,0); }
+    100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+  }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .3px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 11.5px; margin: 0 0 20px 22px; line-height: 1.6; }
+  .plan { border: 1px solid var(--border); border-radius: 12px; background: var(--card); padding: 10px; overflow-x: auto; }
+  svg { display: block; width: 100%; height: auto; min-width: 1180px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-top: 18px; }
+  .card { border: 1px solid var(--border); border-radius: 10px; background: var(--card); padding: 14px 16px; }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .cyan { background: #22d3ee; } .emerald { background: #34d399; }
+  .violet { background: #a78bfa; } .amber { background: #fbbf24; }
+  .rose { background: #fb7185; } .slate { background: #94a3b8; }
+  .card h3 { font-size: 12.5px; margin: 0; font-weight: 600; }
+  .card ul { margin: 0; padding: 0; list-style: none; }
+  .card li { font-size: 11px; color: var(--muted); line-height: 1.8; }
+  footer { margin-top: 20px; color: var(--dim); font-size: 10.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <span class="dot"></span>
+    <h1>react-local-rag → 全栈 RAG 平台 · 目标架构</h1>
+  </div>
+  <p class="sub">双模（浏览器本地 Lite / 服务器集群）· 引用与拒答为一等公民 · Harness 横切保证每次改动可量化验证</p>
+
+  <div class="plan">
+  <svg viewBox="0 0 1280 900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="全栈 RAG 平台目标架构图">
+    <defs>
+      <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+        <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+      </pattern>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+      </marker>
+      <marker id="arrowRose" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/>
+      </marker>
+      <marker id="arrowViolet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+      </marker>
+      <marker id="arrowSlate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+      </marker>
+    </defs>
+
+    <rect x="0" y="0" width="1280" height="900" fill="url(#grid)"/>
+
+    <!-- ===== 连线（先画，位于组件之下） ===== -->
+    <g stroke="#64748b" stroke-width="1.4" fill="none" marker-end="url(#arrow)">
+      <path d="M 475 126 L 475 148"/>
+      <path d="M 475 236 L 475 258"/>
+      <path d="M 475 360 L 475 378"/>
+    </g>
+    <g stroke="#a78bfa" stroke-width="1.4" fill="none" stroke-dasharray="5,4" marker-end="url(#arrowViolet)">
+      <path d="M 890 466 L 890 598"/>
+      <path d="M 575 576 L 575 598"/>
+    </g>
+    <g stroke="#94a3b8" stroke-width="1.3" fill="none" stroke-dasharray="3,3" marker-end="url(#arrowSlate)">
+      <path d="M 400 728 L 400 688"/>
+      <path d="M 760 728 L 760 688"/>
+      <path d="M 1090 728 L 1090 718"/>
+    </g>
+    <g stroke="#fb7185" stroke-width="1.2" fill="none" stroke-dasharray="4,4" marker-end="url(#arrowRose)">
+      <path d="M 918 300 L 900 300"/>
+      <path d="M 918 432 L 900 432"/>
+      <path d="M 918 542 L 900 542"/>
+      <path d="M 918 652 L 900 652"/>
+    </g>
+
+    <!-- ===== L1 客户端层 ===== -->
+    <rect x="30" y="40" width="870" height="86" rx="12" fill="none" stroke="#22d3ee" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="58" fill="#22d3ee" font-size="10" font-weight="600">L1 · 客户端层</text>
+
+    <rect x="50" y="66" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="66" width="260" height="52" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="64" y="88" fill="#e2e8f0" font-size="12">浏览器本地引擎（Lite）</text>
+    <text x="64" y="105" fill="#94a3b8" font-size="9">离线可查 · 数据不出浏览器</text>
+
+    <rect x="335" y="66" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="335" y="66" width="260" height="52" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="349" y="88" fill="#e2e8f0" font-size="12">Web 前端（复用现有）</text>
+    <text x="349" y="105" fill="#94a3b8" font-size="9">引用卡片 · 步骤面板 · HITL</text>
+
+    <rect x="620" y="66" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="620" y="66" width="260" height="52" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="634" y="88" fill="#e2e8f0" font-size="12">CLI / SDK</text>
+    <text x="634" y="105" fill="#94a3b8" font-size="9">批量问答 · CI 集成</text>
+
+    <!-- ===== L2 接入层 ===== -->
+    <rect x="30" y="150" width="870" height="86" rx="12" fill="none" stroke="#34d399" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="168" fill="#34d399" font-size="10" font-weight="600">L2 · 接入层</text>
+
+    <rect x="50" y="176" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="176" width="260" height="52" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="64" y="198" fill="#e2e8f0" font-size="12">API 网关（FastAPI）</text>
+    <text x="64" y="215" fill="#94a3b8" font-size="9">/v1/retrieve · /v1/answer · /v1/eval</text>
+
+    <rect x="335" y="176" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="335" y="176" width="260" height="52" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="349" y="198" fill="#e2e8f0" font-size="12">认证 · 多租户 · RBAC</text>
+    <text x="349" y="215" fill="#94a3b8" font-size="9">OIDC / JWT · 按租户隔离</text>
+
+    <rect x="620" y="176" width="260" height="52" rx="6" fill="#0f172a"/>
+    <rect x="620" y="176" width="260" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="634" y="198" fill="#e2e8f0" font-size="12">限流 · 配额 · 审计日志</text>
+    <text x="634" y="215" fill="#94a3b8" font-size="9">谁问了什么 · 命中哪些块</text>
+
+    <!-- ===== L3 编排层 ===== -->
+    <rect x="30" y="260" width="870" height="100" rx="12" fill="none" stroke="#34d399" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="278" fill="#34d399" font-size="10" font-weight="600">L3 · 编排层（LangGraph）</text>
+
+    <rect x="50" y="288" width="260" height="58" rx="6" fill="#0f172a"/>
+    <rect x="50" y="288" width="260" height="58" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="64" y="310" fill="#e2e8f0" font-size="12">状态机：Ingestion / QA / Agentic</text>
+    <text x="64" y="327" fill="#94a3b8" font-size="9">checkpoint · interrupt · stream</text>
+
+    <rect x="335" y="288" width="260" height="58" rx="6" fill="#0f172a"/>
+    <rect x="335" y="288" width="260" height="58" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="349" y="310" fill="#e2e8f0" font-size="12">Skills 注册表</text>
+    <text x="349" y="327" fill="#94a3b8" font-size="9">manifest · 沙箱 · 租户授权 · 版本</text>
+
+    <rect x="620" y="288" width="260" height="58" rx="6" fill="#0f172a"/>
+    <rect x="620" y="288" width="260" height="58" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="634" y="310" fill="#e2e8f0" font-size="12">MCP Client / Server · HITL</text>
+    <text x="634" y="327" fill="#94a3b8" font-size="9">对外暴露知识库 · 对内挂载工具</text>
+
+    <!-- ===== L4 检索层 ===== -->
+    <rect x="30" y="380" width="870" height="86" rx="12" fill="none" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="398" fill="#a78bfa" font-size="10" font-weight="600">L4 · 检索层</text>
+
+    <rect x="50" y="406" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="406" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="62" y="428" fill="#e2e8f0" font-size="11.5">Query 改写 / 分解</text>
+    <text x="62" y="444" fill="#94a3b8" font-size="9">多轮消解 · 扩展</text>
+
+    <rect x="263" y="406" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="263" y="406" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="275" y="428" fill="#e2e8f0" font-size="11.5">混合检索</text>
+    <text x="275" y="444" fill="#94a3b8" font-size="9">BM25 + 向量 · RRF</text>
+
+    <rect x="477" y="406" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="477" y="406" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="489" y="428" fill="#e2e8f0" font-size="11.5">Rerank</text>
+    <text x="489" y="444" fill="#94a3b8" font-size="9">cross-encoder · logit</text>
+
+    <rect x="690" y="406" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="690" y="406" width="190" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="702" y="428" fill="#e2e8f0" font-size="11.5">ACL 过滤 · 索引版本</text>
+    <text x="702" y="444" fill="#94a3b8" font-size="9">检索层生效 · 灰度重建</text>
+
+    <!-- ===== L5 摄取层 ===== -->
+    <rect x="30" y="490" width="870" height="86" rx="12" fill="none" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="508" fill="#fbbf24" font-size="10" font-weight="600">L5 · 摄取层（异步队列）</text>
+
+    <rect x="50" y="516" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="516" width="190" height="52" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="62" y="538" fill="#e2e8f0" font-size="11.5">解析 / OCR / 转写</text>
+    <text x="62" y="554" fill="#94a3b8" font-size="9">PDF · DOCX · 扫描件</text>
+
+    <rect x="263" y="516" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="263" y="516" width="190" height="52" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="275" y="538" fill="#e2e8f0" font-size="11.5">结构化分块</text>
+    <text x="275" y="554" fill="#94a3b8" font-size="9">跨语言一致 · contentHash</text>
+
+    <rect x="477" y="516" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="477" y="516" width="190" height="52" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="489" y="538" fill="#e2e8f0" font-size="11.5">Embedding</text>
+    <text x="489" y="554" fill="#94a3b8" font-size="9">bge-m3 · 前缀方案版本化</text>
+
+    <rect x="690" y="516" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="690" y="516" width="190" height="52" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="702" y="538" fill="#e2e8f0" font-size="11.5">索引 · 增量更新</text>
+    <text x="702" y="554" fill="#94a3b8" font-size="9">去重 · 变更重算 · 软删除</text>
+
+    <!-- ===== L6 数据层 ===== -->
+    <rect x="30" y="600" width="870" height="86" rx="12" fill="none" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="618" fill="#a78bfa" font-size="10" font-weight="600">L6 · 数据层</text>
+
+    <rect x="50" y="626" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="626" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="62" y="648" fill="#e2e8f0" font-size="11.5">Postgres + pgvector</text>
+    <text x="62" y="664" fill="#94a3b8" font-size="9">租户 · 文档 · 块 · 向量</text>
+
+    <rect x="263" y="626" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="263" y="626" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="275" y="648" fill="#e2e8f0" font-size="11.5">OpenSearch / FTS</text>
+    <text x="275" y="664" fill="#94a3b8" font-size="9">中文分词 BM25</text>
+
+    <rect x="477" y="626" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="477" y="626" width="190" height="52" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="489" y="648" fill="#e2e8f0" font-size="11.5">MinIO</text>
+    <text x="489" y="664" fill="#94a3b8" font-size="9">原文与解析产物</text>
+
+    <rect x="690" y="626" width="190" height="52" rx="6" fill="#0f172a"/>
+    <rect x="690" y="626" width="190" height="52" rx="6" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.5"/>
+    <text x="702" y="648" fill="#e2e8f0" font-size="11.5">Redis</text>
+    <text x="702" y="664" fill="#94a3b8" font-size="9">队列 · 缓存 · 限流计数</text>
+
+    <!-- ===== 模型双通道 ===== -->
+    <rect x="30" y="730" width="870" height="86" rx="12" fill="none" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="46" y="748" fill="#94a3b8" font-size="10" font-weight="600">模型双通道（LiteLLM 统一接口）</text>
+
+    <rect x="50" y="756" width="405" height="52" rx="6" fill="#0f172a"/>
+    <rect x="50" y="756" width="405" height="52" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="64" y="778" fill="#e2e8f0" font-size="12">本地通道：Ollama / vLLM + BGE + reranker</text>
+    <text x="64" y="795" fill="#94a3b8" font-size="9">合规 / 内网 / 离线首选 · 数据不出域</text>
+
+    <rect x="475" y="756" width="405" height="52" rx="6" fill="#0f172a"/>
+    <rect x="475" y="756" width="405" height="52" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="489" y="778" fill="#e2e8f0" font-size="12">云端通道：OpenAI 兼容 API</text>
+    <text x="489" y="795" fill="#94a3b8" font-size="9">效果优先 · 需显式授权 + 脱敏</text>
+
+    <!-- ===== 右列：Harness 横切 ===== -->
+    <rect x="920" y="40" width="330" height="656" rx="12" fill="none" stroke="#fb7185" stroke-width="1.4" stroke-dasharray="6,4"/>
+    <text x="936" y="60" fill="#fb7185" font-size="10.5" font-weight="600">Harness · 评测与回归闭环（横切）</text>
+    <text x="936" y="76" fill="#94a3b8" font-size="9">每次改动都可量化验证</text>
+
+    <rect x="940" y="90" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="90" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="112" fill="#e2e8f0" font-size="11.5">H1 数据集工程</text>
+    <text x="954" y="128" fill="#94a3b8" font-size="9">golden 版本化 · 难例回流 · 合成＋抽检</text>
+
+    <rect x="940" y="152" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="152" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="174" fill="#e2e8f0" font-size="11.5">H2 指标服务</text>
+    <text x="954" y="190" fill="#94a3b8" font-size="9">检索 / 生成 / 系统 / Agent 四类</text>
+
+    <rect x="940" y="214" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="214" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="236" fill="#e2e8f0" font-size="11.5">H3 门槛与预算 CI</text>
+    <text x="954" y="252" fill="#94a3b8" font-size="9">准确率 + 延迟 / 成本预算，退化即红</text>
+
+    <rect x="940" y="276" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="276" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="298" fill="#e2e8f0" font-size="11.5">H4 轨迹回放</text>
+    <text x="954" y="314" fill="#94a3b8" font-size="9">state / 工具调用落库 · 不调模型复现</text>
+
+    <rect x="940" y="338" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="338" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="360" fill="#e2e8f0" font-size="11.5">H5 故障注入矩阵</text>
+    <text x="954" y="376" fill="#94a3b8" font-size="9">超时 / 乱格式 / 空召回 / 429 / 越权</text>
+
+    <rect x="940" y="400" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="400" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="422" fill="#e2e8f0" font-size="11.5">H6 影子 / 金丝雀评测</text>
+    <text x="954" y="438" fill="#94a3b8" font-size="9">新配置并行对比后再放量</text>
+
+    <rect x="940" y="462" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="462" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="484" fill="#e2e8f0" font-size="11.5">H7 人工标注台</text>
+    <text x="954" y="500" fill="#94a3b8" font-size="9">低置信入队 → 标注 → 数据飞轮</text>
+
+    <rect x="940" y="524" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="524" width="290" height="52" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="546" fill="#e2e8f0" font-size="11.5">H8 配置版本化</text>
+    <text x="954" y="562" fill="#94a3b8" font-size="9">prompt / 参数 / 模型 ↔ eval run id</text>
+
+    <rect x="940" y="586" width="290" height="94" rx="6" fill="#0f172a"/>
+    <rect x="940" y="586" width="290" height="94" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+    <text x="954" y="608" fill="#e2e8f0" font-size="11.5">核心 KPI（门槛化）</text>
+    <text x="954" y="626" fill="#94a3b8" font-size="9">引用精度 · 引用召回 · 拒答正确率</text>
+    <text x="954" y="642" fill="#94a3b8" font-size="9">误拒数 · p95 延迟 · 单请求成本</text>
+    <text x="954" y="658" fill="#94a3b8" font-size="9">Agent 步数 · 工具成功率 · 无进展率</text>
+
+    <!-- ===== 右列：可观测 ===== -->
+    <rect x="920" y="730" width="330" height="86" rx="12" fill="none" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="8,4"/>
+    <text x="936" y="748" fill="#94a3b8" font-size="10" font-weight="600">可观测与 SLO</text>
+    <rect x="940" y="756" width="290" height="52" rx="6" fill="#0f172a"/>
+    <rect x="940" y="756" width="290" height="52" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="954" y="778" fill="#e2e8f0" font-size="11.5">OTel Trace · Prometheus · Grafana</text>
+    <text x="954" y="795" fill="#94a3b8" font-size="9">trace_id 还原检索证据与成本</text>
+
+    <!-- ===== 图例（在所有边界之外） ===== -->
+    <g>
+      <text x="30" y="868" fill="#64748b" font-size="9">图例</text>
+      <rect x="72" y="859" width="14" height="10" rx="2" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.2"/>
+      <text x="92" y="868" fill="#94a3b8" font-size="9">客户端</text>
+      <rect x="140" y="859" width="14" height="10" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.2"/>
+      <text x="160" y="868" fill="#94a3b8" font-size="9">服务端 / 编排</text>
+      <rect x="240" y="859" width="14" height="10" rx="2" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.2"/>
+      <text x="260" y="868" fill="#94a3b8" font-size="9">检索 / 数据</text>
+      <rect x="330" y="859" width="14" height="10" rx="2" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.2"/>
+      <text x="350" y="868" fill="#94a3b8" font-size="9">摄取</text>
+      <rect x="395" y="859" width="14" height="10" rx="2" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.2"/>
+      <text x="415" y="868" fill="#94a3b8" font-size="9">安全 / Harness</text>
+      <rect x="505" y="859" width="14" height="10" rx="2" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.2"/>
+      <text x="525" y="868" fill="#94a3b8" font-size="9">队列 / 缓存</text>
+      <rect x="590" y="859" width="14" height="10" rx="2" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.2"/>
+      <text x="610" y="868" fill="#94a3b8" font-size="9">外部 / 模型</text>
+      <path d="M 700 864 L 726 864" stroke="#fb7185" stroke-width="1.2" stroke-dasharray="4,4"/>
+      <text x="734" y="868" fill="#94a3b8" font-size="9">Harness 反馈（门槛 / 回放）</text>
+      <path d="M 900 864 L 926 864" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="5,4"/>
+      <text x="934" y="868" fill="#94a3b8" font-size="9">索引读写</text>
+    </g>
+  </svg>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-header"><span class="card-dot cyan"></span><h3>继承的资产（不要重写）</h3></div>
+      <ul>
+        <li>• 结构化分块规范 + ChunkMeta（跨语言一致）</li>
+        <li>• golden set / 负样本 / 门槛 / 固化向量思维</li>
+        <li>• 引用装配、拒答判定、索引版本机制</li>
+        <li>• 前端 UI：引用卡片、步骤面板、性能面板</li>
+        <li>• 浏览器 Lite 模式作为隐私 / 离线差异化</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-dot rose"></span><h3>Harness 是核心难点</h3></div>
+      <ul>
+        <li>• 指标四类：检索 / 生成 / 系统 / Agent</li>
+        <li>• 预算制门槛：更准但更贵更慢 → 不通过</li>
+        <li>• 轨迹回放：不调模型复现决策路径</li>
+        <li>• 故障注入矩阵验证降级路径</li>
+        <li>• 影子评测 + 标注台形成数据飞轮</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-dot emerald"></span><h3>面试可讲的重难点</h3></div>
+      <ul>
+        <li>• 跨语言分块一致性（contentHash 对齐）</li>
+        <li>• ACL 必须在检索层过滤（防召回污染）</li>
+        <li>• 引用精度 ↔ 拒答率成对权衡</li>
+        <li>• Agent 成本控制与无进展检测</li>
+        <li>• 离线 / 内网部署与索引灰度重建</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>docs/ROADMAP-FULLSTACK.md · 阶段 M0–M7 · 最小可讲路线：M0 → M1 → M4(部分) → M3 → M5</footer>
+</div>
+</body>
+</html>

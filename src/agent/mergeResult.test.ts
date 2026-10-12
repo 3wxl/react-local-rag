@@ -9,6 +9,7 @@ function fakeVerification(): VerificationResult {
     sentences: [],
     checkedAt: Date.now(),
     source: "semantic",
+    scopedChunkCount: 0,
   };
 }
 

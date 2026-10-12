@@ -4,16 +4,18 @@ import {
   loadAllVectorIndexes,
   type ConversationRecord,
 } from "./db";
-import type { VectorChunk } from "../types/doc";
+import type { TextChunk, VectorChunk } from "../types/doc";
+import { fillChunkDefaults } from "./chunk";
 
-/** 备份文件版本号；结构变更时必须升版本，旧版本一律拒绝导入 */
-export const BACKUP_VERSION = "1.0";
+/** 备份文件版本号；结构变更时必须升版本 */
+export const BACKUP_VERSION = "2.0";
+/** 兼容导入的旧版本列表（1.0：分块缺身份字段，导入时补默认值并提示重建索引） */
+const COMPATIBLE_VERSIONS = ["1.0"];
 
-/** 备份中的单个分块：向量以 base64 编码的 Float32 小端二进制存储 */
-interface BackupChunk {
+/** 备份中的单个分块：身份字段 + 向量（base64 编码的 Float32 小端二进制） */
+interface BackupChunk extends Omit<TextChunk, "chunkId" | "docId"> {
   chunkId: string;
   docId: string;
-  content: string;
   /** base64(Float32Array 的原始字节)，比 JSON 数字数组体积小约一半 */
   vectorB64: string;
 }
@@ -86,10 +88,9 @@ export async function createBackup(): Promise<BackupData> {
     vectorIndexes.push({
       convId: record.id,
       chunks: chunks.map((c) => ({
-        chunkId: c.chunkId,
-        docId: c.docId,
-        content: c.content,
-        vectorB64: arrayBufferToBase64(Float32Array.from(c.vector).buffer),
+        ...c,
+        // 向量已是 Float32Array（v2 直存）；slice 兜底普通 ArrayBuffer（buffer 可能是 SharedArrayBuffer 视图）
+        vectorB64: arrayBufferToBase64(c.vector.slice().buffer),
       })),
     });
   }
@@ -132,8 +133,10 @@ export async function exportBackupFile(): Promise<{ convCount: number }> {
 
 export interface ParsedBackup {
   data: BackupData;
-  /** 解码后的向量索引（number[]），可直接写库 */
+  /** 解码后的向量索引（Float32Array 直存），可直接写库 */
   vectorIndexes: { convId: string; chunks: VectorChunk[] }[];
+  /** 旧版本备份导入：向量仍在但身份字段为默认值，需重建索引才能与新分块参数对齐 */
+  needsRebuild: boolean;
 }
 
 /** 读取并校验备份文件，失败时抛 BackupError */
@@ -150,10 +153,11 @@ export async function parseBackupFile(file: File): Promise<ParsedBackup> {
     throw new BackupError("备份文件结构损坏，无法导入");
   }
 
-  // 版本校验：版本不匹配直接拒绝
-  if (data.version !== BACKUP_VERSION) {
+  // 版本校验：当前版本直接导入；1.0 兼容导入（补默认字段 + 提示重建索引）；其余拒绝
+  const isLegacy = data.version === "1.0";
+  if (data.version !== BACKUP_VERSION && !isLegacy) {
     throw new BackupError(
-      `备份文件版本不兼容（文件版本：${data.version ?? "未知"}，当前支持版本：${BACKUP_VERSION}），无法导入`,
+      `备份文件版本不兼容（文件版本：${data.version ?? "未知"}，当前支持版本：${BACKUP_VERSION} 及 ${COMPATIBLE_VERSIONS.join("/")}），无法导入`,
     );
   }
 
@@ -174,19 +178,36 @@ export async function parseBackupFile(file: File): Promise<ParsedBackup> {
     }
   }
 
-  // 解码向量
+  // 解码向量 + 身份字段（1.0 缺字段补默认值）
+  const docNameByConv = new Map(
+    data.conversations.map((c) => [c.id, c.docName ?? ""]),
+  );
   const vectorIndexes: ParsedBackup["vectorIndexes"] = [];
   for (const vi of data.vectorIndexes) {
     if (!vi || typeof vi.convId !== "string" || !Array.isArray(vi.chunks)) {
       throw new BackupError("备份文件中的向量索引损坏，无法导入");
     }
     try {
-      const chunks: VectorChunk[] = vi.chunks.map((c) => ({
-        chunkId: c.chunkId,
-        docId: c.docId,
-        content: c.content,
-        vector: Array.from(base64ToFloat32Array(c.vectorB64)),
-      }));
+      const chunks: VectorChunk[] = vi.chunks.map((raw, i) => {
+        const c = raw as Partial<BackupChunk>;
+        const base = fillChunkDefaults(
+          c as Partial<TextChunk>,
+          c.docId ?? vi.convId,
+          c.docName ?? docNameByConv.get(vi.convId) ?? "",
+          i,
+        );
+        return {
+          ...base,
+          vector: base64ToFloat32Array(c.vectorB64 ?? ""),
+        };
+      });
+      // 1.0 无 prevId/nextId，导入时统一回填（重建索引前仅用于展示顺序）
+      if (isLegacy) {
+        chunks.forEach((ck, i) => {
+          ck.prevId = i > 0 ? chunks[i - 1].chunkId : "";
+          ck.nextId = i < chunks.length - 1 ? chunks[i + 1].chunkId : "";
+        });
+      }
       vectorIndexes.push({ convId: vi.convId, chunks });
     } catch {
       throw new BackupError(
@@ -195,7 +216,7 @@ export async function parseBackupFile(file: File): Promise<ParsedBackup> {
     }
   }
 
-  return { data: data as BackupData, vectorIndexes };
+  return { data: data as BackupData, vectorIndexes, needsRebuild: isLegacy };
 }
 
 /** 将解析后的备份写入 IndexedDB（put 语义：相同 convId 覆盖） */
