@@ -8,6 +8,10 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    # monorepo：前端在 apps/web，所有 npm 命令都在这层目录执行
+    defaults:
+      run:
+        working-directory: apps/web
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +19,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          # package-lock.json 现在在子目录，缓存路径必须显式指定，否则缓存永远 miss
+          cache-dependency-path: apps/web/package-lock.json
 
       - name: Install dependencies
         run: npm ci

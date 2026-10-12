@@ -14,8 +14,8 @@ coverage
 *.local
 
 # Editor directories and files
-.vscode/*
-!.vscode/extensions.json
+**/.vscode/*
+!**/.vscode/extensions.json
 .idea
 .DS_Store
 *.suo
@@ -26,7 +26,9 @@ coverage
 Thumbs.db
 
 # RAG项目：本地模型文件夹，不上传大模型权重
-public/models/
+# 注意：带斜杠的规则是「锚定仓库根」的，monorepo 后子项目里的同名目录必须用 **/ 前缀，
+# 否则 apps/web/public/models 会变成可跟踪 —— 1GB+ 权重会被误提交
+**/public/models/
 .model_cache/
 *.onnx.tmp
 
@@ -40,6 +42,7 @@ public/models/
 # vite缓存
 .vite/
 
-docs/eval/results/
+# 评测产物存档（本地结果，不进仓库；同上前缀问题）
+**/docs/eval/results/
 # 答案级评测产物（需本地 Qwen 才能生成，不是 CI 输入；指标记录在 docs/eval/README.md）
-public/eval/answer-eval.json
+**/public/eval/answer-eval.json
