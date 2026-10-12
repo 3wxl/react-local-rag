@@ -42,6 +42,12 @@ Thumbs.db
 # vite缓存
 .vite/
 
+# Python（apps/api，uv 虚拟环境与缓存）
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
 # 评测产物存档（本地结果，不进仓库；同上前缀问题）
 **/docs/eval/results/
 # 答案级评测产物（需本地 Qwen 才能生成，不是 CI 输入；指标记录在 docs/eval/README.md）
