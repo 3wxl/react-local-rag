@@ -16,6 +16,8 @@
  * 5. minIdfCoverage —— IDF 覆盖率门限扫描（默认关闭）。
  * 6. 精排排序增益 —— rerank 只做相对排序、不做绝对分拒答；比较 RRF vs logit 重排指标。
  * 7. 拒答信号可用性诊断 —— 四路候选信号在「零误拒」前提下各能拒掉多少负样本。
+ * 8. 向量路准入审计 —— hybrid recall@3 是被余弦准入线还是 MMR 重排拖低的
+ *    （三种准入对比 + eval 口径下 λ 对 recall@3 的 q/m 分组影响）。
  *
  * 设计原则（2026-10-02，方案 1）：检索侧只做粗滤，「文档未提及」的最终置信度裁决
  * 在答案侧由 verifyAnswer 的语义证据 + 词法证据 + 数字核查负责。
@@ -35,7 +37,9 @@ import { BM25 } from "../src/utils/bm25";
 import { createTextChunks, DEFAULT_CHUNK_OPTIONS } from "../src/utils/chunk";
 import { normalizeMarkdownForEval } from "../src/utils/evalCorpus";
 import {
+  evaluateFusion,
   evaluateSignal,
+  formatFusionReport,
   formatSignalReports,
   groupOf,
   type SignalName,
@@ -45,6 +49,7 @@ import { loadFixedRerank, logitToScore } from "./fixedRerank";
 import {
   dotProduct,
   postProcessRetrieval,
+  computeRefusalSignals,
   DEFAULT_RETRIEVAL_OPTIONS,
   type RetrievalDoc,
 } from "../src/utils/retrieval";
@@ -113,17 +118,23 @@ function buildCorpus(maxChunkTokens: number): RetrievalDoc[] {
   const files = readdirSync(CORPUS_DIR)
     .filter((f) => f.endsWith(".md"))
     .sort();
+  // 与 eval.ts loadCorpus 对齐：给每个 chunk 挂上固化向量。
+  // 这一步不能省 —— MMR 的多样性判定读的是 doc.vector（retrieval.ts similarity()），
+  // 不挂向量会让 MMR 退化为纯相关度排序（λ 失效），
+  // 于是 tune 扫出来的 rrfK/vecWeight/λ 结论全部基于一条与 eval/线上不同的管线。
+  const fixed = loadFixedEmbeddings();
   const chunks: RetrievalDoc[] = [];
   for (const file of files) {
     const raw = readFileSync(join(CORPUS_DIR, file), "utf8");
     // 与 eval.ts / 浏览器向量固化共用同一份预处理（src/utils/evalCorpus）
     const text = normalizeMarkdownForEval(raw);
-    chunks.push(
-      ...createTextChunks(file, file, text, {
-        ...DEFAULT_CHUNK_OPTIONS,
-        maxChunkTokens,
-      }),
-    );
+    for (const chunk of createTextChunks(file, file, text, {
+      ...DEFAULT_CHUNK_OPTIONS,
+      maxChunkTokens,
+    })) {
+      const v = fixed?.chunks[chunk.contentHash];
+      chunks.push({ ...chunk, vector: v ? Float32Array.from(v) : null });
+    }
   }
   return chunks;
 }
@@ -765,6 +776,167 @@ function sweepMinVecScore(): void {
   }
 }
 
+/**
+ * 向量路准入审计：回答「hybrid recall@3 被什么拖低」。
+ *
+ * 由来（2026-10-15）：hybrid 曾比 BM25-only 低 13 个点（81.1 vs 94.6），一度怀疑向量口径。
+ * 本段把嫌疑逐个排除：RRF 顺序全量 top3 与 BM25-only 齐平（94.6），准入审计显示只有极少数
+ * 正样本的答案被余弦准入线过滤 —— 真正的差额来自 MMR 的多样性重排（见第 4 段 λ 曲线）。
+ *
+ * hybrid 模式下 applyThreshold 的准入判据是**只看余弦**（minVecScore=0.5，
+ * 不给 BM25 豁免）；而 BM25-only 基线的准入是 bm25Rank≤3。两者口径不对称 ——
+ * 一个 BM25 排第 1、但余弦 <0.5 的正确块，在 hybrid 里会被直接丢弃。
+ *
+ * 本段对每条受保护正样本，把窗口按 RRF 顺序全量列出（关掉准入/相对切/MMR），
+ * 找出「内容含答案」的 oracle 窗口，看它的最高余弦与 BM25 名次，并对比三种准入：
+ *   全量（不过滤） / 余弦准入（cos≥0.5） / 并集准入（cos≥0.5 或 bm25Rank≤3）；
+ * 另附 eval 口径下 mmrLambda 对 hybrid recall@3 的影响（含 q/m 分组）。
+ */
+function auditVectorAdmission(): void {
+  console.log("\n===== 8. 向量路准入审计 =====");
+  const chunks = buildCorpus(DEFAULT_CHUNK_OPTIONS.maxChunkTokens);
+  const bm25 = new BM25(chunks.map((c) => c.content));
+  const fixed = loadFixedEmbeddings();
+  const MINVEC = DEFAULT_RETRIEVAL_OPTIONS.minVecScore;
+  const base = {
+    topK: 30,
+    ...DEFAULT_RETRIEVAL_OPTIONS,
+    mmrLambda: 1, // 关 MMR：保留纯 RRF 顺序
+    minVecScore: -1, // 准入全放行
+    relativeCutRatio: 0,
+    minIdfCoverage: 0,
+    minMaxCosine: 0,
+    minCosGap: 0,
+    minBm25: 0,
+  };
+
+  let r3All = 0;
+  let r3Cos = 0;
+  let r3Union = 0;
+  let failCos = 0;
+  let notAdmitted = 0;
+  let bm25Rescuable = 0;
+  const detail: string[] = [];
+
+  for (const q of posQueries) {
+    const relevant = q.relevant ?? [];
+    const qvec = fixed?.queries[q.id];
+    const vecScores =
+      qvec && fixed
+        ? chunks.map((d) => {
+            const v = fixed.chunks[d.contentHash];
+            return v
+              ? dotProduct(Float32Array.from(qvec), Float32Array.from(v))
+              : 0;
+          })
+        : null;
+    const bm25Scores = bm25.scoreAll(q.question);
+    const audit = postProcessRetrieval(chunks, bm25Scores, vecScores, {
+      ...base,
+      idfCoverage: bm25.idfWeightedCoverage(q.question),
+    });
+    const hits = audit.hits;
+    const oracle = hits.filter((h) =>
+      relevant.some((key) => h.content.includes(key)),
+    );
+    const ansBestCos = oracle.length
+      ? Math.max(...oracle.map((h) => h.vecScore ?? 0))
+      : -1;
+    const ansBestBm25Rank = oracle.length
+      ? Math.min(...oracle.map((h) => h.bm25Rank))
+      : 999;
+
+    const cov = (list: typeof hits, k: number) =>
+      relevant.length === 0
+        ? 0
+        : relevant.filter((key) =>
+            list.slice(0, k).some((h) => h.content.includes(key)),
+          ).length / relevant.length;
+
+    const r3c = cov(
+      hits.filter((h) => (h.vecScore ?? 0) >= MINVEC),
+      3,
+    );
+    const r3u = cov(
+      hits.filter((h) => (h.vecScore ?? 0) >= MINVEC || h.bm25Rank <= 3),
+      3,
+    );
+    r3All += cov(hits, 3);
+    r3Cos += r3c;
+    r3Union += r3u;
+
+    if (r3c < 1) {
+      failCos++;
+      if (ansBestCos < MINVEC) notAdmitted++;
+      if (ansBestBm25Rank <= 3) bm25Rescuable++;
+      detail.push(
+        `  ${q.id} r3(余弦准入)=${r3c.toFixed(2)} r3(并集)=${r3u.toFixed(2)} ` +
+          `答案最高余弦=${ansBestCos.toFixed(3)} 答案BM25名次=${ansBestBm25Rank === 999 ? "-" : ansBestBm25Rank} ` +
+          `oracle窗口=${oracle.length} 总窗口=${hits.length}`,
+      );
+    }
+  }
+
+  console.log(detail.join("\n"));
+  const n = posQueries.length;
+  console.log(
+    `汇总（受保护 ${n} 条）：RRF 顺序全量 top3=${pct(r3All / n)} | ` +
+      `余弦准入=${pct(r3Cos / n)} | 并集准入=${pct(r3Union / n)}`,
+  );
+  console.log(
+    `  hybrid 漏检 ${failCos} 条中：答案最高余弦<${MINVEC}（被准入线过滤）${notAdmitted} 条；` +
+      `答案 BM25 名次≤3（加 BM25 豁免即可救回）${bm25Rescuable} 条。`,
+  );
+
+  // 第二步：eval 口径（minVec=0.5 / ratio=0.4 / topK=5）下，看 MMR λ 对 recall@3 的影响
+  console.log("\n  —— eval 口径下 mmrLambda 对 hybrid recall@3 的影响 ——");
+  for (const lambda of [0.7, 0.8, 0.9, 1.0]) {
+    let r3 = 0;
+    let q3 = 0;
+    let qN = 0;
+    let m3 = 0;
+    let mN = 0;
+    for (const q of posQueries) {
+      const relevant = q.relevant ?? [];
+      const qvec = fixed?.queries[q.id];
+      const vecScores =
+        qvec && fixed
+          ? chunks.map((d) => {
+              const v = fixed.chunks[d.contentHash];
+              return v
+                ? dotProduct(Float32Array.from(qvec), Float32Array.from(v))
+                : 0;
+            })
+          : null;
+      const bm25Scores = bm25.scoreAll(q.question);
+      const res = postProcessRetrieval(chunks, bm25Scores, vecScores, {
+        topK: 5,
+        ...DEFAULT_RETRIEVAL_OPTIONS,
+        mmrLambda: lambda,
+        idfCoverage: bm25.idfWeightedCoverage(q.question),
+      });
+      const c =
+        relevant.length === 0
+          ? 0
+          : relevant.filter((key) =>
+              res.hits.slice(0, 3).some((h) => h.content.includes(key)),
+            ).length / relevant.length;
+      r3 += c;
+      if (q.type === "multi_subject_single_doc") {
+        m3 += c;
+        mN++;
+      } else {
+        q3 += c;
+        qN++;
+      }
+    }
+    console.log(
+      `  mmrLambda=${lambda.toFixed(1)}  hybrid recall@3=${pct(r3 / posQueries.length)}` +
+        `（q 单主题 ${pct(q3 / qN)} / m 多主题 ${pct(m3 / mN)}）`,
+    );
+  }
+}
+
 function sweepMmrLambda(): void {
   console.log("\n===== 4. mmrLambda（MMR 多样性权重，1 = 关闭 MMR）=====");
   console.log(
@@ -846,21 +1018,23 @@ function sweepMmrLambda(): void {
   } else if (singleBest.l === multiBest.l) {
     console.log(`  两组最优一致，推荐 mmrLambda=${multiBest.l.toFixed(1)}。`);
   } else {
-    // 折中：取 multi 最优（多主题是 MMR 的设计目标），但若 single 在该 λ 下降幅超过 5% 则取中间值
-    const singleAtMulti = singleBest.m.byGroup.single.r3;
-    const singleAtMultiBest = multiBest.m.byGroup.single.r3;
-    if (singleAtMulti - singleAtMultiBest > 0.05) {
-      const mid = rows[Math.floor(rows.length / 2)];
-      console.log(
-        `  多主题最优会让单主题 recall@3 掉 ${pct(singleAtMulti - singleAtMultiBest)}，` +
-          `折中取 λ=${mid.l.toFixed(1)}。`,
-      );
-    } else {
-      console.log(
-        `  多主题是 MMR 的设计目标场景，推荐 mmrLambda=${multiBest.l.toFixed(1)}` +
-          `（单主题 recall@3 仅降 ${pct(singleAtMulti - singleAtMultiBest)}）。`,
-      );
-    }
+    // 两组最优不同时：在「保持多主题最优」的 λ 集合里，取单主题最大者。
+    //
+    // 不再取「中点」——中点只是位置上的折中，不最优化任何指标。实测（2026-10-15）：
+    // multi 在 λ≤0.9 全为 100，single 随 λ 单调增（0.7→72 / 0.8→84 / 0.9→88 / 1.0→96）；
+    // 中点会落到 0.8，其合计 recall@3=89.2 恰好低于相对门槛（BM25-only×0.95=89.9），
+    // 于是「工具推荐值」与「CI 门槛」互相打架。改取「multi 不降前提下 single 最大」= 0.9
+    // （合计 91.9，过门槛），两目标同时最优，不再需要人为折中。
+    const keepMulti = rows.filter((r) => r.m.byGroup.multi.r3 === multiBest.m.byGroup.multi.r3);
+    const pick = keepMulti.reduce((a, b) =>
+      b.m.byGroup.single.r3 > a.m.byGroup.single.r3 ? b : a,
+    );
+    console.log(
+      `  多主题最优 λ=${multiBest.l.toFixed(1)}；在「多主题不掉分」的 λ 里取单主题最大者，` +
+        `推荐 mmrLambda=${pick.l.toFixed(1)}` +
+        `（单主题 recall@3=${pct(pick.m.byGroup.single.r3)}，多主题=${pct(pick.m.byGroup.multi.r3)}，` +
+        `合计=${pct(pick.m.recallAt3)}）。`,
+    );
   }
 
   // MMR 是否真正触发：若所有 λ 的冗余占位率都是 0，说明 top3 没有同文档重叠窗口
@@ -1152,16 +1326,15 @@ async function sweepSignalUsability(): Promise<void> {
   for (const q of golden.queries) {
     const bs = bm25.scoreAll(q.question);
     const qv = fixed?.queries[q.id];
-    let sims: number[] = [];
-    if (qv) {
-      sims = chunks
-        .map((d) => {
+    // 与检索管线共用同一实现（retrieval.ts computeRefusalSignals）：
+    // 保证诊断扫出的阈值与线上门限看到的取值逐位一致，避免口径分叉。
+    const simsRaw: number[] | null = qv
+      ? chunks.map((d) => {
           const v = fixed!.chunks[d.contentHash];
           return v ? dotProduct(Float32Array.from(qv), Float32Array.from(v)) : 0;
         })
-        .sort((a, b) => b - a);
-    }
-    const mean = sims.length ? sims.reduce((s, v) => s + v, 0) / sims.length : 0;
+      : null;
+    const sig = computeRefusalSignals(bs, simsRaw);
     // 精排信号与 eval 同口径：取「该查询对所有块的最大 logit」
     // （候选窗口由多个块拼成，取块内最高分代表窗口分）
     let maxRerankLogit: number | null = null;
@@ -1177,9 +1350,9 @@ async function sweepSignalUsability(): Promise<void> {
       group: groupOf(q.id),
       question: q.question,
       idfCoverage: bm25.idfWeightedCoverage(q.question),
-      maxCosine: sims[0] ?? 0,
-      cosineGap: (sims[0] ?? 0) - mean,
-      maxBm25: Math.max(...bs),
+      maxCosine: sig.maxCosine ?? 0,
+      cosineGap: sig.cosGap ?? 0,
+      maxBm25: sig.maxBm25 ?? 0,
       maxRerankLogit,
     });
   }
@@ -1217,8 +1390,27 @@ async function sweepSignalUsability(): Promise<void> {
       .join("\n"),
   );
   console.log(
+    "\n【调参口径】多信号融合（q+m 零误拒）：",
+  );
+  console.log(formatFusionReport(evaluateFusion(tuningValues)));
+  console.log("\n【保守口径·仅观察】多信号融合（q+s+m 零误拒）：");
+  console.log(formatFusionReport(evaluateFusion(values)));
+  // 仅检索侧（不含精排）：精排在 applyThreshold 之后才执行，线上无法在门限处使用，
+  // 因此要单独看「只用检索侧 4 信号」能到多少 —— 这才是能直接写回默认值的口径。
+  const retrievalSignals: SignalName[] = [
+    "idfCoverage",
+    "maxCosine",
+    "cosineGap",
+    "maxBm25",
+  ];
+  console.log("\n【调参口径】融合·仅检索侧（不含精排；q+m 零误拒）：");
+  console.log(formatFusionReport(evaluateFusion(tuningValues, 0.6, retrievalSignals)));
+  console.log("\n【保守口径·仅观察】融合·仅检索侧（不含精排）：");
+  console.log(formatFusionReport(evaluateFusion(values, 0.6, retrievalSignals)));
+  console.log(
     "\n判读：调参口径决定门槛写多少；保守口径只告诉你难例代价。" +
-      "\n两个口径结论分叉时，以调参口径选参，难例的「文档未提及」交给答案侧证据校验。",
+      "\n两个口径结论分叉时，以调参口径选参，难例的「文档未提及」交给答案侧证据校验。" +
+      "\n融合（并集）只会扩大覆盖、不引入误拒：单信号各自不达标时，看并集能否到 60%。",
   );
 }
 
@@ -1240,6 +1432,27 @@ async function main(): Promise<void> {
     `调参口径：1~6 段只用 ${posQueries.length} 条正样本选参（q 单主题 + m 多主题）；` +
       `${semanticQueries.length} 条 s 语义难例不参与选参，仅在第 7 段做压力观察。`,
   );
+
+  // 快速开关：--only=N 只跑第 N 段（都不加载模型，秒级）：
+  // 2 = RRF 权重×k 扫描，4 = mmrLambda 扫描，7 = 拒答信号诊断，8 = 向量路准入审计。
+  const only =
+    process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length) ?? null;
+  if (only === "7") {
+    await sweepSignalUsability();
+    return;
+  }
+  if (only === "2") {
+    sweepRrfWeights();
+    return;
+  }
+  if (only === "4") {
+    sweepMmrLambda();
+    return;
+  }
+  if (only === "8") {
+    auditVectorAdmission();
+    return;
+  }
 
   // 加载 embedding 模型用于实时编码（方案 A：不依赖 embeddings.json）
   let embedder: Awaited<ReturnType<typeof pipeline<"feature-extraction">>> | undefined;

@@ -362,12 +362,37 @@ describe("applyThreshold 检索侧拒答信号", () => {
     expect(result.noRelevantHit).toBe(false);
   });
 
-  it("信号 1：默认门限为 0（关闭），不传覆盖率时不拒答", () => {
-    // 默认 minIdfCoverage=0：信号 1 关闭，即使 idfCoverage=0 也不拒
+  it("信号 1：门限显式为 0（关闭）时不拒答", () => {
+    // 默认 minIdfCoverage 已改为非零（见 DEFAULT_RETRIEVAL_OPTIONS，融合拒答的一路），
+    // 这里显式传 0 验证「门限为 0 = 该路关闭」：idfCoverage=0 也不拒
     const result = applyThreshold([goodHit()], {
       topK: 3,
       vecAvailable: true,
+      minIdfCoverage: 0,
       idfCoverage: 0,
+    });
+    expect(result.noRelevantHit).toBe(false);
+  });
+
+  it("融合拒答（并集）默认生效：BM25 最高分/余弦对比度都极低 → 拒答", () => {
+    const result = applyThreshold([goodHit()], {
+      topK: 3,
+      vecAvailable: true,
+      idfCoverage: 1, // 该路不触发
+      maxBm25: 0.5, // < 默认 8.2246
+      maxCosine: 0.1, // < 默认 0.5426
+      cosGap: 0.001, // < 默认 0.0776
+    });
+    expect(result.noRelevantHit).toBe(true);
+  });
+
+  it("融合拒答只在向量可用时启用：同样低分但 vecAvailable=false → 不拒答（降级保持原行为）", () => {
+    const result = applyThreshold([goodHit()], {
+      topK: 3,
+      vecAvailable: false,
+      maxBm25: 0.5,
+      maxCosine: 0.1,
+      cosGap: 0.001,
     });
     expect(result.noRelevantHit).toBe(false);
   });
@@ -595,6 +620,11 @@ describe("postProcessRetrieval", () => {
     const result = postProcessRetrieval([doc], [5], [0.9], {
       topK: 3,
       ...DEFAULT_RETRIEVAL_OPTIONS,
+      // 合成语料的绝对分远低于真实语料（BM25 最高分 5 < 默认门限 8.2246），
+      // 显式关掉融合绝对门限，否则会被误拒。真实语料门限见 DEFAULT_RETRIEVAL_OPTIONS。
+      minBm25: 0,
+      minMaxCosine: 0,
+      minCosGap: 0,
     });
     const hit = result.hits[0];
     expect(hit.docId).toBe("d1");

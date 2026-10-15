@@ -227,3 +227,110 @@ export function groupQueries(
 ): Map<string, DiagnosticQuery> {
   return new Map(queries.map((q) => [q.id, q]));
 }
+
+/** 融合条件：某信号「低于门限即拒答」的零误拒最宽门限 */
+export interface FusionCondition {
+  signal: SignalName;
+  /** 门限：取值 < threshold 判拒答（取该信号正样本最小值，严格小于故零误拒） */
+  threshold: number;
+  /** 该信号单独能拒掉的负样本条数 */
+  refusedNegatives: number;
+}
+
+/** 多信号融合结果（并集：任一条件触发即拒答） */
+export interface FusionReport {
+  conditions: FusionCondition[];
+  /** 零误拒前提下的并集拒答率 */
+  refusalRate: number;
+  /** 并集误拒正样本条数（并集构造上应为 0；用于自检） */
+  falseRefusals: number;
+  negCount: number;
+  posCount: number;
+  /** 是否达到目标：refusalRate ≥ minSafeRefusal 且无误拒 */
+  usable: boolean;
+}
+
+/**
+ * 多信号融合可用性诊断（单信号各自不达标时，并集能否达标）。
+ *
+ * 原理：若信号 A 存在零误拒门限 tA（拒 A 条负样本），信号 B 存在零误拒门限 tB，
+ * 则「A<tA 或 B<tB」这一并集条件同样零误拒 —— 因为没有任何正样本会触发 A 或 B 的条件，
+ * 并集自然不会误拒；而并集覆盖的负样本是两者的超集。所以并集只会扩大覆盖、不会引入误拒，
+ * 是「在单信号上限之下再往上冲」的唯一安全手段。
+ *
+ * 每个信号的门限取**正样本最小值**（value < minPos 即零误拒）——这是该信号在零误拒
+ * 约束下最宽的切点，能让并集覆盖最大化。单独贡献为 0 的信号不纳入（不改变并集，只增噪声）。
+ */
+export function evaluateFusion(
+  values: SignalValues[],
+  minSafeRefusal = 0.6,
+  signals?: SignalName[],
+): FusionReport {
+  const negs = values.filter((v) => v.group === "n");
+  const pos = values.filter((v) => v.group !== "n");
+  const list = signals ?? (Object.keys(SIGNAL_LABELS) as SignalName[]);
+
+  const conditions: FusionCondition[] = [];
+  for (const s of list) {
+    const posVals = pos.map((v) => v[s]).filter((x): x is number => x !== null);
+    if (posVals.length === 0) continue; // 该信号在正样本上全缺值，无法定门限
+    const minPos = Math.min(...posVals);
+    const refused = negs.filter((v) => {
+      const x = v[s];
+      return x !== null && x < minPos;
+    }).length;
+    if (refused > 0) {
+      conditions.push({ signal: s, threshold: minPos, refusedNegatives: refused });
+    }
+  }
+
+  const fires = (v: SignalValues) => firesAnyCondition(conditions, v);
+  const refusedNeg = negs.filter(fires).length;
+  const falseRefusals = pos.filter(fires).length;
+  const refusalRate = negs.length === 0 ? 0 : refusedNeg / negs.length;
+
+  return {
+    conditions,
+    refusalRate,
+    falseRefusals,
+    negCount: negs.length,
+    posCount: pos.length,
+    usable: falseRefusals === 0 && refusalRate >= minSafeRefusal,
+  };
+}
+
+/** 并集判定：任一条件的「取值 < 门限」成立即拒答；缺值信号不触发 */
+function firesAnyCondition(
+  conditions: FusionCondition[],
+  v: SignalValues,
+): boolean {
+  return conditions.some(({ signal, threshold }) => {
+    const x = v[signal];
+    return x !== null && x < threshold;
+  });
+}
+
+/** 生成可读的融合诊断报告 */
+export function formatFusionReport(
+  report: FusionReport,
+  minSafeRefusal = 0.6,
+): string {
+  const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
+  const conds =
+    report.conditions.length === 0
+      ? "无（没有任何信号能在零误拒下定出门限）"
+      : report.conditions
+          .map(
+            (c) =>
+              `${SIGNAL_LABELS[c.signal]}(<${c.threshold.toFixed(6)}，单拒 ${c.refusedNegatives})`,
+          )
+          .join(" ∪ ");
+  const refused = Math.round(report.refusalRate * report.negCount);
+  const verdict = report.usable ? "✅ 达标" : "❌ 未达标";
+  return (
+    `  多信号融合（并集）零误拒拒答率=${pct(report.refusalRate)}` +
+    `（${report.negCount} 负样本中拒 ${refused} 条；误拒 ${report.falseRefusals}/${report.posCount}）\n` +
+    `    条件：${conds}\n` +
+    `    ${verdict}（目标 ≥${pct(minSafeRefusal)}）`
+  );
+}

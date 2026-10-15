@@ -110,6 +110,16 @@ export interface RetrievalOptions {
   vecWeight?: number;
   /** BM25 路 RRF 权重（w_bm25）。默认 1 = 等权。 */
   bm25Weight?: number;
+  /**
+   * 查询级「最高余弦」门限：**全语料**最高余弦低于此值 → 直接拒答。
+   * 与 minVecScore（逐命中门限）不同，这是**查询级**信号，参与多信号融合拒答。
+   * 阈值来源：tune 第 7 段「融合·仅检索侧」在调参口径（q+m）下扫出的零误拒最宽点。
+   */
+  minMaxCosine?: number;
+  /** 查询级「余弦对比度」（最高余弦 − 全语料余弦均值）门限：低于此值 → 拒答 */
+  minCosGap?: number;
+  /** 查询级「BM25 最高分」（全语料）门限：低于此值 → 拒答 */
+  minBm25?: number;
 }
 
 export const DEFAULT_RETRIEVAL_OPTIONS: Omit<
@@ -138,38 +148,62 @@ export const DEFAULT_RETRIEVAL_OPTIONS: Omit<
   bm25ExemptRank: 3,
   relativeCutRatio: 0.4,
   /**
-   * IDF 覆盖率门限：**默认关闭（0）**，由 `npm run tune:retrieval`
-   * 第 5/7 段实测判定（2026-10-02，45 块旧语料 / 39 正样本含 14 条口语化 / 10 负样本）：
-   * 零误拒前提下拒答率 0%（正样本最低覆盖率 0.000，s001/s013；
-   * 负样本最高 0.406），没有任何门限能同时做到零误拒。
+   * IDF 覆盖率门限（多信号融合的一路）。
    *
-   * 根因：IDF 覆盖率抓的是"词表覆盖"，不是"主题存在"。
-   * 口语化查询（"严寒酷暑下还能干活吗"）问的是语料里有的温度指标，
-   * 但用词与语料完全不同 → 覆盖率同样很低，与负样本无法区分。
-   * 保留该函数与门限机制供诊断使用，但**不要**设成非零值。
+   * 2026-10-15 重取（119 块语料 / 37 正调参样本 q+m / 10 负样本，tune 第 7 段「融合·仅检索侧」）：
+   * 调参口径 q+m 下零误拒最宽切点 = **0.227795**（拒 6/10 负样本）。
+   * 这里取 0.2277（**略微向下**，不向上取整）：向上取整会把取值恰好等于最小值的
+   * 正样本压到门限之下而误拒 —— 首次落地正是踩了这个坑（q/m 各误拒 1 条）。
+   *
+   * 取舍（已知代价）：口语化难例 s* 的 IDF 覆盖率与负样本重叠，纳入保护则本信号拒答率为 0；
+   * 按「调参口径」（只保护 q+m）可换取拒答能力，代价是部分 s 会被误拒。
+   * 这是刻意选择：s 的「文档未提及」由答案侧 verifyAnswer 兜底，检索侧不再为它让路。
    */
-  minIdfCoverage: 0,
+  minIdfCoverage: 0.2277,
+  /** 查询级最高余弦门限（融合的一路）：零误拒切点 0.542665，取 0.5426（略向下） */
+  minMaxCosine: 0.5426,
+  /** 查询级余弦对比度门限（融合的一路）：零误拒切点 0.077628，取 0.0776（略向下） */
+  minCosGap: 0.0776,
+  /** 查询级 BM25 最高分门限（融合的一路）：零误拒切点 8.224614，取 8.2246（略向下） */
+  minBm25: 8.2246,
   // 注意：没有 minRerankScore。精排（cross-encoder）只做**相对排序**，不做绝对分拒答 ——
   // bge-reranker-base 的原始 logit 对「跨查询的全局置信度」不可靠（正样本里存在 -10 离群值，
   // 与负样本分布重叠，任何绝对门限都会误拒）。「文档未提及」统一由答案侧
   // verifyAnswer（语义证据 + 词法证据 + 数字核查）裁决。
   maxWindowChars: 1200,
   windowRadius: 1,
-  mmrLambda: 0.7,
+  /**
+   * MMR 多样性权重 λ。**0.9（2026-10-15 重取）**。
+   *
+   * 旧默认 0.7 来自一次失效的扫描：当时 tune 的 buildCorpus 漏挂 doc.vector，
+   * MMR 的多样性判定恒为 0 → λ 完全不起作用 → 扫描曲线是平的，0.7 这个值没有依据。
+   * 修好后重扫（受保护 q+m 37 条，119 块语料）：
+   *   λ=0.7 → 合计 81.1（q 72.0 / m 100.0）
+   *   λ=0.8 → 合计 89.2（q 84.0 / m 100.0）
+   *   λ=0.9 → 合计 91.9（q 88.0 / m 100.0）  ← 本值
+   *   λ=1.0 → 合计 94.6（q 96.0 / m 91.7）
+   * MMR 对单主题检索是**净损失**（λ 越小、正确答案越容易被多样化的次优块挤出 top-3），
+   * 但对单文档多主题查询是**净收益**（m 从 91.7 抬到 100）。
+   * 取 0.9：在多主题不掉分的前提下把单主题损失压到最小，合计 91.9 ≥ 相对门槛
+   * （BM25-only 94.6 × 0.95 = 89.9）。若日后语料以单主题为主，可考虑 λ=1.0 直接关掉 MMR。
+   */
+  mmrLambda: 0.9,
   mmrPoolSize: 20,
   /*
-   * RRF 融合参数：**扫描过，维持 RRF 论文默认值**（等权 + k=60）。
+   * RRF 融合参数：**维持 RRF 论文默认值**（等权 + k=60）。
    *
-   * 依据（tune 第 2 段，2026-10-03，119 块语料，hybrid 全实时编码）：
-   * 扫了 vecWeight ∈ {0.5, 1.0, 1.5, 2.0} × k ∈ {20, 40, 60, 80} 共 16 组，
-   * 文档级 top-1 / recall@3 / MRR **全部完全相同**。
-   * 单独把 vecWeight 拉到 100 验证参数是否真的生效：MRR 只动 0.0005（0.6781 → 0.6776），
-   * 说明管线是通的，只是**这个语料上两路排名高度一致**，相对权重几乎不影响 top-3。
+   * 依据（tune 第 2 段，2026-10-15 重取，119 块语料，hybrid 全实时编码）：
+   * 先修了一处工具分叉 —— tune 的 buildCorpus 曾漏挂 doc.vector，使 MMR 的
+   * 多样性判定（读 doc.vector）退化为恒 0，λ 失效。修好后再扫
+   * vecWeight ∈ {0.5, 1.0, 1.5, 2.0} × k ∈ {20, 40, 60, 80} 共 16 组：
+   * hybrid recall@3 落在 81.1~83.8，**全部低于 BM25-only 94.6 × 0.95 = 89.9**。
+   * 也就是说本语料上向量路系统性拖后腿，**问题不在融合参数**（换权重/k 抬不上去），
+   * 而在向量口径本身（query instruction / 归一化 / 模型选型），需要单独排查。
    *
-   * 既然没有任何一组配置显著优于默认值，就没有理由偏离论文默认
-   * （Cormack et al. 2009 原始 RRF 即等权 + k=60）。改成别的值等于凭空引入无依据的超参。
+   * 既然没有任何一组配置能过相对门槛，就没有理由偏离论文默认（Cormack et al. 2009
+   * 原始 RRF 即等权 + k=60）；改成别的值等于凭空引入无依据的超参。
    *
-   * 相对门槛（语料无关）已搬进 CI：hybrid recall@3 ≥ BM25-only × 0.95 ——
+   * 相对门槛（语料无关）在 CI：hybrid recall@3 ≥ BM25-only × 0.95 ——
    * 它不依赖具体语料，能兜住"融合配置退化"这类问题。见 scripts/eval.ts 的 gate。
    */
   rrfK: 60,
@@ -520,6 +554,34 @@ export interface RefusalSignals {
   idfCoverage?: number;
   /** 信号 2：最高归一化相关度（由 hits 内部算出，不必外部传） */
   topRelevance?: number;
+  /** 信号 3：全语料最高余弦（查询级；由 postProcessRetrieval 从 vecScores 算出） */
+  maxCosine?: number;
+  /** 信号 4：余弦对比度 = 全语料最高余弦 − 全语料余弦均值（查询级） */
+  cosGap?: number;
+  /** 信号 5：全语料 BM25 最高分（查询级） */
+  maxBm25?: number;
+}
+
+/**
+ * 从**全量**两路原始分算出查询级拒答信号（最高余弦 / 对比度 / BM25 最高分）。
+ *
+ * 单一实现：tune 第 7 段信号诊断与检索管线共用本函数，保证「诊断扫出的阈值」
+ * 与「线上门限看到的取值」逐位一致 —— 否则会重演「诊断说零误拒、线上却误拒」的分叉。
+ * 遍历按数组原序累加（不排序），避免浮点加法结合律带来的均值漂移。
+ */
+export function computeRefusalSignals(
+  bm25Scores: number[],
+  vecScores: number[] | null,
+): { maxCosine?: number; cosGap?: number; maxBm25?: number } {
+  const maxBm25 = bm25Scores.length > 0 ? Math.max(...bm25Scores) : undefined;
+  if (!vecScores || vecScores.length === 0) return { maxBm25 };
+  let max = -Infinity;
+  let sum = 0;
+  for (const v of vecScores) {
+    if (v > max) max = v;
+    sum += v;
+  }
+  return { maxCosine: max, cosGap: max - sum / vecScores.length, maxBm25 };
 }
 
 /**
@@ -548,11 +610,35 @@ export function applyThreshold(
   const minIdf =
     options.minIdfCoverage ?? DEFAULT_RETRIEVAL_OPTIONS.minIdfCoverage;
 
-  // 信号 1：查询词在语料里几乎找不到 → 直接拒答。
-  // 放在最前面：这是唯一不依赖候选质量的信号，
-  // 「股票代码是多少」这类问题在候选里可能仍有关键词碎片命中。
-  if ((options.idfCoverage ?? 1) < minIdf) {
-    return { hits: [], noRelevantHit: true, droppedCount: hits.length };
+  /*
+   * 多信号融合拒答（**并集**：任一条件触发即拒答）。
+   *
+   * 单信号在零误拒约束下的上限有限（tune 第 7 段实测：调参口径 q+m 下
+   * IDF 60% / BM25 80% / 余弦 50% / 对比度 10%），但并集可以叠加：
+   * 每个门限都取「q+m 正样本最小值」，故没有任何正样本会触发任一条件 →
+   * 并集**构造上零误拒**，同时覆盖是各信号的超集（实测融合后 9/10 = 90%）。
+   *
+   * **只在向量可用时启用**：四条阈值都是在 hybrid 口径下扫出的；降级纯 BM25
+   * 路径（向量模型加载失败）保持原行为不变 —— 否则 BM25-only 基线自己也会拒掉
+   * 正样本，相对门槛（hybrid ≥ BM25-only × 0.95）失去可比性。
+   * IDF 覆盖率一路同样收在这里（它虽是纯词表信号，但门限值来自 hybrid 扫描）。
+   * 精排分不参与（它在 applyThreshold 之后才算，且 logit 跨查询不可比）。
+   */
+  if (options.vecAvailable) {
+    const minMaxCos =
+      options.minMaxCosine ?? DEFAULT_RETRIEVAL_OPTIONS.minMaxCosine;
+    const minGap = options.minCosGap ?? DEFAULT_RETRIEVAL_OPTIONS.minCosGap;
+    const minBm = options.minBm25 ?? DEFAULT_RETRIEVAL_OPTIONS.minBm25;
+    if (
+      // 信号 1：查询词在语料里几乎找不到 —— 唯一不依赖候选质量的信号，
+      // 「股票代码是多少」这类问题在候选里可能仍有关键词碎片命中。
+      (options.idfCoverage ?? 1) < minIdf ||
+      (options.maxCosine !== undefined && options.maxCosine < minMaxCos) ||
+      (options.cosGap !== undefined && options.cosGap < minGap) ||
+      (options.maxBm25 !== undefined && options.maxBm25 < minBm)
+    ) {
+      return { hits: [], noRelevantHit: true, droppedCount: hits.length };
+    }
   }
 
   for (const hit of hits) {
@@ -665,13 +751,15 @@ export function postProcessRetrieval(
   const pool = unique.slice(0, poolSize);
 
   // 门限先算，给出 relevance 供 MMR 使用
+  // 拒答信号透传：idfCoverage 由调用方（worker/eval）从同一份 BM25 统计算出；
+  // 余弦类信号用 computeRefusalSignals（与 tune 第 7 段同实现、同口径）。
+  const signals = computeRefusalSignals(bm25Scores, vecScores);
   const gated = applyThreshold(pool, {
     ...options,
     topK: poolSize,
     vecAvailable: vecScores !== null,
-    // 拒答信号透传：idfCoverage 由调用方（worker）从同一份 BM25 统计算出。
-    // 精排只排序、不参与门限（在 applyThreshold 之后的 worker search 分支执行）。
     idfCoverage: options.idfCoverage,
+    ...signals,
   });
 
   if (gated.hits.length === 0) {

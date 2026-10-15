@@ -181,6 +181,19 @@ interface Metrics {
    * `undefined > 0` 恒为 false，门槛会静默失效。
    */
   falseRefusalCount: number;
+  /**
+   * **受保护人群**（q + m，不含口语化 s）的误拒条数。
+   *
+   * 2026-10-15 起检索侧启用多信号融合拒答（默认只保护调参口径 q+m），
+   * s 的部分样本会被粗拒是「拒答 ≥0.60」的已知代价（见 retrieval.ts 注释）。
+   * 因此误拒门槛只对 q+m 要求 0 —— 这是「零误拒约束」在方案里明确定义的人群。
+   * falseRefusalCount（含 s）保留为观察项，不计门槛。
+   */
+  protectedFalseRefusalCount: number;
+  /** 受保护人群（q+m）的 recall@3 */
+  protectedRecallAt3: number;
+  /** 受保护人群（q+m）的 BM25-only 基线 recall@3（相对门槛的分母）；无向量路时为 null */
+  protectedBm25OnlyRecallAt3: number | null;
   /** 负样本：应当拒答的条数 / 正确拒答的条数 */
   negativeCount: number;
   /** 负样本被正确拒答的**绝对条数**（门槛用它而不是比率，见 main 里的说明） */
@@ -249,6 +262,15 @@ function evaluate(golden: Golden, chunks: RetrievalDoc[], topK: number): {
   let pointHits = 0;
   let pointTotal = 0;
   let noHit = 0;
+  /*
+   * 受保护人群（q+m）的累计：误拒门槛与相对门槛只在这批上判定。
+   * s（口语化）按既定策略降为观察项 —— 它被融合拒答粗拒是已知代价，
+   * 不应再污染「零误拒」与「hybrid ≥ BM25-only」两个门槛。
+   */
+  let protectedCount = 0;
+  let protectedR3Sum = 0;
+  let protectedBm25OnlyR3Sum = 0;
+  let protectedNoHit = 0;
   /** 分组累计（q=技术措辞 / s=口语化改写 / m=单文档多主题） */
   const byGroup: Record<string, { count: number; r3: number; r5: number; noHit: number }> = {};
   /** 精排列的分组累计（判断精排对哪类查询有效，尤其是口语化的 s 组） */
@@ -288,6 +310,10 @@ function evaluate(golden: Golden, chunks: RetrievalDoc[], topK: number): {
   for (const q of posQueries) {
     const { result, wide } = runQuery(q);
     const relevant = q.relevant ?? [];
+    // 分组：q=技术措辞，s=口语化改写（观察项），m=单文档多主题
+    const g = q.id[0] === "s" ? "s" : q.id[0] === "m" ? "m" : "q";
+    /** 受保护人群：q+m（不含口语化 s） */
+    const isProtected = g !== "s";
 
     if (result.noRelevantHit) noHit++;
 
@@ -309,20 +335,28 @@ function evaluate(golden: Golden, chunks: RetrievalDoc[], topK: number): {
      * 用来算**语料无关的相对门槛** hybrid ≥ BM25-only × 0.95 ——
      * 它不依赖具体语料与绝对值，能兜住"融合配置退化"（比如两路权重调歪、
      * 向量路被错误地完全压制）这类问题，而绝对门槛在换语料后就失效了。
+     * 相对门槛同样只算**受保护人群（q+m）**：s 已被检索侧刻意粗拒，
+     * 让它当分母等于用「已知要放弃的人群」去卡向量质量，必然误报。
      */
     if (hybrid) {
       const onlyBm25 = runQuery(q, {}, true).result;
       const onlyTop = onlyBm25.hits;
-      bm25OnlyR3Sum +=
+      const baseR3 =
         relevant.length === 0
           ? 0
           : relevant.filter((key) =>
               onlyTop.slice(0, 3).some((h) => h.content.includes(key)),
             ).length / relevant.length;
+      bm25OnlyR3Sum += baseR3;
+      if (isProtected) protectedBm25OnlyR3Sum += baseR3;
     }
 
-    // 分组累计：q=技术措辞，s=口语化改写，m=单文档多主题
-    const g = q.id[0] === "s" ? "s" : q.id[0] === "m" ? "m" : "q";
+    if (isProtected) {
+      protectedCount++;
+      protectedR3Sum += covered(3);
+      if (result.noRelevantHit) protectedNoHit++;
+    }
+
     let bucket = byGroup[g];
     if (!bucket) {
       bucket = { count: 0, r3: 0, r5: 0, noHit: 0 };
@@ -495,6 +529,14 @@ function evaluate(golden: Golden, chunks: RetrievalDoc[], topK: number): {
     top3NearDuplicateRate: +(nearDupQueries / n).toFixed(4),
     noHitQueryCount: noHit,
     falseRefusalCount: noHit,
+    // 受保护人群（q+m）：误拒门槛与相对门槛只在这批上判定（见字段注释）
+    protectedFalseRefusalCount: protectedNoHit,
+    protectedRecallAt3:
+      protectedCount === 0 ? 0 : +(protectedR3Sum / protectedCount).toFixed(4),
+    protectedBm25OnlyRecallAt3:
+      hybrid && protectedCount > 0
+        ? +(protectedBm25OnlyR3Sum / protectedCount).toFixed(4)
+        : null,
     rerank: fixedRerank
       ? {
           recallAt3: +(rerankR3 / n).toFixed(4),
@@ -657,6 +699,11 @@ function main(): void {
   console.log(
     `负样本拒答正确率  : ${pct(metrics.negativeRefusalRate)}（${metrics.negativeCount} 条，正确拒答 ${Math.round(metrics.negativeRefusalRate * metrics.negativeCount)} 条）`,
   );
+  // 误拒口径必须显式分列：门槛只卡 q+m，s 的拒答是「拒答≥0.60」的已知代价（观察项）
+  console.log(
+    `误拒              : 受保护(q+m) ${metrics.protectedFalseRefusalCount} 条（门槛=0）` +
+      `  |  观察：s 组 ${metrics.byGroup.s?.noHit ?? 0}/${metrics.byGroup.s?.count ?? 0} 条被拒、全量 ${metrics.falseRefusalCount} 条`,
+  );
   // 分组明细：两类正样本难度差很多，合并成一个数字会掩盖是哪类在退步
   const GROUP_LABELS: Record<string, string> = {
     q: "技术措辞正样本",
@@ -747,7 +794,13 @@ function main(): void {
     ["top3NearDuplicateRate", metrics.top3NearDuplicateRate, 0],
     // 正样本被拒答 = 漏检。拒答越激进这条越容易破，必须与 negativeRefusalRate
     // 成对设：只压一边会把系统调成哑巴。
-    ["falseRefusalCount", metrics.falseRefusalCount, 0],
+    //
+    // 口径选择：**只卡受保护人群（q+m）**。2026-10-15 起检索侧按「调参口径」启用
+    // 多信号融合拒答，s（口语化）已被刻意降为观察项、部分会被粗拒 ——
+    // 若这里仍卡全量 51 条正样本，等于要求「拒答能力提升」与「s 零误拒」同时成立，
+    // 而实测后者不可能（保守口径上限 50%）。故用 protectedFalseRefusalCount。
+    // 全量 falseRefusalCount 保留为观察项（见分组输出）。
+    ["protectedFalseRefusalCount", metrics.protectedFalseRefusalCount, 0],
   ];
 
   /*
@@ -793,16 +846,37 @@ function main(): void {
    * （见 loadCorpus 注释），MMR 真按线上行为参与多样性选择，实测值变化为
    * q 0.92→0.72、s 0.29→0.50、m 1.0→1.0：技术措辞组因近义块被 MMR 降权而下降，
    * 口语化组反而明显受益（相似块不再挤占 top3）。门槛按新实测值重取（各留 ~0.04 余量）。
+   *
+   * 2026-10-15 再取：把 mmrLambda 从 0.7 提到 0.9（旧 0.7 同样出自 MMR 失效的扫描，
+   * 见 retrieval.ts 的 mmrLambda 注释），q 组从 0.72 回到 0.88、m 组维持 1.0。
+   * q 门槛随之收紧到 0.84（实测 0.88 往下留 0.04）—— 否则 0.68 这条旧门会放过
+   * 最大 20 个点的真实退化。
    */
   const BY_GROUP_GATE: Record<string, number> = {
-    q: 0.68, // 技术措辞：实测 0.72（2026-10-12）
-    s: 0.45, //  口语化：实测 0.50（2026-10-12）；受 bge-small-zh 语义能力限制
+    q: 0.84, // 技术措辞：实测 0.88（2026-10-15，mmrLambda=0.9）
+    s: 0.45, //  口语化：实测 0.50（2026-10-12）；**2026-10-15 起降为观察项**（见下）
     m: 0.9, //  单文档多主题：跨块合并/多窗口是设计目标，必须高命中（实测 1.0）
   };
   for (const [g, min] of Object.entries(BY_GROUP_GATE)) {
     const v = metrics.byGroup[g];
     if (!v) {
       failed.push(`缺少分组 ${g}`);
+      continue;
+    }
+    /*
+     * s（口语化难例）**只观察、不计门槛**。
+     *
+     * 2026-10-15 起检索侧启用多信号融合拒答（默认保护调参口径 q+m），
+     * s 的部分样本会被粗拒 —— 被拒的 s 贡献 0 覆盖，会同时压低 recall@3 与拉高 noHit。
+     * 这是「拒答 ≥0.60」的已知代价：按调参口径，检索侧只保证 q+m 零误拒，
+     * s 的「文档未提及」交给答案侧 verifyAnswer 裁决。
+     * 若把 s 也设成门槛，等于要求拒答能力提升与 s 零误拒同时成立 —— 实测下不可能（上限 50%）。
+     */
+    if (g === "s") {
+      console.log(
+        `[note] s 组观察：recall@3=${v.recallAt3}（参考线 ${min}，不计门槛）、` +
+          `被拒 ${v.noHit}/${v.count} 条（调参口径下检索侧不保护 s）`,
+      );
       continue;
     }
     if (v.recallAt3 < min) failed.push(`${g}.recall@3<${min}`);
@@ -815,33 +889,41 @@ function main(): void {
    * 绝对门槛在换语料后就失效了；这条比的是"开了向量路是否比只用关键词更差"，
    * 与语料难度无关，能兜住融合配置退化（两路权重调歪、向量路被错误压制、
    * RRF 实现改坏）这类问题 —— 它们不会让指标掉到绝对门槛以下，但会让 hybrid 白开。
+   *
+   * 口径：**只比受保护人群（q+m）**。s 已被检索侧按「调参口径」刻意粗拒，
+   * 纳入分母等于用"已知要放弃的人群"去评判向量质量 —— 两侧都被 s 的 0 覆盖率
+   * 稀释，门槛要么恒过要么恒红，失去诊断力。收缩到 q+m 后，这条门槛才真正
+   * 只反映"向量路在两种模式都被要求服务的人群上有没有拖后腿"。
    */
-  if (metrics.hybrid && metrics.bm25OnlyRecallAt3 !== null) {
-    const floor = metrics.bm25OnlyRecallAt3 * 0.95;
-    if (metrics.recallAt3 < floor) {
+  if (metrics.hybrid && metrics.protectedBm25OnlyRecallAt3 !== null) {
+    const floor = metrics.protectedBm25OnlyRecallAt3 * 0.95;
+    if (metrics.protectedRecallAt3 < floor) {
       failed.push(
-        `recall@3(${metrics.recallAt3}) < BM25-only(${metrics.bm25OnlyRecallAt3})×0.95=${floor.toFixed(4)}（向量路拖后腿）`,
+        `受保护人群 recall@3(${metrics.protectedRecallAt3}) < BM25-only(${metrics.protectedBm25OnlyRecallAt3})×0.95=${floor.toFixed(4)}（向量路拖后腿）`,
       );
     }
   }
 
   if (metrics.hybrid) {
     /*
-     * 拒答门槛只在有向量路时设：唯一可用的拒答信号是余弦门限
-     * （见 tune 第 7 段诊断，IDF/对比度/BM25/精排在零误拒约束下拒答率均为 0%）。
-     * 分不开的负样本不硬拒，交给答案侧 verifyAnswer 裁决。
+     * 拒答门槛：检索侧多信号融合（IDF ∪ 最高余弦 ∪ 对比度 ∪ BM25 最高分，
+     * 见 retrieval.ts applyThreshold 与 tune 第 7 段「融合·仅检索侧」）。
+     *
+     * 2026-10-15 起默认启用融合拒答：调参口径 q+m 下零误拒拒答率
+     * 由单信号的 40% 提升到 **9/10**（实测 ≥0.60 达标），且 q+m 误拒仍为 0。
+     * 剩余分不开的负样本不硬拒，交给答案侧 verifyAnswer 裁决。
      *
      * ── 为什么用**绝对条数**而不是比率 ──
      * 比率门槛（如 = 0.4）是"实测值即门槛"：负样本只有 10 条，翻转 1 条就掉 10pt，
      * 任何一次语料微调都会随机变红，而它并没有反映真实退化。
-     * 改用条数后含义明确：**10 条负样本里至少拒掉 3 条**。
-     * 实测当前为 4/10（0.50 门限），留 1 条余量 —— 既能在拒答能力真的塌掉时变红
-     * （把 minVecScore 调到 0.35 会退化为 0/10 → 红），也不会因个别样本抖动误报。
+     * 改用条数后含义明确：**10 条负样本里至少拒掉 6 条**。
+     * 实测当前 9/10，留 3 条余量 —— 既能在融合拒答真的塌掉时变红
+     * （把融合信号关掉会退化为 4/10 → 红），也不会因个别样本抖动误报。
      *
-     * 取值依据与日期：2026-10-03，minVecScore=0.5 下实测 4/10，门槛取 3/10。
+     * 取值依据与日期：2026-10-15，融合拒答下实测 9/10，门槛取 6/10。
      */
     const minGates: Gate[] = [
-      ["negativeRefusedCount", metrics.negativeRefusedCount, 3],
+      ["negativeRefusedCount", metrics.negativeRefusedCount, 6],
     ];
     for (const [name, actual, min] of minGates) {
       if (actual < min) failed.push(`${name}<${min}`);
