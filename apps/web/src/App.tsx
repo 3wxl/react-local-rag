@@ -58,6 +58,12 @@ import { WelcomeState } from "./components/WelcomeState";
 import { PerfPanel } from "./components/PerfPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useAgentSettings } from "./agent/useAgentSettings";
+import {
+  ServerError,
+  askServer,
+  uploadDocument,
+  waitForTask,
+} from "./server/client";
 import { WarningIcon } from "./components/icons";
 
 /** 允许上传的文档后缀 */
@@ -199,6 +205,51 @@ function App() {
       // 文档状态管控：处理中标记 processing，此期间该会话禁用提问（见 handleSend / ChatInput），
       // 避免"上传了但 AI 读不到"的迷惑场景
       patchConversation(convId, { docStatus: "processing" });
+
+      // 服务器模式：文件交给 apps/api 解析/分块/向量化（前端不建本地索引）
+      if (agentSettings.agentMode === "server-rag") {
+        try {
+          setDocLoading("正在上传到服务端...");
+          const { taskId } = await uploadDocument(
+            agentSettings.serverBaseUrl,
+            file,
+          );
+          const task = await waitForTask(agentSettings.serverBaseUrl, taskId, {
+            onProgress: (t) =>
+              setDocLoading(
+                t.status === "queued"
+                  ? "服务端排队中..."
+                  : `服务端处理中（已切块 ${t.progress.chunks ?? 0}）...`,
+              ),
+          });
+          patchConversation(convId, {
+            docName: file.name,
+            docStatus: "ready",
+          });
+          setDocLoading(
+            task.progress.deduped
+              ? "该文档已在服务端索引中（内容未变，跳过重复向量化）"
+              : "",
+          );
+          setTimeout(() => setDocLoading(""), 2500);
+        } catch (err) {
+          console.error(err);
+          patchConversation(convId, { docStatus: "failed" });
+          const code = err instanceof ServerError ? err.code : "";
+          const hint =
+            code === "model_unavailable"
+              ? "（服务端缺少向量模型：检查 apps/web/public/models 是否存在）"
+              : "";
+          setDocLoading(
+            (err instanceof Error ? err.message : "上传失败") + hint,
+          );
+          setTimeout(() => setDocLoading(""), 5000);
+        } finally {
+          resetIdleTimer();
+        }
+        return;
+      }
+
       try {
         setDocLoading("正在解析文档...");
         const tParse = startTimer("parse");
@@ -252,7 +303,7 @@ function App() {
         resetIdleTimer();
       }
     },
-    [attachDocument, patchConversation, resetIdleTimer],
+    [attachDocument, patchConversation, resetIdleTimer, agentSettings],
   );
 
   /** 确保存在当前会话，返回其 id */
@@ -413,14 +464,16 @@ function App() {
       answerSource:
         agentSettings.agentMode === "cloud-only"
           ? "cloud-only"
-          : agentSettings.agentMode === "tool-agent"
-            ? "tool-agent"
-            : agentSettings.agentMode === "hybrid-agent"
-              ? "hybrid-agent"
-              : agentSettings.agentMode === "local-rag" &&
-                  agentSettings.enableSelfRag
-                ? "self-rag"
-                : "normal-rag",
+          : agentSettings.agentMode === "server-rag"
+            ? "server-rag"
+            : agentSettings.agentMode === "tool-agent"
+              ? "tool-agent"
+              : agentSettings.agentMode === "hybrid-agent"
+                ? "hybrid-agent"
+                : agentSettings.agentMode === "local-rag" &&
+                    agentSettings.enableSelfRag
+                  ? "self-rag"
+                  : "normal-rag",
     };
 
     addMessages(convId, [userMsg, assistantMsg], text);
@@ -444,6 +497,46 @@ function App() {
       //    不占用用户等待回复的关键路径；本轮直接使用此前已持久化的摘要与标记。
       // 进入 Prompt 的最近对话（永远只取标记后的最近 4 条，Prompt 长度有上界）
       const historyTurns = buildPromptHistory(prevMessages, prevMarker);
+
+      // ── 服务器模式（apps/api）──
+      // 检索 / 生成 / 逐句校验都在服务端完成，这里只负责把结果映射成
+      // 与本地模式同一批类型（ContextRef / VerificationResult），UI 一行都不用改。
+      if (agentSettings.agentMode === "server-rag") {
+        patchMessage(convId, assistantMsg.id, { status: "retrieving" });
+        let result;
+        try {
+          const tSearch = startTimer("search");
+          result = await askServer(agentSettings.serverBaseUrl, text, topK);
+          tSearch.done({
+            topK,
+            hitCount: result.contexts.length,
+            mode: "server",
+          });
+        } catch (err) {
+          // 服务端错误码 → 可执行提示（而不是把 500 甩给用户）
+          const code = err instanceof ServerError ? err.code : "";
+          const hint =
+            code === "index_not_ready"
+              ? "服务端还没有任何文档：切到服务器模式后先上传文档，或在服务端执行摄取。"
+              : code === "model_unavailable"
+                ? "服务端未就绪（模型不可用）：检查 apps/api 的模型路径或改用 Ollama/假模型通道。"
+                : "";
+          const detail = err instanceof Error ? err.message : String(err);
+          patchMessage(convId, assistantMsg.id, {
+            status: "error",
+            error: hint ? `${detail} ${hint}` : detail,
+          });
+          return;
+        }
+        patchMessage(convId, assistantMsg.id, {
+          status: "done",
+          content: result.answer,
+          context: result.contexts.map((c) => c.content).join("\n\n"),
+          contexts: result.contexts,
+          verification: result.verification,
+        });
+        return;
+      }
 
       // ── Agent 模式分支 ──
       // hybrid-agent：本地轻量检索取信号 → 云端规划 → 三指令分支（异常自动降级本地）

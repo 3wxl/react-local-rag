@@ -12,6 +12,7 @@ export type AnswerSource =
   | "self-rag"
   | "hybrid-agent"
   | "cloud-only"
+  | "server-rag"
   | "tool-agent";
 
 /** 单条消息的运行状态 */

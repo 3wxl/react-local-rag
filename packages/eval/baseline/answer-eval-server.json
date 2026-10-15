@@ -1,0 +1,14 @@
+{
+  "generatedAt": "2026-10-12T13:30:47.949404Z",
+  "generator": "手工记录：apps/api 真实 ONNX 通道跑 /v1/answer 的抽检（脚本见提交说明）",
+  "spotCheck": true,
+  "note": "服务端答案级**抽检**（非全量 51 条）：5 条正样本 + 3 条负样本，模型与浏览器端同为 Qwen2.5-0.5B q4，Prompt 同为 apps/api/app/parity/answer_prompt.py（逐字节同 TS）。样本量小，数字只作趋势参考；全量需要本地跑约 20 分钟（每条约 22s）。",
+  "metrics": {
+    "positiveCount": 5,
+    "negativeCount": 3,
+    "keyPointHitRateInAnswer": 0.75,
+    "citationRate": 0.0,
+    "negativeRefusalRate": 0.6667,
+    "medianLatencyS": 22.11
+  }
+}

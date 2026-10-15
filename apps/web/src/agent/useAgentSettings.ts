@@ -14,6 +14,7 @@ const KEY_CLOUD_BASE_URL = "agent:cloudBaseUrl";
 const KEY_CLOUD_UPSTREAM_URL = "agent:cloudUpstreamUrl";
 const KEY_CLOUD_MODEL = "agent:cloudModel";
 const KEY_ALLOW_TOOL_CHUNKS = "agent:allowToolChunksToCloud";
+const KEY_SERVER_BASE_URL = "agent:serverBaseUrl";
 
 export const DEFAULT_AGENT_MODE: AgentMode = "local-rag";
 export const DEFAULT_ENABLE_SELF_RAG = true;
@@ -34,6 +35,11 @@ export const DEFAULT_CLOUD_MODEL = "deepseek-flash";
  * 打开需在设置面板经确认弹窗显式同意（与 cloud-only 同一性质的知情同意）。
  */
 export const DEFAULT_ALLOW_TOOL_CHUNKS = false;
+/**
+ * 服务器模式的后端地址。默认空串 = **同源**：
+ * dev 下由 vite 代理 `/v1` → apps/api（见 vite.config.ts），生产可填完整地址。
+ */
+export const DEFAULT_SERVER_BASE_URL = "";
 
 /** 设置面板：厂商预设（一键填上游 + 推荐模型） */
 export const CLOUD_PROVIDER_PRESETS: {
@@ -100,6 +106,8 @@ export interface AgentSettings {
   cloudModel: string;
   /** 工具智能体：允许检索片段随工具结果上云（同意模式），默认 false */
   allowToolChunksToCloud: boolean;
+  /** 服务器模式：apps/api 地址（空串 = 同源，dev 走 vite 代理） */
+  serverBaseUrl: string;
 }
 
 function readStr(key: string, fallback: string): string {
@@ -182,6 +190,7 @@ function loadAll(): AgentSettings {
       KEY_ALLOW_TOOL_CHUNKS,
       DEFAULT_ALLOW_TOOL_CHUNKS,
     ),
+    serverBaseUrl: readStr(KEY_SERVER_BASE_URL, DEFAULT_SERVER_BASE_URL),
   };
 }
 
@@ -213,6 +222,8 @@ export function useAgentSettings(): [
         writeStr(KEY_CLOUD_MODEL, next.cloudModel);
       if (patch.allowToolChunksToCloud !== undefined)
         writeBool(KEY_ALLOW_TOOL_CHUNKS, next.allowToolChunksToCloud);
+      if (patch.serverBaseUrl !== undefined)
+        writeStr(KEY_SERVER_BASE_URL, next.serverBaseUrl);
       return next;
     });
   }, []);

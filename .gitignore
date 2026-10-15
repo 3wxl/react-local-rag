@@ -44,6 +44,8 @@ Thumbs.db
 
 # Python（apps/api，uv 虚拟环境与缓存）
 .venv/
+# apps/api 本地运行数据：SQLite 库、上传的原始文件（可重建，不进仓库）
+**/apps/api/.data/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -51,4 +53,4 @@ __pycache__/
 # 评测产物存档（本地结果，不进仓库；同上前缀问题）
 **/docs/eval/results/
 # 答案级评测产物（需本地 Qwen 才能生成，不是 CI 输入；指标记录在 docs/eval/README.md）
-**/public/eval/answer-eval.json
+**/packages/eval/answer-eval.json

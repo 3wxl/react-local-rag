@@ -17,14 +17,14 @@
  * 此时评测明确标注 mode=bm25，而不是把降级结果当成混合检索成绩。
  */
 import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 import { DEFAULT_CHUNK_OPTIONS, EMBEDDING_MODEL_NAME } from "../src/utils/chunk";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-/** 与 public/eval/ 下其他评测数据同处一地（构建机生成后提交） */
-const EMBEDDINGS_PATH = join(ROOT, "public", "eval", "embeddings.json");
+import { EVAL_DIR } from "./evalDir";
+
+/** 与 packages/eval/ 下其他评测数据同处一地（构建机生成后提交） */
+const EMBEDDINGS_PATH = join(EVAL_DIR, "embeddings.json");
 
 export interface FixedEmbeddings {
   /** 模型标识：换模型后向量不可比 */
@@ -139,7 +139,7 @@ export function assertEmbeddingsConsistent(
       "固化向量与当前语料/代码不一致，禁止用旧向量跑评测：\n  - " +
         problems.join("\n  - ") +
         `\n请在有模型的环境重新生成：npm run gen:embeddings` +
-        `（产物直接写入 public/eval/embeddings.json）`,
+        `（产物直接写入 packages/eval/embeddings.json）`,
     );
   }
 }

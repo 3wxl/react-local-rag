@@ -2,7 +2,7 @@
 
 浏览器端**离线** RAG 知识库问答系统，以及围绕它演进的平台化路线。
 
-> 定位：面向「数据不能出域、答案必须可追溯」的场景。当前已落地**浏览器本地模式**（零安装、数据不出浏览器、完全离线可用）；服务器模式（多租户 / 大规模摄取 / Agent 编排）在规划中。
+> 定位：面向「数据不能出域、答案必须可追溯」的场景。已落地**浏览器本地模式**（零安装、数据不出浏览器、完全离线可用）与**服务器模式**（自托管服务端，多人共享索引、可审计）；两端跑**同一套评测口径**，差异有实测数字（见 [docs/dual-mode-comparison.md](docs/dual-mode-comparison.md)）。多租户 / Agent 编排仍在路线图中。
 
 ## 主场景与边界
 
@@ -28,15 +28,19 @@
 .
 ├── apps/
 │   ├── web/                 # 浏览器端应用（React + TS + Transformers.js），Lite 模式主线
-│   └── api/                 # 后端服务（FastAPI + LangGraph + pgvector），骨架阶段
-├── docs/                    # 平台级文档
-│   ├── ROADMAP-FULLSTACK.md      # 全栈化路线图（M0–M7 任务清单）
-│   └── architecture-fullstack.html # 目标架构图
-├── .github/workflows/ci.yml # 共用 CI（工作目录 apps/web）
-└── .gitignore               # 共用忽略规则（含子项目模型的 **/ 前缀规则）
+│   └── api/                 # 服务端（FastAPI + pgvector/SQLite + 本地 ONNX），与前端同口径
+├── packages/
+│   ├── eval/                # 评测资产唯一真源：语料 / golden / 固化向量 / 冻结基线
+│   └── chunker-spec/        # 跨语言分块规范（SPEC.md + 边界 fixtures + 期望值）
+├── docs/
+│   ├── ROADMAP-FULLSTACK.md        # 全栈化路线图（M0–M7 任务清单）
+│   ├── api-contract.md             # v1 接口契约（字段与不变量）
+│   └── dual-mode-comparison.md     # 双端对比报告（实测，含「什么场景该用哪端」结论）
+└── .github/workflows/ci.yml # CI：web job（lint/test/build/eval）+ api job（跨语言一致性/Harness）
 ```
 
-`apps/api`（Python + FastAPI + LangGraph，骨架已就位）、`packages/*`（跨端共享的分块规范 / 评测资产 / MCP）见路线图。
+两端的**算法同源**：分块器、BM25、RRF/MMR、门限、校验、Prompt 在 TS 与 Python 各有一份实现，
+由 `apps/api/tests/` 的跨语言一致性测试逐项钉住（contentHash 全等、排名全等、Prompt 逐字节相同）。
 
 ## 快速开始（浏览器端）
 
@@ -49,20 +53,37 @@ npm run dev
 
 完整说明（模型下载、评测、架构、模块详解）见 [apps/web/README.md](apps/web/README.md)。
 
+## 快速开始（服务器端）
+
+```bash
+cd apps/api
+uv sync
+uv run python scripts/ingest_corpus.py ../../packages/eval/corpus   # 灌语料（复用同一份评测语料）
+uv run uvicorn app.main:app --port 8000                            # 单进程
+```
+
+前端切到「服务器模式」（设置面板里的运行模式）即可直连 —— 引用卡片、拒答、逐句校验
+用的还是同一套 UI 组件，只是数据来自 `/v1/answer`。数据库默认 SQLite（零依赖），
+设 `DATABASE_URL=postgresql://…` 即切 Postgres+pgvector（`compose.yaml` 给了两容器部署形态）。
+详见 [apps/api/README.md](apps/api/README.md)。
+
 ## 这个项目真正的差异化
 
 不是「又一个 RAG 平台」，而是四件开源平台普遍缺失的能力：
 
 1. **可追溯引用 + 拒答判定**：回答逐句带角标 → 引用卡片 → 原文高亮回跳；无依据必须拒答
 2. **评测驱动（Harness）**：golden set + 负样本 + 固化向量 + CI 门槛，任何改动都有前后对比数字
-3. **离线 / 隐私双模**：浏览器本地模式（无网可用）+ 未来的服务器模式
+3. **离线 / 隐私双模**：浏览器本地模式（无网可用）+ 服务器模式（自托管、可审计、多人共享）
 4. **结构化分块 + 索引版本**：长文档跨块问答、索引过期可感知、可灰度重建
 
 ## 工程约定
 
 - **评测口径必须等于线上默认配置**：评测跑什么配置，线上默认就用什么配置（曾经踩过「评测开精排、线上默认关」的坑）
 - **门槛取值纪律**：门槛 = 实测基线往下留余量，并记录取值依据与日期；不设远大于实测的「摆设门槛」
-- **单一事实来源**：评测脚本直接 `import` 线上代码，禁止手抄一份「同口径的移植」
+- **单一事实来源**：评测脚本直接 `import` 线上代码，禁止手抄一份「同口径的移植」；
+  评测资产只有 `packages/eval` 一份（浏览器 `/eval/*` 由 vite 插件转发，不留副本）
+- **跨语言一致性是门槛不是口号**：TS 与 Python 对同一语料必须切出相同 contentHash、相同检索排名；
+  不一致 CI 直接红（`apps/api/tests/test_chunk_parity.py`、`test_retrieval_parity.py`）
 
 ## 路线图
 

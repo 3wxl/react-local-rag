@@ -1,0 +1,2807 @@
+{
+  "implementation": "typescript",
+  "note": "浏览器端（Node 等价路径）检索管线基准：与 apps/api/scripts/bench_retrieval.py 同输入同参数。不加载模型。内存口径为 Node 进程 RSS 峰值（浏览器端另有 WASM 堆限制，见对比报告）。",
+  "topK": 5,
+  "repeat": 3,
+  "chunkCount": 119,
+  "queryCount": 61,
+  "latencyMs": {
+    "p50": 1.149,
+    "p95": 2.09,
+    "mean": 1.318,
+    "max": 4.074
+  },
+  "memory": {
+    "peakRssMb": 95.1
+  },
+  "costPerQueryUsd": 0,
+  "offline": {
+    "requiresNetwork": false,
+    "notes": "浏览器本地推理，断网可用；模型权重随构建产物离线分发"
+  },
+  "perQuery": [
+    {
+      "id": "q001",
+      "question": "智能网关标准版的售价是多少？",
+      "negative": false,
+      "medianMs": 4.074,
+      "minMs": 2.448,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 4,
+      "coveredKeys": [
+        "标准版单台售价为 3980 元，包含一年保修。"
+      ]
+    },
+    {
+      "id": "q002",
+      "question": "批量采购 100 台以上有什么折扣？",
+      "negative": false,
+      "medianMs": 1.589,
+      "minMs": 1.403,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-产品定价与折扣审批.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q003",
+      "question": "智能网关支持的工作温度范围是多少？",
+      "negative": false,
+      "medianMs": 1.774,
+      "minMs": 1.535,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "设备工作温度为负 20 摄氏度至 70 摄氏度"
+      ]
+    },
+    {
+      "id": "q004",
+      "question": "专业版网关的保修期是多久？",
+      "negative": false,
+      "medianMs": 1.835,
+      "minMs": 1.216,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "干扰-数据采集终端产品手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "专业版保修期为 36 个月"
+      ]
+    },
+    {
+      "id": "q005",
+      "question": "智能网关的峰值功耗和待机功耗分别是多少？",
+      "negative": false,
+      "medianMs": 1.123,
+      "minMs": 1.054,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "整机功耗峰值为 15 瓦，待机功耗为 3 瓦。"
+      ]
+    },
+    {
+      "id": "q006",
+      "question": "公司的年假制度是怎么规定的？",
+      "negative": false,
+      "medianMs": 1.255,
+      "minMs": 1.234,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "员工入职满一年可享受 5 天带薪年假，工作年限每增加一年年假增加 1 天，年假上限为 15 天。"
+      ]
+    },
+    {
+      "id": "q007",
+      "question": "周末加班费按什么标准计算？",
+      "negative": false,
+      "medianMs": 1.581,
+      "minMs": 1.563,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-云枢数据员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q008",
+      "question": "出差住宿的报销标准是多少？",
+      "negative": false,
+      "medianMs": 1.083,
+      "minMs": 1.073,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-会议与差旅管理细则.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "干扰-启明科技员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q009",
+      "question": "什么绩效等级可以获得年终奖？",
+      "negative": false,
+      "medianMs": 1.111,
+      "minMs": 0.986,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-云枢数据员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q010",
+      "question": "报销单需要在多久内提交？",
+      "negative": false,
+      "medianMs": 0.955,
+      "minMs": 0.851,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-启明科技员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-产品定价与折扣审批.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q011",
+      "question": "数据中台 2.0 版本计划什么时候上线？",
+      "negative": false,
+      "medianMs": 1.206,
+      "minMs": 1.015,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 4,
+      "coveredKeys": [
+        "第一季度完成数据中台 2.0 版本上线"
+      ]
+    },
+    {
+      "id": "q012",
+      "question": "技术债务清理的预算有多少？",
+      "negative": false,
+      "medianMs": 1.589,
+      "minMs": 1.143,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-财务预算编制与执行.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-启明科技财务报告.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q013",
+      "question": "移动端改版的目标是什么？",
+      "negative": false,
+      "medianMs": 0.716,
+      "minMs": 0.681,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "干扰-研发代码评审与分支策略.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 4,
+      "coveredKeys": [
+        "目标将移动端日活提升 30%"
+      ]
+    },
+    {
+      "id": "q014",
+      "question": "全年市场推广预算是多少，线上占比多少？",
+      "negative": false,
+      "medianMs": 0.908,
+      "minMs": 0.894,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "q015",
+      "question": "数据中台架构评审定在什么时间？",
+      "negative": false,
+      "medianMs": 1.351,
+      "minMs": 1.142,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "数据中台架构评审定于 3 月 20 日进行"
+      ]
+    },
+    {
+      "id": "q016",
+      "question": "RRF 融合算法的常数 k 取多少？",
+      "negative": false,
+      "medianMs": 1.015,
+      "minMs": 0.952,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-多模态内容审核技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-实时风控引擎技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 3,
+      "coveredKeys": [
+        "融合常数 k 取 60"
+      ]
+    },
+    {
+      "id": "q017",
+      "question": "bge 向量模型的向量维度是多少？",
+      "negative": false,
+      "medianMs": 0.98,
+      "minMs": 0.762,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-实时风控引擎技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-多模态内容审核技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 3,
+      "coveredKeys": [
+        "向量维度为 512 维"
+      ]
+    },
+    {
+      "id": "q018",
+      "question": "检索响应时间的中位数是多少？",
+      "negative": false,
+      "medianMs": 0.849,
+      "minMs": 0.814,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-客户投诉处理办法.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "检索响应时间中位数为 80 毫秒"
+      ]
+    },
+    {
+      "id": "q019",
+      "question": "幻觉校验中语义证据和词法证据的权重分别是多少？",
+      "negative": false,
+      "medianMs": 1.408,
+      "minMs": 1.033,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-多模态内容审核技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "语义证据权重为 0.75，词法证据权重为 0.25。"
+      ]
+    },
+    {
+      "id": "q020",
+      "question": "云端接口超时设置为多少秒？",
+      "negative": false,
+      "medianMs": 1.163,
+      "minMs": 1.058,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-多模态内容审核技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "云端接口超时设置为 8 秒"
+      ]
+    },
+    {
+      "id": "q021",
+      "question": "2025 年度总营收是多少？",
+      "negative": false,
+      "medianMs": 0.987,
+      "minMs": 0.979,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "2025 年度总营收为 1.8 亿元，同比增长 25%。"
+      ]
+    },
+    {
+      "id": "q022",
+      "question": "2025 年度净利润和净利率是多少？",
+      "negative": false,
+      "medianMs": 1.037,
+      "minMs": 0.929,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "年度净利润为 5200 万元，净利率为 28.9%。"
+      ]
+    },
+    {
+      "id": "q023",
+      "question": "研发投入占营收的比例是多少？",
+      "negative": false,
+      "medianMs": 1.047,
+      "minMs": 0.902,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "研发投入为 4000 万元，占营收比例 22%。"
+      ]
+    },
+    {
+      "id": "q024",
+      "question": "2026 年度的营收目标是多少？",
+      "negative": false,
+      "medianMs": 1.01,
+      "minMs": 0.941,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "2026 年度预算总营收目标为 2.3 亿元。"
+      ]
+    },
+    {
+      "id": "q025",
+      "question": "前三大客户贡献了总营收的多少比例？",
+      "negative": false,
+      "medianMs": 1.059,
+      "minMs": 1.017,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-启明科技财务报告.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "前三大客户贡献了总营收的 45%"
+      ]
+    },
+    {
+      "id": "s001",
+      "question": "这台东西在严寒酷暑下还能正常干活吗？",
+      "negative": false,
+      "medianMs": 1.71,
+      "minMs": 1.089,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s002",
+      "question": "一台网关最多能挂多少个传感器？",
+      "negative": false,
+      "medianMs": 1.124,
+      "minMs": 1.092,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "干扰-实时风控引擎技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "可同时接入 128 台子设备"
+      ]
+    },
+    {
+      "id": "s003",
+      "question": "晚上七点钟打电话报修有人受理吗？",
+      "negative": false,
+      "medianMs": 1.414,
+      "minMs": 1.141,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-客户投诉处理办法.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-启明科技员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s004",
+      "question": "刷机过程中出错了系统还能恢复吗？",
+      "negative": false,
+      "medianMs": 1.193,
+      "minMs": 1.169,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-质量检验与不合格品控制.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "固件升级失败时，设备会自动回滚到上一个稳定版本"
+      ]
+    },
+    {
+      "id": "s005",
+      "question": "假期没休完年底会给钱补偿吗？",
+      "negative": false,
+      "medianMs": 1.994,
+      "minMs": 1.03,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-启明科技员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "doc": "员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "年假须在次年 3 月底前使用完毕，未使用部分不折算现金"
+      ]
+    },
+    {
+      "id": "s006",
+      "question": "十一期间干活报酬翻倍吗？",
+      "negative": false,
+      "medianMs": 1.42,
+      "minMs": 0.948,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "hitCount": 2,
+      "coveredKeys": []
+    },
+    {
+      "id": "s007",
+      "question": "上个月多干的活这个月还能补休吗？",
+      "negative": false,
+      "medianMs": 1.08,
+      "minMs": 0.836,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "调休申请须在加班发生后 30 天内提出，逾期自动作废"
+      ]
+    },
+    {
+      "id": "s008",
+      "question": "打车的发票公司给不给报？",
+      "negative": false,
+      "medianMs": 1.365,
+      "minMs": 0.841,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-会议与差旅管理细则.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "干扰-多模态内容审核技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s009",
+      "question": "聊得太久之后系统会自己整理前面的内容吗？",
+      "negative": false,
+      "medianMs": 1.569,
+      "minMs": 1.272,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "历史对话超过 2000 字符时触发自动摘要压缩"
+      ]
+    },
+    {
+      "id": "s010",
+      "question": "这个 AI 跑起来要吃多少机器资源？",
+      "negative": false,
+      "medianMs": 0.968,
+      "minMs": 0.89,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-实时风控引擎技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s011",
+      "question": "哪块业务贡献了最多的进账？",
+      "negative": false,
+      "medianMs": 1.127,
+      "minMs": 0.93,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-启明科技财务报告.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "软件授权收入 9000 万元，占比 50%"
+      ]
+    },
+    {
+      "id": "s012",
+      "question": "收不回的货款平均要拖多久？",
+      "negative": false,
+      "medianMs": 0.994,
+      "minMs": 0.92,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-客户投诉处理办法.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-启明科技员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-仓储作业管理规范.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s013",
+      "question": "明年打算再多招些人吗？",
+      "negative": false,
+      "medianMs": 1.418,
+      "minMs": 0.988,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-财务预算编制与执行.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-品牌视觉与对外发布规范.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "s014",
+      "question": "核心组件要是第三方跳票了项目会怎么变？",
+      "negative": false,
+      "medianMs": 1.528,
+      "minMs": 1.116,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-需求管理与变更控制.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "若引擎延期发布将整体顺延两周"
+      ]
+    },
+    {
+      "id": "m001",
+      "question": "智能网关的定价和技术规格分别是什么？",
+      "negative": false,
+      "medianMs": 1.626,
+      "minMs": 1.263,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "产品手册.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "干扰-产品定价与折扣审批.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 3,
+      "coveredKeys": [
+        "标准版单台售价为 3980 元",
+        "设备工作温度为负 20 摄氏度至 70 摄氏度"
+      ]
+    },
+    {
+      "id": "m002",
+      "question": "员工手册里年假和报销制度分别怎么规定？",
+      "negative": false,
+      "medianMs": 2.453,
+      "minMs": 2.451,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "员工入职满一年可享受 5 天带薪年假",
+        "出差住宿标准为一线城市每晚 500 元"
+      ]
+    },
+    {
+      "id": "m003",
+      "question": "技术方案的架构和性能指标分别是什么？",
+      "negative": false,
+      "medianMs": 1.149,
+      "minMs": 1.038,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "会议纪要.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "系统采用本地优先的混合检索架构",
+        "检索响应时间中位数为 80 毫秒"
+      ]
+    },
+    {
+      "id": "m004",
+      "question": "财务报告的收入情况和下年预算分别是多少？",
+      "negative": false,
+      "medianMs": 1.021,
+      "minMs": 1.02,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "财务报告.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "干扰-财务预算编制与执行.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "2025 年度总营收为 1.8 亿元",
+        "2026 年度预算总营收目标为 2.3 亿元"
+      ]
+    },
+    {
+      "id": "m005",
+      "question": "入职导师带教期间每月津贴是多少？学员转正答辩一次性通过后导师额外有什么奖励？",
+      "negative": false,
+      "medianMs": 1.181,
+      "minMs": 1.062,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "干扰-招聘与入职流程说明.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "导师带教期间每月可获得 600 元带教津贴",
+        "导师额外获得 1000 元结业奖励"
+      ]
+    },
+    {
+      "id": "m006",
+      "question": "技术职族中级面授课每门多长时间？学习平台工作日的服务可用性承诺是多少、维护要怎么公告？",
+      "negative": false,
+      "medianMs": 2.09,
+      "minMs": 1.188,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "每门课面授 16 学时",
+        "工作日 8 点至 22 点的可用性不低于 99.5%"
+      ]
+    },
+    {
+      "id": "m007",
+      "question": "储能电池舱运行温度窗口和单体压差告警阈值是多少？接到需求响应邀约后多久内要降低多少负荷？",
+      "negative": false,
+      "medianMs": 1.303,
+      "minMs": 1.106,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "运行温度窗口为 15 至 30 摄氏度",
+        "单体压差超过 50 毫伏时触发告警",
+        "30 分钟内可降低负荷 800 千瓦"
+      ]
+    },
+    {
+      "id": "m008",
+      "question": "光伏组件满足什么条件才启动退役评估？退役组件交给回收单位拆解时再生硅料利用率要求不低于多少？",
+      "negative": false,
+      "medianMs": 2.003,
+      "minMs": 1.827,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "干扰-开源软件使用与合规.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "组件达到 25 年质保或功率衰减超过 20% 时启动退役评估",
+        "再生硅料利用率不低于 90%"
+      ]
+    },
+    {
+      "id": "m009",
+      "question": "剧毒、易制毒化学品采购前要向哪里办什么手续、单次采购量上限是多少？高校联合实验结束后剩余化学品多久内要清退核销？",
+      "negative": false,
+      "medianMs": 2.353,
+      "minMs": 1.966,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "采购前须向属地公安机关办理准购备案",
+        "单次采购量不得超过 30 天使用量",
+        "项目结束后 10 个工作日内清退剩余化学品并核销领用记录"
+      ]
+    },
+    {
+      "id": "m010",
+      "question": "化学废液按哪四类分桶收集？废液桶装载量上限和暂存时限分别是多少？",
+      "negative": false,
+      "medianMs": 1.853,
+      "minMs": 1.694,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "化学废液按含卤有机、无卤有机、无机酸碱、含重金属四类分桶收集",
+        "废液桶装载量不得超过容积的 80%",
+        "暂存时间不得超过 90 天"
+      ]
+    },
+    {
+      "id": "m011",
+      "question": "通风柜面风速的有效控制区间是多少？断电释放测试的频次是怎样规定的？",
+      "negative": false,
+      "medianMs": 1.89,
+      "minMs": 1.656,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "干扰-能耗与设施运行管理.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "有效控制风速区间为 0.3 至 0.5 米每秒",
+        "门禁系统每半年做一次断电释放测试"
+      ]
+    },
+    {
+      "id": "m012",
+      "question": "热菜中心温度要达到多少、出锅后至售卖不得超过多久？每餐每样成品菜留样多少克、冷藏保存多久？",
+      "negative": false,
+      "medianMs": 1.325,
+      "minMs": 1.104,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "干扰-库存周转与呆滞料处理.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": [
+        "热菜中心温度须达到 70 摄氏度以上",
+        "出锅后至售卖不得超过 2 小时",
+        "每样成品菜留样不少于 125 克",
+        "专柜冷藏保存 48 小时"
+      ]
+    },
+    {
+      "id": "n001",
+      "question": "公司在哪个证券交易所上市了？",
+      "negative": true,
+      "medianMs": 0.788,
+      "minMs": 0.697,
+      "noRelevantHit": false,
+      "top3": [],
+      "hitCount": 0,
+      "coveredKeys": []
+    },
+    {
+      "id": "n002",
+      "question": "公司的首席执行官是谁？",
+      "negative": true,
+      "medianMs": 0.642,
+      "minMs": 0.632,
+      "noRelevantHit": false,
+      "top3": [],
+      "hitCount": 0,
+      "coveredKeys": []
+    },
+    {
+      "id": "n003",
+      "question": "员工的期权行权价格是多少？",
+      "negative": true,
+      "medianMs": 0.768,
+      "minMs": 0.741,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "企业内部培训体系建设方案.md",
+          "ords": [
+            8,
+            11
+          ],
+          "windowOrds": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "doc": "技术方案.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 2,
+      "coveredKeys": []
+    },
+    {
+      "id": "n004",
+      "question": "产品的 FCC 认证编号是多少？",
+      "negative": true,
+      "medianMs": 0.692,
+      "minMs": 0.658,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "干扰-品牌视觉与对外发布规范.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-客户投诉处理办法.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "n005",
+      "question": "供应商的银行账号是多少？",
+      "negative": true,
+      "medianMs": 1.07,
+      "minMs": 1.06,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-供应链数字化转型专题.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            0,
+            3
+          ],
+          "windowOrds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 4,
+      "coveredKeys": []
+    },
+    {
+      "id": "n006",
+      "question": "去年公司的碳排放总量是多少吨？",
+      "negative": true,
+      "medianMs": 1.023,
+      "minMs": 0.837,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            11,
+            14
+          ],
+          "windowOrds": [
+            11,
+            12,
+            13,
+            14
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "n007",
+      "question": "第三方安全审计报告在哪里下载？",
+      "negative": true,
+      "medianMs": 0.873,
+      "minMs": 0.79,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "实验室化学品安全管理办法.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        },
+        {
+          "doc": "干扰-2025 年度增长规划.md",
+          "ords": [
+            0,
+            1
+          ],
+          "windowOrds": [
+            0,
+            1
+          ]
+        },
+        {
+          "doc": "园区分布式光伏微电网运维规范.md",
+          "ords": [
+            12,
+            15
+          ],
+          "windowOrds": [
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "n008",
+      "question": "员工的补充医疗保险报销比例是多少？",
+      "negative": true,
+      "medianMs": 0.878,
+      "minMs": 0.856,
+      "noRelevantHit": false,
+      "top3": [
+        {
+          "doc": "干扰-云枢数据员工手册.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "干扰-信息安全培训与考核.md",
+          "ords": [
+            0,
+            0
+          ],
+          "windowOrds": [
+            0
+          ]
+        },
+        {
+          "doc": "员工食堂运营与膳食管理办法.md",
+          "ords": [
+            4,
+            7
+          ],
+          "windowOrds": [
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "hitCount": 5,
+      "coveredKeys": []
+    },
+    {
+      "id": "n009",
+      "question": "生产车间的具体地址在哪里？",
+      "negative": true,
+      "medianMs": 0.831,
+      "minMs": 0.785,
+      "noRelevantHit": false,
+      "top3": [],
+      "hitCount": 0,
+      "coveredKeys": []
+    },
+    {
+      "id": "n010",
+      "question": "公司的股票代码是多少？",
+      "negative": true,
+      "medianMs": 0.965,
+      "minMs": 0.75,
+      "noRelevantHit": false,
+      "top3": [],
+      "hitCount": 0,
+      "coveredKeys": []
+    }
+  ]
+}

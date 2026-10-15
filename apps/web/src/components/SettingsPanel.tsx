@@ -37,6 +37,7 @@ const MODE_LABELS: Record<AgentMode, string> = {
   "local-rag": "纯本地 RAG",
   "hybrid-agent": "混合 Agent",
   "cloud-only": "云端 RAG",
+  "server-rag": "服务器模式",
   "tool-agent": "工具智能体",
 };
 
@@ -80,6 +81,7 @@ export function SettingsPanel({
     cloudUpstreamUrl,
     cloudModel,
     allowToolChunksToCloud,
+    serverBaseUrl,
   } = agentSettings;
 
   const activeProvider = matchCloudProvider(cloudUpstreamUrl);
@@ -215,6 +217,7 @@ export function SettingsPanel({
               <option value="local-rag">{MODE_LABELS["local-rag"]}</option>
               <option value="hybrid-agent">{MODE_LABELS["hybrid-agent"]}</option>
               <option value="cloud-only">{MODE_LABELS["cloud-only"]}</option>
+              <option value="server-rag">{MODE_LABELS["server-rag"]}</option>
               <option value="tool-agent">{MODE_LABELS["tool-agent"]}</option>
             </select>
             <p className="text-xs text-ink-faint mt-2 leading-relaxed">
@@ -224,11 +227,36 @@ export function SettingsPanel({
                   ? "纯本地运行：向量+BM25 检索 + Qwen 本地推理，零外部服务，隐私安全。"
                   : agentMode === "hybrid-agent"
                     ? "混合模式：本地检索 + 云端规划（问题路由），按需调用云端大模型。"
-                    : agentMode === "tool-agent"
-                      ? "工具智能体：云端模型按需调用本地工具（检索 / 文档大纲 / 计算器）多轮规划，默认只回传元数据、正文不上云。"
-                      : "云端 RAG：本地检索 Top-K 分片，仅将相关分片发送云端生成（无文档时云端基于通用知识回答）。"}
+                    : agentMode === "server-rag"
+                      ? "服务器模式：检索 / 生成 / 逐句校验全部在 apps/api 完成，前端只渲染引用卡片与拒答；上传的文档进入服务端索引（多人共享）。"
+                      : agentMode === "tool-agent"
+                        ? "工具智能体：云端模型按需调用本地工具（检索 / 文档大纲 / 计算器）多轮规划，默认只回传元数据、正文不上云。"
+                        : "云端 RAG：本地检索 Top-K 分片，仅将相关分片发送云端生成（无文档时云端基于通用知识回答）。"}
             </p>
           </div>
+
+          {/* ── 服务器模式：后端地址（仅 server-rag 模式） ── */}
+          {agentMode === "server-rag" && (
+            <div className="rounded-lg border border-emerald-400/40 bg-emerald-400/10 px-3 py-2.5 space-y-2">
+              <label className="text-xs font-medium text-ink block">
+                服务端地址（apps/api）
+              </label>
+              <input
+                type="text"
+                value={serverBaseUrl}
+                onChange={(e) =>
+                  onAgentSettingsChange({ serverBaseUrl: e.target.value })
+                }
+                placeholder="留空 = 同源（开发时由 vite 代理到 localhost:8000）"
+                className="w-full rounded-lg border border-line bg-bg px-3 py-1.5 text-xs text-ink focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-ink-faint leading-relaxed">
+                留空时请求走同源 <code>/v1/*</code>（开发环境已配代理）。
+                独立部署时填完整地址，例如 http://192.168.1.10:8000。
+                服务端单进程运行：<code>uv run uvicorn app.main:app --port 8000</code>。
+              </p>
+            </div>
+          )}
 
           {/* ── 工具智能体：隐私模式开关 + 说明（仅 tool-agent 模式） ── */}
           {agentMode === "tool-agent" && (

@@ -20,11 +20,11 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 /**
- * 语料只有这一份：public/eval/corpus。
+ * 语料只有这一份：packages/eval/corpus。
  * Node 侧 eval 直接读盘，浏览器侧评测工具走 fetch 读同一批文件，
  * 不存在「Node 一份、浏览器一份」的副本。
  */
-const OUT = join(ROOT, "public", "eval", "corpus");
+const OUT = join(ROOT, "..", "..", "packages", "eval", "corpus");
 
 /* ---------------- 同族文档模板 ---------------- */
 

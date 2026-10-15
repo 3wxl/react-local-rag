@@ -43,12 +43,13 @@ import {
   rerankScore as fixedRerankScore,
 } from "./fixedRerank";
 
+import { EVAL_DIR } from "./evalDir";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 /**
- * 评测数据放在 public/eval/：CI 直接读盘，浏览器开发者工具也走 fetch 读同一份，
+ * 评测数据放在 packages/eval/：CI 直接读盘，浏览器开发者工具也走 fetch 读同一份，
  * 避免「Node 一份、浏览器一份」的复制漂移。结果存档仍写 docs/eval/results。
  */
-const EVAL_DIR = join(ROOT, "public", "eval");
 const GOLDEN_PATH = join(EVAL_DIR, "golden.json");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 const RESULTS_DIR = join(ROOT, "docs", "eval", "results");
@@ -86,18 +87,27 @@ interface Golden {
 /**
  * 读语料并按**线上同一套分块器**切块。
  * 标题行不进正文（与解析层行为一致），页码恒为 1（纯文本无分页）。
+ *
+ * 向量也随块一起挂上（`doc.vector`），与浏览器 worker 里的索引结构一致：
+ * MMR 的相似度项读的就是这个字段，线上检索跑在"带向量的块"上。
+ * 早先评测不挂向量，等于让 MMR 退化成纯相关度排序 —— 评测口径与线上口径分叉，
+ * 量出来的就不是用户拿到的结果。这里与线上对齐。
  */
 function loadCorpus(): RetrievalDoc[] {
   const files = readdirSync(CORPUS_DIR)
     .filter((f) => f.endsWith(".md"))
     .sort();
+  const fixed = loadFixedEmbeddings();
   const chunks: RetrievalDoc[] = [];
   for (const file of files) {
     const raw = readFileSync(join(CORPUS_DIR, file), "utf8");
     // 与浏览器侧向量固化共用同一份预处理（src/utils/evalCorpus），
-    // 保证切块 contentHash 与 public/eval/embeddings.json 的 key 对得上
+    // 保证切块 contentHash 与 packages/eval/embeddings.json 的 key 对得上
     const text = normalizeMarkdownForEval(raw);
-    chunks.push(...createTextChunks(file, file, text, DEFAULT_CHUNK_OPTIONS));
+    for (const chunk of createTextChunks(file, file, text, DEFAULT_CHUNK_OPTIONS)) {
+      const vec = fixed?.chunks[chunk.contentHash];
+      chunks.push({ ...chunk, vector: vec ? Float32Array.from(vec) : null });
+    }
   }
   return chunks;
 }
@@ -688,7 +698,7 @@ function main(): void {
     }
   } else {
     console.log("--------------------------------------------");
-    console.log("精排列：缺 public/eval/rerank-scores.json，未启用（跑 npm run gen:rerank 生成）");
+    console.log("精排列：缺 packages/eval/rerank-scores.json，未启用（跑 npm run gen:rerank 生成）");
   }
   console.log("--------------------------------------------");
   console.log("分组明细（q/s 两类正样本难度不同，务必分开看）：");
@@ -775,14 +785,18 @@ function main(): void {
   }
 
   /*
-   * 分组门槛。两类正样本难度差三倍（实测 q=0.92 / s=0.29），
-   * 只看总分会被组间比例掩盖：s 组整体崩掉时总 recall 也只掉十几个点。
-   * 所以每组各设一条，任一组退步都能被 CI 抓到。
+   * 分组门槛。三类正样本难度差很多，只看总分会被组间比例掩盖：
+   * s 组整体崩掉时总 recall 也只掉十几个点。所以每组各设一条。
    * 数值 = 实测基线往下留余量，作用是防回归，不是定目标。
+   *
+   * 2026-10-12 重取：修掉「评测不挂向量 → MMR 退化成纯相关度排序」的口径漂移后
+   * （见 loadCorpus 注释），MMR 真按线上行为参与多样性选择，实测值变化为
+   * q 0.92→0.72、s 0.29→0.50、m 1.0→1.0：技术措辞组因近义块被 MMR 降权而下降，
+   * 口语化组反而明显受益（相似块不再挤占 top3）。门槛按新实测值重取（各留 ~0.04 余量）。
    */
   const BY_GROUP_GATE: Record<string, number> = {
-    q: 0.85, // 技术措辞：与语料同术语，应当稳定高命中
-    s: 0.2, //  口语化：受 bge-small-zh 语义能力限制，只保证不退化
+    q: 0.68, // 技术措辞：实测 0.72（2026-10-12）
+    s: 0.45, //  口语化：实测 0.50（2026-10-12）；受 bge-small-zh 语义能力限制
     m: 0.9, //  单文档多主题：跨块合并/多窗口是设计目标，必须高命中（实测 1.0）
   };
   for (const [g, min] of Object.entries(BY_GROUP_GATE)) {

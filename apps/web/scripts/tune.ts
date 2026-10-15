@@ -10,7 +10,7 @@
  *    看 recall@3 / recall@5 / MRR 与块数。块太小语义不完整，太大稀释主题且顶到模型上限。
  * 2. RRF 权重 × k —— w_vec / w_bm25 / rrfK 三维扫描，外加**语料无关的相对门槛**
  *    hybrid ≥ BM25-only × 0.95（防止融合配置退化到不如纯关键词）。
- *    **需要 public/eval/embeddings.json**（无向量时无法对比 hybrid 与 BM25-only，本段跳过）。
+ *    **需要 packages/eval/embeddings.json**（无向量时无法对比 hybrid 与 BM25-only，本段跳过）。
  * 3. minVecScore —— 相关度弱门限（只粗滤、不承担最终拒答），输出真正的 **P/R 曲线**。
  * 4. mmrLambda —— 多样性权重。λ=1 关闭 MMR。看 recall@3 与 top3 冗余占位率。
  * 5. minIdfCoverage —— IDF 覆盖率门限扫描（默认关闭）。
@@ -56,6 +56,8 @@ import {
 import { AutoTokenizer, AutoModelForSequenceClassification, env, pipeline } from "@huggingface/transformers";
 import { applyEmbedPrefix } from "../src/utils/embedPrefix";
 
+import { EVAL_DIR } from "./evalDir";
+
 // 与 gen-embeddings.ts 同配置：用本地模型，不走远程下载
 env.localModelPath = join(dirname(fileURLToPath(import.meta.url)), "..", "public", "models");
 env.allowLocalModels = true;
@@ -63,7 +65,6 @@ env.allowRemoteModels = false;
 env.useBrowserCache = false;
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EVAL_DIR = join(ROOT, "public", "eval");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 
 interface GoldenQuery {
@@ -676,7 +677,7 @@ function sweepMinVecScore(): void {
   const fixed = loadFixedEmbeddings();
   if (!fixed) {
     console.log(
-      "⚠ 缺 public/eval/embeddings.json：没有向量分，该参数在纯 BM25 下不起作用，曲线会是一条直线。",
+      "⚠ 缺 packages/eval/embeddings.json：没有向量分，该参数在纯 BM25 下不起作用，曲线会是一条直线。",
     );
     console.log(
       "  生成方法：npm run gen:embeddings（见 docs/eval/README.md）。",

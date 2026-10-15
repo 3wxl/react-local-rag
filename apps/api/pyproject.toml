@@ -1,23 +1,37 @@
 [project]
 name = "api"
 version = "0.1.0"
-description = "RAG 平台后端：FastAPI + LangGraph + pgvector"
+description = "RAG 平台后端：FastAPI + pgvector + 本地 ONNX 模型通道（与浏览器 Lite 模式同口径）"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "langgraph>=0.2",
     "pydantic-settings>=2.4",
-    "pgvector>=0.3",
-    "asyncpg>=0.29",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    # 检索与向量计算：MMR 相似度、余弦、float32 对齐（对应 TS 的 Float32Array 语义）
+    "numpy>=2.1",
+    # 本地模型通道：复用 apps/web/public/models 下的 ONNX 权重（与 Lite 模式同一份）
+    "onnxruntime>=1.20",
+    "tokenizers>=0.20",
+    # 文档解析（PDF 用 pypdfium2 而非 PyMuPDF：BSD/Apache 许可，避免 AGPL）
+    "pypdfium2>=4.30",
+    "python-docx>=1.1",
 ]
+
+[project.optional-dependencies]
+# Postgres + pgvector 生产路径（默认走本地 SQLite，见 app/store）
+pg = ["asyncpg>=0.29", "pgvector>=0.3"]
+# M3 起用：LangGraph 编排（M1 不装，保持安装轻量）
+agent = ["langgraph>=0.2"]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "httpx>=0.27",
+    "pytest-asyncio>=0.24",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"

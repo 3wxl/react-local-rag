@@ -136,13 +136,14 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 
 ## M0 · 冻结与契约（约 1 周）[可验]
 
-- [ ] 确认主场景，把「适用 / 不适用场景」写进 `README`
-- [ ] API 契约：`POST /v1/retrieve`、`POST /v1/answer`、`GET /v1/answer/{id}/trace`、`POST /v1/eval/run`
-      —— 返回体必须含 `citations[] / verdict / evidence_snapshot / cost / latency_ms`
-- [ ] 仓库结构（已有基础）：`apps/web`（已就位）、`apps/api`、`packages/eval`（跨端唯一评测口径）、`packages/chunker-spec`（跨语言分块规范）
+- [x] 确认主场景，把「适用 / 不适用场景」写进 `README`（2026-10-12）
+- [x] API 契约：`POST /v1/retrieve`、`POST /v1/answer`、`GET /v1/answer/{id}/trace`、`POST /v1/eval/run`
+      —— 返回体必须含 `citations[] / verdict / evidence_snapshot / cost / latency_ms`（契约文档 + 实现 + 不变量测试）
+- [x] 仓库结构：`apps/web`、`apps/api`、`packages/eval`（跨端唯一评测口径）、`packages/chunker-spec`（跨语言分块规范 + fixtures）
       —— **暂不建 `infra/` 与 `packages/mcp`**，分别在 M5/M6 按需加
-- [ ] 评测资产从 `apps/web/public/eval/` 提升为 `packages/eval/`，前后端共用一份
-- [ ] 现有前端打 tag 作为 `Lite 模式`参考实现
+- [x] 评测资产从 `apps/web/public/eval/` 提升为 `packages/eval/`，前后端共用一份
+      （浏览器侧 `/eval/*` 由 vite 插件从该目录转发；脚本统一从 `scripts/evalDir.ts` 取路径）
+- [ ] 现有前端打 tag 作为 `Lite 模式`参考实现（待打 tag；当前以 `apps/web` 主线即 Lite 模式）
 
 **验收**：契约文档 + monorepo 骨架 + 评测资产迁移完成；前端仍可独立跑（`apps/web` 下 test/lint/build/eval 全绿）。
 
@@ -152,15 +153,24 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 
 > 这一阶段的价值**不是"又一个后端"**，而是"同一套评测口径下的双端对比"。
 
-- [ ] FastAPI 骨架 + Postgres(pgvector，单库起步) + 本地模型通道（Ollama/vLLM 或复用 ONNX）
+- [x] FastAPI 骨架 + Postgres(pgvector，单库起步) + 本地模型通道（复用 ONNX）
       —— **不引 MinIO/Redis**：先用本地磁盘与进程内任务
-- [ ] 摄取：上传 → 解析（PDF/DOCX/MD/TXT）→ 结构化分块（移植现有逻辑）→ embedding → 入索引
-- [ ] 检索 / 生成 / 引用 / 拒答：与前端同口径（沿用现有默认值与调参结论）
-- [ ] **跨语言分块一致性测试**：TS 与 Python 对同一语料产出**相同 contentHash**，不一致 CI 红 ← 亮点
-- [ ] **双端对比报告**：同一 golden set 跑出召回一致性 / p50-p95 延迟 / 内存峰值 / 单次成本 / 离线可用性，
-      并给出结论「什么场景该用哪端」 ← 亮点
-- [ ] Harness v1：Python 评测脚本，指标与门槛与前端一致（recall@k / MRR / 要点 / 拒答 / 冗余）
-- [ ] 前端新增「服务器模式」开关，引用卡片/拒答 UI 直连后端
+      （存储双实现：默认本地 SQLite 便于无 Docker 环境跑通，`DATABASE_URL` 即切 pgvector；
+      `compose.yaml` 给了 api+postgres 两容器形态；生成通道 onnx/ollama/fake 三选一，共用同一份 Prompt）
+- [x] 摄取：上传 → 解析（PDF/DOCX/MD/TXT）→ 结构化分块（Python 端逐行对齐 TS）→ embedding → 入索引
+      （HTTP 上传 202+任务轮询；CLI `scripts/ingest_corpus.py` 批量灌入；失败隔离到单文档）
+- [x] 检索 / 生成 / 引用 / 拒答：与前端同口径（默认参数逐字段照搬，检索命中逐条一致）
+- [x] **跨语言分块一致性测试**：TS 与 Python 对同一语料产出**相同 contentHash**，不一致 CI 红 ← 亮点
+      （`packages/chunker-spec/`：SPEC + 边界 fixtures + 期望值；评测路径与摄取路径都测；
+      并扩到 BM25 排名、RRF/MMR/门限命中、Prompt 逐字节一致）
+- [x] **双端对比报告**：同一 golden set 跑出召回一致性 / p50-p95 延迟 / 内存峰值 / 单次成本 / 离线可用性，
+      并给出结论「什么场景该用哪端」 ← 亮点（`docs/dual-mode-comparison.md`：召回一致率 100%，
+      延迟 p50 1.1ms vs 25.5ms，答案层同模型同短板）
+- [x] Harness v1：Python 评测脚本，指标与门槛与前端一致（recall@k / MRR / 要点 / 拒答 / 冗余）
+      —— 与 `npm run eval` 数值逐字段相同（`tests/test_eval_gate_parity.py` 钉住）
+- [x] 前端新增「服务器模式」开关，引用卡片/拒答 UI 直连后端
+      （新增 `server-rag` 运行模式；上传走 `/v1/documents`，问答走 `/v1/answer`；
+      契约字段映射成既有 ContextRef / VerificationResult，UI 组件零改动）
 
 **验收**：一条命令端到端问答带引用；双端对比表产出且结论写进 `docs/`。
 

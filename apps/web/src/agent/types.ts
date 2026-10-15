@@ -3,6 +3,7 @@
  * - local-rag：纯本地 RAG（向量+BM25 检索 + Qwen 本地推理）
  * - hybrid-agent：混合模式（本地检索 + 云端规划 + 本地/云端执行）
  * - cloud-only：纯云端（跳过本地检索，直接走云端大模型）
+ * - server-rag：服务器模式（检索/生成/校验都在 apps/api，前端只渲染引用卡片与拒答）
  * - tool-agent：工具智能体（云端模型走 OpenAI tool-calls 协议驱动循环，
  *   工具在本地执行：search_docs / doc_outline / calculator。
  *   默认「元数据模式」工具结果不含片段原文、答案本地生成；
@@ -12,6 +13,7 @@ export type AgentMode =
   | "local-rag"
   | "hybrid-agent"
   | "cloud-only"
+  | "server-rag"
   | "tool-agent";
 
 /**

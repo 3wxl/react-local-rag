@@ -61,6 +61,14 @@ function AnswerSourceBadge({ source }: { source: AnswerSource }) {
       </span>
     );
   }
+  if (source === "server-rag") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+        <AiIcon className="w-3 h-3" />
+        服务器模式（apps/api）
+      </span>
+    );
+  }
   if (source === "tool-agent") {
     return (
       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30">

@@ -14,6 +14,8 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "eval": "tsx scripts/eval.ts",
+    "parity:dump": "tsx scripts/parity-dump.ts",
+    "bench": "tsx scripts/bench.ts",
     "preview": "vite preview",
     "proxy": "node proxy.mjs",
     "tune:retrieval": "tsx scripts/tune.ts",

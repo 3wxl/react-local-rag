@@ -7,11 +7,11 @@
  * 不允许静默按 0 分排序 —— 那种情况指标会悄悄掉下来，且找不到原因。
  */
 import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const FIXED_RERANK_PATH = join(ROOT, "public", "eval", "rerank-scores.json");
+import { EVAL_DIR } from "./evalDir";
+
+export const FIXED_RERANK_PATH = join(EVAL_DIR, "rerank-scores.json");
 
 /** 与 worker 的 RERANKER_MODEL 必须一致：换模型后分数分布不同，阈值不可复用 */
 export const RERANKER_MODEL_NAME = "Xenova/bge-reranker-base";

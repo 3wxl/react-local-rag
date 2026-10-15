@@ -10,7 +10,7 @@
  * 语义上明显不相关的（实测 4/10），剩下的由它按「句子是否有原文依据」逐句裁决。
  * 之前这道防线的能力只有注释里的一句承诺，没有任何量化。
  *
- * 做法：用 public/eval/verify-labels.json 的人工标注（每句标注是否有依据），
+ * 做法：用 packages/eval/verify-labels.json 的人工标注（每句标注是否有依据），
  * 在 Node 里用真实 bge-small 算语义分、用同一套词法逻辑算覆盖率，
  * 再走 **线上同一个** computeSentenceScore + levelOf，与标注比对得 P/R。
  * 因此这里量出来的就是线上组件的能力，不是另写一套近似实现。
@@ -33,8 +33,9 @@ import {
   type VerifyThresholds,
 } from "../src/utils/verifyAnswer";
 
+import { EVAL_DIR } from "./evalDir";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EVAL_DIR = join(ROOT, "public", "eval");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 
 // 与两个 worker 一致：只从本地加载模型

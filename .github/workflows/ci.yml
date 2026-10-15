@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  web:
     runs-on: ubuntu-latest
     # monorepo：前端在 apps/web，所有 npm 命令都在这层目录执行
     defaults:
@@ -41,3 +41,38 @@ jobs:
       # 幻觉校验组件的 P/R（读固化打分，无模型依赖）
       - name: Verify component P/R
         run: npm run eval:verify -- --check
+
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 跨语言一致性测试要调用 apps/web 的 parity-dump.ts（读取真实 TS 实现），
+      # 所以后端 job 也需要 Node 依赖
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install web dependencies (供跨语言导出器使用)
+        working-directory: apps/web
+        run: npm ci
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Python 端测试：跨语言 contentHash 一致性 + 检索对齐 + Harness 门槛 + 契约 + 存储契约
+      - name: Sync api dependencies
+        working-directory: apps/api
+        run: uv sync
+
+      - name: Pytest（含跨语言一致性门槛）
+        working-directory: apps/api
+        run: uv run pytest -q
+
+      # Harness 与 `npm run eval` 同口径：一条命令复现指标与门槛
+      - name: Harness gates
+        working-directory: apps/api
+        run: uv run python scripts/eval_retrieval.py

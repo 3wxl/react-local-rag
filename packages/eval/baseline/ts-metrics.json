@@ -1,0 +1,74 @@
+{
+  "note": "apps/web/scripts/eval.ts 在 packages/eval 上的实测指标冻结副本（results/ 目录是 gitignore 的，CI 拿不到）。Python Harness 以此为同口径基准做断言：字段名与取值都必须一致。",
+  "source": "apps/web/scripts/eval.ts",
+  "topK": 5,
+  "chunkParams": {
+    "maxChunkTokens": 256,
+    "minChunkChars": 100,
+    "maxChunkChars": 600,
+    "sentenceOverlap": 2
+  },
+  "metrics": {
+    "queryCount": 61,
+    "chunkCount": 119,
+    "hybrid": true,
+    "bm25OnlyRecallAt3": 0.7451,
+    "recallAt3": 0.7255,
+    "recallAt5": 0.8235,
+    "mrrAt10": 0.6615,
+    "keyPointHitRate": 0.8642,
+    "top3DuplicateRate": 0.098,
+    "top3NearDuplicateRate": 0,
+    "noHitQueryCount": 0,
+    "falseRefusalCount": 0,
+    "rerank": {
+      "recallAt3": 0.8039,
+      "recallAt5": 0.8235,
+      "mrrAt10": 0.6967,
+      "keyPointHitRate": 0.8889,
+      "top1ChangedRate": 0.4118,
+      "missingPairs": 0,
+      "top1LogitMedian": 0.9767,
+      "byGroup": {
+        "q": {
+          "count": 25,
+          "recallAt3": 0.88,
+          "recallAt5": 0.88
+        },
+        "s": {
+          "count": 14,
+          "recallAt3": 0.5714,
+          "recallAt5": 0.6429
+        },
+        "m": {
+          "count": 12,
+          "recallAt3": 0.9167,
+          "recallAt5": 0.9167
+        }
+      }
+    },
+    "negativeCount": 10,
+    "negativeRefusedCount": 4,
+    "negativeRefusalRate": 0.4,
+    "byGroup": {
+      "q": {
+        "count": 25,
+        "recallAt3": 0.72,
+        "recallAt5": 0.88,
+        "noHit": 0
+      },
+      "s": {
+        "count": 14,
+        "recallAt3": 0.5,
+        "recallAt5": 0.5714,
+        "noHit": 0
+      },
+      "m": {
+        "count": 12,
+        "recallAt3": 1,
+        "recallAt5": 1,
+        "noHit": 0
+      }
+    }
+  }
+}

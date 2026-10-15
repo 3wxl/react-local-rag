@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 评测向量固化（Node 版）：把语料块与查询的向量算好写成 public/eval/embeddings.json。
+ * 评测向量固化（Node 版）：把语料块与查询的向量算好写成 packages/eval/embeddings.json。
  *
  * 用法：npm run gen:embeddings
  *
@@ -32,9 +32,10 @@ import {
 } from "../src/utils/chunk";
 import type { TextChunk } from "../src/types/doc";
 
+import { EVAL_DIR } from "./evalDir";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MODEL = "Xenova/bge-small-zh-v1.5";
-const EVAL_DIR = join(ROOT, "public", "eval");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 const OUT_PATH = join(EVAL_DIR, "embeddings.json");
 const BATCH = 16;

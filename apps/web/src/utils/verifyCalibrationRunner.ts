@@ -116,7 +116,7 @@ export function serializeSamples(samples: VerifySample[]): string {
   return JSON.stringify({ samples }, null, 2);
 }
 
-/** public/eval/verify-labels.json 的结构 */
+/** packages/eval/verify-labels.json 的结构（/eval/* 由 vite 插件转发自该目录） */
 interface LabelsFile {
   docs: { doc: string; samples: LabeledSentence[] }[];
 }

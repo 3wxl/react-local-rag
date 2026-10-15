@@ -30,8 +30,9 @@ import {
   type RetrievalDoc,
 } from "../src/utils/retrieval";
 
+import { EVAL_DIR } from "./evalDir";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EVAL_DIR = join(ROOT, "public", "eval");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 
 env.localModelPath = join(ROOT, "public", "models");
@@ -64,7 +65,17 @@ async function main(): Promise<void> {
   const chunks: RetrievalDoc[] = [];
   for (const f of readdirSync(CORPUS_DIR).filter((x) => x.endsWith(".md")).sort()) {
     const raw = readFileSync(join(CORPUS_DIR, f), "utf8");
-    chunks.push(...createTextChunks(f, f, normalizeMarkdownForEval(raw), DEFAULT_CHUNK_OPTIONS));
+    for (const chunk of createTextChunks(
+      f,
+      f,
+      normalizeMarkdownForEval(raw),
+      DEFAULT_CHUNK_OPTIONS,
+    )) {
+      // 向量与块一起挂上：MMR 的相似度项依赖 doc.vector，线上索引也是这个结构
+      //（评测不挂向量会让 MMR 静默失效，量出来的就不是线上行为）
+      const vec = embeddings.chunks[chunk.contentHash];
+      chunks.push({ ...chunk, vector: vec ? Float32Array.from(vec) : null });
+    }
   }
   const bm25 = new BM25(chunks.map((c) => c.content));
 

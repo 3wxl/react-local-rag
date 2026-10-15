@@ -5,25 +5,20 @@ import * as pdfjsLib from "pdfjs-dist";
 // - 部署到子路径时随 base 自动正确
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { fileTooLargeError, pdfParseError } from "./errors";
+import {
+  cleanText,
+  markdownToBlocks,
+  txtToBlocks,
+  type ParsedBlock,
+} from "./parseBlocks";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 /** 建议上传上限（MB），超过给友好提示而非直接崩 */
 const MAX_FILE_MB = 50;
 
-/**
- * 解析层输出的结构化文本块：正文 + 页码 + 标题路径。
- * 分块器（chunk.ts）据此产出带身份的结构块（引用可定位到「第几页/哪个标题下」）。
- */
-export interface ParsedBlock {
-  text: string;
-  /** 页码（PDF 逐页递增；无分页格式恒为 1） */
-  page: number;
-  /** 标题路径（Markdown 层级，如 ["第一章", "1.1 背景"]；其他格式缺省空数组） */
-  headingPath?: string[];
-  /** heading=标题行（只作结构信号，正文不含标题文本） */
-  type?: "text" | "heading" | "list";
-}
+// 「文本 → 块」的规则在 parseBlocks.ts（纯函数，Node 里也能跑，跨语言一致性测试要用）
+export type { ParsedBlock };
 
 /**
  * 读取File对象，解析 PDF/TXT/Markdown/DOCX，通过 onBlock 回调流式输出结构化文本块。
@@ -95,8 +90,8 @@ async function parseTxt(
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const cleaned = cleanText(reader.result as string);
-      if (!cleaned) {
+      const blocks = txtToBlocks(reader.result as string);
+      if (blocks.length === 0) {
         reject(
           pdfParseError(
             new Error(
@@ -108,7 +103,7 @@ async function parseTxt(
         );
         return;
       }
-      onBlock({ text: cleaned, page: 1 });
+      blocks.forEach(onBlock);
       resolve();
     };
     reader.onerror = () => reject(pdfParseError(new Error("文本文件读取失败")));
@@ -117,33 +112,9 @@ async function parseTxt(
 }
 
 /**
- * 去掉 YAML front matter（文件开头 --- ... ---），兼容 CRLF。
- * 仅当首行是 `---` 且块内像 YAML（含 key: value）或为空时才剥离，
- * 避免把正文水平分割线误删成空文档。
- */
-function stripMarkdownFrontMatter(text: string): string {
-  // 1. 移除 UTF-8 BOM 标记 \uFEFF
-  const normalized = text.replace(/^\uFEFF/, ""); // UTF-8 BOM
-  // 2. 正则匹配【文档开头】的 YAML FrontMatter
-  const m = normalized.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  // 没有匹配到符合格式的frontmatter，直接返回原文
-  if (!m) return normalized;
-  // m[1] 提取两个 --- 中间的内容
-  const body = m[1];
-  // 3. 校验：中间内容是空  OR  存在 yaml key:value 格式，才判定是真frontmatter
-  if (body.trim() === "" || /^[\w-]+\s*:/m.test(body)) {
-    // 把匹配到的 frontmatter 整个切掉，返回后面正文
-    return normalized.slice(m[0].length);
-  }
-  // 校验不通过，说明不是yaml frontmatter（只是正文的分割线），原文原样返回
-  return normalized;
-}
-
-/**
- * Markdown 解析：按标题层级产出结构化块。
- * - `# 标题` 行 → heading 块 + 更新 headingPath（层级堆栈，低层级标题出栈）
- * - 正文行按段落聚合成 text 块，携带当前 headingPath
- * - 列表行标记 type=list（供分块器与检索识别，正文文本保留）
+ * Markdown 解析：读取文件 → parseBlocks.markdownToBlocks 产出结构化块。
+ * 「标题层级堆栈 → headingPath」的规则在 parseBlocks.ts（纯函数），
+ * 与 Python 端共用同一份口径，见 packages/chunker-spec/SPEC.md。
  */
 async function parseMarkdown(
   file: File,
@@ -153,62 +124,8 @@ async function parseMarkdown(
     const reader = new FileReader(); //`FileReader`：浏览器原生 API 读取上传文件内容，**只能在浏览器环境运行（不能 node）**
     reader.onload = () => {
       const raw = String(reader.result ?? ""); //`raw`：读取文件原始文本
-      // 去掉 HTML 注释与 YAML front matter
-      const noComment = raw.replace(/<!--[\s\S]*?-->/g, ""); //`noComment`：正则删除所有`<!-- 注释 -->`HTML 注释，Markdown 里这类注释不需要进入 RAG 知识库
-      const noFrontMatter = stripMarkdownFrontMatter(noComment); //`noFrontMatter`：调用你刚才那段`stripMarkdownFrontMatter`，删掉 md 头部 YAML 元信息
-      const lines = noFrontMatter
-        .split(/\r?\n/) //`split(/\r?\n/)`：切割成行，兼容 Windows CRLF、LF 换行
-        .map((line) => line.replace(/\s+$/g, "")); // 去行尾空白
-
-      const headingPath: string[] = [];
-      /** 段落缓冲（连续正文行聚合成一个 text 块） */
-      let paragraph: string[] = [];
-      let emitted = false;
-
-      const flushParagraph = () => {
-        if (paragraph.length === 0) return;
-        const text = paragraph.join("\n").trim();
-        if (text) {
-          onBlock({
-            text,
-            page: 1,
-            headingPath: [...headingPath],
-            type: "text",
-          });
-          emitted = true;
-        }
-        paragraph = [];
-      };
-
-      for (const line of lines) {
-        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-        if (headingMatch) {
-          // 标题切换：先刷出上一段正文
-          flushParagraph();
-          const level = headingMatch[1].length;
-          const title = headingMatch[2].trim();
-          // 标题层级堆栈：同层替换，低层出栈，高层压栈
-          headingPath.length = level - 1;
-          headingPath.push(title);
-          onBlock({
-            text: title,
-            page: 1,
-            headingPath: [...headingPath],
-            type: "heading",
-          });
-          emitted = true;
-          continue;
-        }
-        // 空行分隔段落
-        if (line.trim() === "") {
-          flushParagraph();
-          continue;
-        }
-        paragraph.push(line.trim());
-      }
-      flushParagraph();
-
-      if (!emitted) {
+      const blocks = markdownToBlocks(raw);
+      if (blocks.length === 0) {
         const hint =
           file.size === 0
             ? "Markdown 文件为空（0 字节）"
@@ -218,6 +135,7 @@ async function parseMarkdown(
         reject(pdfParseError(new Error(hint)));
         return;
       }
+      blocks.forEach(onBlock);
       resolve();
     };
     reader.onerror = () =>
@@ -304,13 +222,4 @@ async function parsePdf(
       new Error("PDF 文件未提取到任何文本内容，可能是扫描件或空文档"),
     );
   }
-}
-
-/** 清洗脏文本 */
-function cleanText(text: string): string {
-  const noHtml = text.replace(/<[^>]*>/g, "");
-  return noHtml
-    .replace(/[ \t]+/g, " ") // 水平空白压缩
-    .replace(/\n{3,}/g, "\n\n") // 连续空行压缩
-    .trim();
 }

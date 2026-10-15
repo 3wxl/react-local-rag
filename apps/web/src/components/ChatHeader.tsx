@@ -4,6 +4,7 @@ export type AgentModeBanner =
   | "local-rag"
   | "hybrid-agent"
   | "cloud-only"
+  | "server-rag"
   | "tool-agent";
 
 interface ChatHeaderProps {
@@ -42,6 +43,14 @@ function ModeBanner({ mode }: { mode: AgentModeBanner }) {
       <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30">
         <span>🧰</span>
         <span>工具智能体：云端规划检索，默认正文不上传</span>
+      </div>
+    );
+  }
+  if (mode === "server-rag") {
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+        <span>🖧</span>
+        <span>服务器模式：检索与生成在自托管服务端</span>
       </div>
     );
   }

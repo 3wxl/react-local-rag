@@ -24,8 +24,9 @@ import { AutoTokenizer, AutoModelForSequenceClassification, env } from "@hugging
 import { createTextChunks, DEFAULT_CHUNK_OPTIONS } from "../src/utils/chunk";
 import { normalizeMarkdownForEval } from "../src/utils/evalCorpus";
 
+import { EVAL_DIR } from "./evalDir";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EVAL_DIR = join(ROOT, "public", "eval");
 const CORPUS_DIR = join(EVAL_DIR, "corpus");
 const OUT_PATH = join(EVAL_DIR, "rerank-scores.json");
 
