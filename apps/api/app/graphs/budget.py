@@ -72,6 +72,31 @@ def price_usd(settings: Settings, prompt_tokens: int, completion_tokens: int) ->
     )
 
 
+def cost_dict(
+    state: dict,
+    *,
+    latency_ms: int,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> dict:
+    """契约 §0.4 的 cost 对象（QA 图与 Agent 图共用同一处口径）。
+
+    `estimated_cost_usd` 取账本里的真实累计成本：默认价目为 0（本地通道）时与 M2 的
+    固定 0.0 逐字段一致；接云端通道配了价目后才是真金白银的数字。
+    """
+    ledger = state.get("budget") or {}
+    return {
+        "latency_ms": latency_ms,
+        "latency_breakdown_ms": dict(state.get("breakdown") or {}),
+        "tokens": {
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "total": prompt_tokens + completion_tokens,
+        },
+        "estimated_cost_usd": float(ledger.get("cost_usd", 0.0) or 0.0),
+    }
+
+
 def estimate_tokens(question: str, top_k: int, max_new_tokens: int) -> int:
     """预检的 token 上界估算。
 

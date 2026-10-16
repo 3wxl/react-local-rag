@@ -36,7 +36,7 @@ from ..parity.verify import (
     verify_answer,
 )
 from ..store import AnswerRecord, Store, TraceRecord
-from .budget import BudgetLimits, charge
+from .budget import BudgetLimits, charge, cost_dict
 from .events import EVENT_FINAL, EVENT_TOKEN, emit
 from .state import QaState, filters_from_dict
 from .trace import trace_row
@@ -291,7 +291,13 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
     async def verify(state: QaState) -> dict:
         contexts = [context_from_dict(c) for c in state["citations"]]
         t2 = time.perf_counter()
-        verification = await _verify(deps, state["answer"], contexts, version=state["version"])
+        verification = await run_verification(
+            store=deps.store,
+            embedder=deps.embedder,
+            answer_text=state["answer"],
+            contexts=contexts,
+            version=state["version"],
+        )
         duration_ms = int((time.perf_counter() - t2) * 1000)
         row = trace_row(
             state,
@@ -352,7 +358,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
     async def finalize(state: QaState) -> dict:
         meta = state.get("completion_meta") or {}
         latency_ms = int((time.perf_counter() - state["started_perf"]) * 1000)
-        cost = _cost_dict(
+        cost = cost_dict(
             state,
             latency_ms=latency_ms,
             prompt_tokens=int(meta.get("prompt_tokens", 0) or 0),
@@ -402,25 +408,26 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
 # ---------------- 校验实现（从 AnswerService._verify 搬迁） ----------------
 
 
-async def _verify(
-    deps: QaDeps,
+async def run_verification(
+    *,
+    store,
+    embedder,
     answer_text: str,
     contexts: list,
-    *,
     version: str,
 ):
     """语义比对范围收敛到引用段落的窗口块（与 Lite 模式 toVerifyPassages 一致）。"""
     passages = to_verify_passages(contexts)
     scorer = None
-    if deps.embedder.available and passages:
+    if embedder.available and passages:
         wanted = {cid for p in passages for cid in p.chunk_ids}
-        all_vectors = await deps.store.load_vectors(version)
+        all_vectors = await store.load_vectors(version)
         scope_vectors = [all_vectors[cid] for cid in wanted if cid in all_vectors]
 
         def scorer(texts: list[str], scope: list[str] | None = None) -> list[float]:
             if not scope_vectors:
                 return [0.0] * len(texts)
-            sent = deps.embedder.embed_verify(texts)
+            sent = embedder.embed_verify(texts)
             # 每句取「被引用块」内的最大余弦（与 worker 的 maxSimilarity 同义）
             return [
                 float(np.max(sent[i] @ np.asarray(scope_vectors).T)) for i in range(len(texts))
@@ -438,26 +445,6 @@ async def _verify(
 
 
 # ---------------- 拒答 / 成本 / 快照 / 落库 ----------------
-
-
-def _cost_dict(
-    state: QaState,
-    *,
-    latency_ms: int,
-    prompt_tokens: int,
-    completion_tokens: int,
-) -> dict:
-    return {
-        "latency_ms": latency_ms,
-        "latency_breakdown_ms": dict(state.get("breakdown") or {}),
-        "tokens": {
-            "prompt": prompt_tokens,
-            "completion": completion_tokens,
-            "total": prompt_tokens + completion_tokens,
-        },
-        # 成本口径：按价目折算（默认价目 0 → 本地通道仍是 0.0，与 M2 逐字段一致）
-        "estimated_cost_usd": float((state.get("budget") or {}).get("cost_usd", LOCAL_COST_USD) or LOCAL_COST_USD),
-    }
 
 
 def _refusal_outcome(
@@ -504,7 +491,7 @@ def _refusal_outcome(
             sampling={},
             rewrite_info=_rewrite_info(state),
         ),
-        "cost": _cost_dict(state, latency_ms=latency_ms, prompt_tokens=0, completion_tokens=0),
+        "cost": cost_dict(state, latency_ms=latency_ms, prompt_tokens=0, completion_tokens=0),
         "trace_nodes": nodes,
     }
 

@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     cost_per_1k_completion_usd: float = 0.0
     #: Agent 无进展检测：连续 N 次没有新增证据即提前收敛（多跳何时停）
     agent_no_progress_limit: int = 2
+    #: Agent 工具检索的默认条数（工具参数缺省时用）
+    graph_tool_top_k: int = 5
     #: MCP 工具服务（stdio 启动命令，空 = 禁用；CI 与默认部署都不起外部进程）
     mcp_server_command: str = ""
     #: MCP 工具 allowlist（空 = 全部放行的前提是显式配置了服务；见 app/mcp/client.py）

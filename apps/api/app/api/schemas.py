@@ -43,6 +43,22 @@ class AnswerRequest(StrictModel):
     rewrite: bool = False
 
 
+class AgentRunRequest(StrictModel):
+    """POST /v1/agent/run（M3）：planner + 工具循环，可能因人工审批挂起。"""
+
+    question: str = Field(min_length=1)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    filters: FiltersIn | None = None
+    stream: bool = False
+
+
+class AgentResumeRequest(StrictModel):
+    """POST /v1/agent/{run_id}/resume：人工审批（HITL）的决定。"""
+
+    approved: bool
+    note: str | None = None
+
+
 class EvalRunRequest(StrictModel):
     suite: str = "retrieval"
     config_overrides: dict = Field(default_factory=dict)

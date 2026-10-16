@@ -105,6 +105,47 @@ class IngestState(TypedDict, total=False):
     trace_nodes: Annotated[list[dict], operator.add]
 
 
+class AgentState(TypedDict, total=False):
+    """Agentic Graph State（planner → 工具 → 无进展检测 → HITL → 汇总）。
+
+    `observations` / `tool_calls` / `signatures` 等是**整体替换**的通道：每个节点返回
+    追加后的完整列表。这种写法在检查点恢复时是幂等的（节点重跑不会重复追加）。
+    """
+
+    run_id: str
+    trace_id: str
+    question: str
+    version: str
+    top_k: int
+    filters_dict: dict
+    #: run 开始时刻（ISO）：Agent 可能跨进程续跑，不能用单调时钟
+    started_iso: str
+
+    steps: int
+    plan: dict
+    observations: list[dict]
+    signatures: list[dict]
+    tool_calls: list[dict]
+    evidence: list[dict]
+    citations: list[dict]
+    approved: list[str]
+
+    answer: str
+    completion_meta: dict
+    verification: dict
+    verify_detail: dict
+    must_refuse: bool
+    verdict: str
+    refusal: dict | None
+    no_progress: dict
+    outcome: dict
+    cost: dict
+
+    breakdown: Annotated[dict, merge_dicts]
+    budget: dict
+    trace_nodes: Annotated[list[dict], operator.add]
+
+
 def filters_to_dict(filters: Filters | None) -> dict:
     """Filters → State 里的普通 dict（dataclass 不进 State；检索节点再重建）。"""
     if filters is None:
