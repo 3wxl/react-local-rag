@@ -18,11 +18,15 @@ import numpy as np
 
 from ..embedding.bge import BgeOnnxEmbedder
 from ..parity.bm25 import BM25
+from ..parity.query_expansion import build_query_variants
 from ..parity.retrieval import (
     DEFAULT_RETRIEVAL_OPTIONS,
+    QueryVariantScores,
+    RefusalSignals,
     RetrievalDoc,
     RetrievalOptions,
     SearchHit,
+    compute_refusal_signals,
     post_process_retrieval,
 )
 from ..store import Filters, Store
@@ -40,6 +44,8 @@ class SearchOutcome:
     latency_ms: int
     #: 命中候选总数（未过门限前），用于可观测性排查
     candidate_count: int = 0
+    #: 查询级拒答信号（多信号融合拒答用的取值，进 /v1/retrieve 响应便于归因）
+    signals: RefusalSignals = field(default_factory=RefusalSignals)
     #: 融合结果（评测与调试用；不进 API 响应）——见 retrieval.post_process_retrieval
     fused: list = field(default_factory=list)
 
@@ -109,8 +115,13 @@ class RetrievalService:
         options: RetrievalOptions = DEFAULT_RETRIEVAL_OPTIONS,
         filters: Filters | None = None,
         allow_vector: bool = True,
+        expansions: list[str] | None = None,
     ) -> SearchOutcome:
-        """检索并做后处理（与 worker 的 search 分支同序）。"""
+        """检索并做后处理（与 worker 的 search 分支同序）。
+
+        `expansions`：术语化改写（可选）。它们作为额外路参与 RRF 与拒答信号，
+        但不改变命中上的分数字段 —— 与 TS 侧 postProcessRetrieval 的 variants 同口径。
+        """
         started = time.perf_counter()
         docs = await self._load_docs(version, filters)
         if not docs:
@@ -141,8 +152,34 @@ class RetrievalService:
         effective = RetrievalOptions(
             **{**options.__dict__, "top_k": max(1, min(top_k, len(docs)))}
         )
+        variants: list[QueryVariantScores] = []
+        for text, weight in build_query_variants(question, expansions or [])[1:]:
+            v_bm25 = bm25.score_all(text)
+            v_vec: list[float] | None = None
+            if vec_scores is not None and allow_vector and self.embedder.available:
+                try:
+                    v_qvec = self.embedder.embed_query(text)
+                    v_vec = [
+                        float(np.dot(d.vector, v_qvec)) if d.vector is not None else 0.0
+                        for d in docs
+                    ]
+                except Exception:  # noqa: BLE001 —— 变体向量失败时该路降级为纯 BM25
+                    v_vec = None
+            variants.append(
+                QueryVariantScores(
+                    bm25_scores=v_bm25,
+                    vec_scores=v_vec,
+                    idf_coverage=bm25.idf_weighted_coverage(text),
+                    weight=weight,
+                )
+            )
         result = post_process_retrieval(
-            docs, bm25_scores, vec_scores, effective, idf_coverage=idf_coverage
+            docs,
+            bm25_scores,
+            vec_scores,
+            effective,
+            idf_coverage=idf_coverage,
+            variants=variants or None,
         )
         return SearchOutcome(
             hits=result.hits,
@@ -152,5 +189,6 @@ class RetrievalService:
             mode="hybrid" if vec_scores is not None else "bm25",
             latency_ms=int((time.perf_counter() - started) * 1000),
             candidate_count=len(result.fused),
+            signals=compute_refusal_signals(bm25_scores, vec_scores),
             fused=result.fused,
         )

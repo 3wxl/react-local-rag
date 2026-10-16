@@ -6,7 +6,8 @@
 2. 邻近合并：同文档 ord 连续的命中合成一个窗口（overlap 片段不再各占一个坑）
 3. 窗口聚合：窗口内的最高分为该窗口的分，向量取 RRF 最高那条（供 MMR）
 4. contentHash 去重：相同内容只留最高分的一条
-5. 门限 + 自适应 K：相关度门限过滤（调用方据此走「文档未提及」拒答）
+5. 门限 + 自适应 K：多信号融合拒绝（IDF 覆盖率 ∪ 最高余弦 ∪ 余弦对比度 ∪ BM25 最高分，
+   **并集、且仅在向量可用时启用**）+ 相关度门限过滤（调用方据此走「文档未提及」拒答）
 6. MMR 保多样：λ·relevance − (1−λ)·与已选集合的最大相似度
 7. 上下文扩展：对最终 ≤ topK 条向两侧扩邻块（小块检索 / 大块喂 LLM）
 
@@ -61,16 +62,29 @@ class RetrievalOptions:
     min_vec_score: float = 0.5
     #: BM25 豁免排名：**仅向量降级时生效**（向量可用时豁免会让负样本靠通用词挤进前三）
     bm25_exempt_rank: int = 3
-    #: IDF 覆盖率门限：默认关闭（0）。口语化查询与负样本在该信号上无法区分，勿设非零
-    min_idf_coverage: float = 0.0
+    #: IDF 覆盖率门限（提示位，**不参与检索侧粗拒**，理由同 min_bm25）
+    min_idf_coverage: float = 0.2277
+    #: 查询级「最高余弦」门限（检索侧粗拒的语义路）。
+    #: 2026-10-15 取 0.53：受保护人群（q+m）实测最低余弦 0.5427，故对 q+m 仍零误拒（余量 0.013），
+    #: 同时把两条口语化难例（s006 0.535 / s011 0.541）放进来 —— 旧值 0.5426 正好把它们拒掉。
+    min_max_cosine: float = 0.53
+    #: 查询级「余弦对比度」门限（最高余弦 − 全语料余弦均值，零误拒切点 0.077628）
+    min_cos_gap: float = 0.0776
+    #: 查询级「BM25 最高分」——**已不参与检索侧粗拒**（2026-10-15 起降为提示信号）。
+    #: 它与 IDF 覆盖率都无法区分口语化提问与否样本（两组分布重叠），放进并集只会把 s 组整体拒掉。
+    #: 值保留在档：响应里的 refusal_signals 要如实报告取值，答案侧也要这条参考线。
+    min_bm25: float = 8.2246
     #: 相对门限：RRF 分低于最高分 × ratio 的命中被丢弃
     relative_cut_ratio: float = 0.4
     #: 邻近合并窗口的字符上限
     max_window_chars: int = 1200
     #: 上下文扩展半径（命中块前后各取多少块）
     window_radius: int = 1
-    #: MMR 多样性权重（1 = 只看相关度 = 关闭 MMR）
-    mmr_lambda: float = 0.7
+    #: MMR 多样性权重。**1.0 = 关闭 MMR**（2026-10-15 起）。
+    #: 引入查询扩展后实测反转：λ=1.0 + 扩展开时 q 0.92 / s 0.50 / m 1.00，
+    #: 而 λ=0.9 + 扩展开只有 s 0.14 —— MMR 的结果侧多样性会抵消多查询融合的收益
+    #: （把正确答案当"重复"压下去）。多样性改由查询扩展提供（问法多样而非结果多样）。
+    mmr_lambda: float = 1.0
     #: MMR 候选池大小
     mmr_pool_size: int = 20
     rrf_k: int = RRF_K
@@ -129,6 +143,31 @@ class ThresholdResult:
 @dataclass
 class RetrievalResult(ThresholdResult):
     fused: list[FusedHit] = field(default_factory=list)
+
+
+@dataclass
+class RefusalSignals:
+    """查询级拒答信号快照（由全量两路原始分算出，与 TS computeRefusalSignals 同口径）。
+
+    max_cosine / cos_gap 参与粗拒；max_bm25 / idf_coverage 是**提示信号**（不参与），
+    但必须回传：答案侧与排障要用，且"当时看到的取值"不该事后无法复核。
+    """
+
+    max_cosine: float | None = None
+    cos_gap: float | None = None
+    max_bm25: float | None = None
+    idf_coverage: float | None = None
+
+
+@dataclass
+class QueryVariantScores:
+    """一个查询变体的两路原始分（查询扩展的多路输入，与 TS QueryVariantScores 同构）。"""
+
+    bm25_scores: Sequence[float]
+    vec_scores: Sequence[float] | None
+    idf_coverage: float | None = None
+    #: 该变体在融合里的相对权重（拓展变体 < 1）
+    weight: float = 1.0
 
 
 # ---------------- 1. RRF 融合 ----------------
@@ -208,6 +247,85 @@ def rrf_fuse(
             )
         )
     return fused
+
+
+def rrf_fuse_runs(
+    docs: Sequence[RetrievalDoc],
+    runs: Sequence[QueryVariantScores],
+    *,
+    k: int = RRF_K,
+    vec_weight: float = 1.0,
+    bm25_weight: float = 1.0,
+) -> list[FusedHit]:
+    """多路 RRF 融合（查询扩展用）。`rrf_fuse` 是"只有一路"的特例。
+
+    **只有第一路（原查询）决定命中上的分数与排名字段**，后续路只累加 RRF 分 ——
+    vec_score/bm25_rank 既是展示值，也是接纳判据与 MMR 的相关度输入；
+    让改写路抬高它们等于让"猜的问法"替用户的问题接纳候选（实测：q 组 0.88 → 0.84）。
+    改写只做一件事：把"文档里有没有这件事"的信号抬高（见 best_refusal_signals）。
+    """
+    prepared = [
+        (
+            scores_to_ranks(run.bm25_scores, False),
+            scores_to_ranks(run.vec_scores, True) if run.vec_scores is not None else None,
+            run,
+        )
+        for run in runs
+    ]
+    primary_ranks, primary_vec_ranks, primary = prepared[0]
+
+    fused: list[FusedHit] = []
+    for i, doc in enumerate(docs):
+        rrf_score = 0.0
+        for bm25_ranks, vec_ranks, run in prepared:
+            vr = vec_ranks[i] if vec_ranks is not None else None
+            if vr and vr > 0:
+                rrf_score += (vec_weight * run.weight) / (k + vr)
+            if bm25_ranks[i] > 0:
+                rrf_score += (bm25_weight * run.weight) / (k + bm25_ranks[i])
+        vr = primary_vec_ranks[i] if primary_vec_ranks is not None else None
+        fused.append(
+            FusedHit(
+                index=i,
+                doc=doc,
+                vec_score=primary.vec_scores[i] if primary.vec_scores is not None else None,
+                vec_rank=vr if vr and vr > 0 else None,
+                bm25_score=primary.bm25_scores[i] if i < len(primary.bm25_scores) else 0.0,
+                bm25_rank=primary_ranks[i] if i < len(primary_ranks) else 0,
+                rrf_score=rrf_score,
+            )
+        )
+    return fused
+
+
+def best_refusal_signals(variants: Sequence[QueryVariantScores]) -> RefusalSignals:
+    """逐信号取各变体的最优值（与 TS bestRefusalSignals 同口径）。
+
+    判据因此是：**原查询与所有改写都看不出相关性时才拒答** ——
+    这正好补上词表信号在语义化提问上的失效（一条术语化改写命中语料，
+    就说明文档里确实有这件事，不该粗拒）。
+    """
+    max_cosine: float | None = None
+    cos_gap: float | None = None
+    max_bm25: float | None = None
+    idf_coverage: float | None = None
+
+    def take(cur: float | None, nxt: float | None) -> float | None:
+        if nxt is None:
+            return cur
+        if cur is None:
+            return nxt
+        return max(cur, nxt)
+
+    for variant in variants:
+        signals = compute_refusal_signals(variant.bm25_scores, variant.vec_scores)
+        max_cosine = take(max_cosine, signals.max_cosine)
+        cos_gap = take(cos_gap, signals.cos_gap)
+        max_bm25 = take(max_bm25, signals.max_bm25)
+        idf_coverage = take(idf_coverage, variant.idf_coverage)
+    return RefusalSignals(
+        max_cosine=max_cosine, cos_gap=cos_gap, max_bm25=max_bm25, idf_coverage=idf_coverage
+    )
 
 
 # ---------------- 2. 邻近合并 ----------------
@@ -384,7 +502,7 @@ def _similarity(a: SearchHit, b: SearchHit) -> float:
 
 
 def mmr_select(
-    hits: list[SearchHit], limit: int, lam: float = 0.7
+    hits: list[SearchHit], limit: int, lam: float = 0.9
 ) -> list[SearchHit]:
     """每轮挑「λ·相关度 − (1−λ)·与已选集合的最大相似度」最高的一条。"""
     if lam >= 1 or len(hits) <= 1:
@@ -420,6 +538,32 @@ def _compute_relevance(hit: SearchHit, vec_available: bool) -> float:
     return 0.0
 
 
+def compute_refusal_signals(
+    bm25_scores: Sequence[float],
+    vec_scores: Sequence[float] | None,
+) -> RefusalSignals:
+    """从**全量**两路原始分算出查询级拒答信号（最高余弦 / 对比度 / BM25 最高分）。
+
+    单一实现：tune 第 7 段的信号诊断与检索管线共用本函数，保证「诊断扫出的阈值」
+    与「线上门限看到的取值」逐位一致。遍历按数组原序累加（不排序），
+    避免浮点加法结合律带来的均值漂移 —— 与 TS 的 `for (const v of vecScores)` 同序。
+    """
+    max_bm25 = max(bm25_scores) if len(bm25_scores) > 0 else None
+    if vec_scores is None or len(vec_scores) == 0:
+        return RefusalSignals(max_bm25=max_bm25)
+    max_cos = float("-inf")
+    total = 0.0
+    for value in vec_scores:
+        if value > max_cos:
+            max_cos = value
+        total += value
+    return RefusalSignals(
+        max_cosine=max_cos,
+        cos_gap=max_cos - total / len(vec_scores),
+        max_bm25=max_bm25,
+    )
+
+
 def apply_threshold(
     hits: list[SearchHit],
     options: RetrievalOptions,
@@ -427,17 +571,32 @@ def apply_threshold(
     vec_available: bool,
     idf_coverage: float | None = None,
     top_k: int | None = None,
+    max_cosine: float | None = None,
+    cos_gap: float | None = None,
+    max_bm25: float | None = None,
 ) -> ThresholdResult:
-    """门限 + 自适应 K + 检索侧拒答信号（精排不参与拒答判定）。"""
+    """门限 + 自适应 K + 检索侧**粗拒**（精排不参与拒答判定）。
+
+    粗拒只看**语义信号**（最高余弦 ∪ 余弦对比度）。词表信号（IDF 覆盖率 / BM25 最高分）
+    不再是**一票否决**：2026-10-15 逐条诊断证明它们在 s 组与负样本上完全重叠
+    （s 的 maxBm25 4.46~7.51 / IDF 0.137~0.162，负样本 4.77~7.06 / 0.152~0.197），
+    放进并集只会把 s 组整体拒掉（实测 s recall@3 0.50 → 0.07），而负样本拒答仅 4/10 → 9/10。
+    职责按路线图拆开：检索侧粗拒、细拒交答案侧 verifyAnswer（`parity/verify.should_refuse`）。
+    词表信号仍然计算并随响应返回，供答案侧与排障使用。
+
+    **只在向量可用时启用**：降级纯 BM25 时保持原行为（否则 BM25-only 基线自己也会拒正样本，
+    相对门槛 hybrid ≥ BM25-only × 0.95 失去可比性）。
+    """
     min_vec = options.min_vec_score
     ratio = options.relative_cut_ratio
     exempt_rank = options.bm25_exempt_rank
-    min_idf = options.min_idf_coverage
     limit = options.top_k if top_k is None else top_k
 
-    # 信号 1：查询词在语料里几乎找不到 → 直接拒答（唯一不依赖候选质量的信号）
-    if (idf_coverage if idf_coverage is not None else 1.0) < min_idf:
-        return ThresholdResult(hits=[], no_relevant_hit=True, dropped_count=len(hits))
+    if vec_available:
+        if (max_cosine is not None and max_cosine < options.min_max_cosine) or (
+            cos_gap is not None and cos_gap < options.min_cos_gap
+        ):
+            return ThresholdResult(hits=[], no_relevant_hit=True, dropped_count=len(hits))
 
     for hit in hits:
         hit.relevance = _compute_relevance(hit, vec_available)
@@ -470,12 +629,20 @@ def post_process_retrieval(
     options: RetrievalOptions = DEFAULT_RETRIEVAL_OPTIONS,
     *,
     idf_coverage: float | None = None,
+    variants: Sequence[QueryVariantScores] | None = None,
 ) -> RetrievalResult:
-    """检索后处理全流程（顺序与 TS 一致，见模块 docstring）。"""
-    fused = rrf_fuse(
+    """检索后处理全流程（顺序与 TS 一致，见模块 docstring）。
+
+    `variants`：查询扩展的额外变体。它们参与 RRF 排名与拒答信号，
+    但**不改变命中上的分数字段**（见 rrf_fuse_runs）。
+    """
+    primary = QueryVariantScores(
+        bm25_scores=bm25_scores, vec_scores=vec_scores, idf_coverage=idf_coverage
+    )
+    runs = [primary, *(variants or [])]
+    fused = rrf_fuse_runs(
         docs,
-        bm25_scores,
-        vec_scores,
+        runs,
         k=options.rrf_k,
         vec_weight=options.vec_weight,
         bm25_weight=options.bm25_weight,
@@ -490,12 +657,23 @@ def post_process_retrieval(
     unique = dedupe_by_hash(hits)
     pool = unique[: options.mmr_pool_size]
 
+    # 拒答信号透传：idf_coverage 由调用方（检索服务/评测）从同一份 BM25 统计算出；
+    # 余弦类信号用 compute_refusal_signals（与 tune 第 7 段同实现、同口径）。
+    signals = (
+        best_refusal_signals(runs)
+        if len(runs) > 1
+        else RefusalSignals(**{**compute_refusal_signals(bm25_scores, vec_scores).__dict__,
+                               "idf_coverage": idf_coverage})
+    )
     gated = apply_threshold(
         pool,
         options,
-        vec_available=vec_scores is not None,
+        vec_available=any(run.vec_scores is not None for run in runs),
         idf_coverage=idf_coverage,
         top_k=options.mmr_pool_size,
+        max_cosine=signals.max_cosine,
+        cos_gap=signals.cos_gap,
+        max_bm25=signals.max_bm25,
     )
     if not gated.hits:
         return RetrievalResult(
