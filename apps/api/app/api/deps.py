@@ -39,6 +39,8 @@ class AppContext:
     reindex: ReindexService
     #: LangGraph 检查点（M3）：interrupt 恢复与断点续跑都在这里落盘
     checkpointer: BaseCheckpointSaver | None = None
+    #: 摄取图（M3）：POST /v1/documents 与重建都走它（reindex 走 ReindexService 内部持有的同一实例）
+    ingest_graph: object | None = None
     #: 进程内任务（评测 / 摄取 / Agent 续跑）：不引队列框架，状态写 tasks 表
     tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 

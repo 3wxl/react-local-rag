@@ -25,6 +25,8 @@ from .core.config import settings
 from .embedding.bge import get_embedder
 from .generation.factory import build_provider
 from .graphs import open_checkpointer
+from .graphs.ingest_graph import build_ingest_graph
+from .graphs.ingest_nodes import IngestDeps
 from .graphs.qa_graph import build_qa_graph
 from .graphs.qa_nodes import QaDeps
 from .services.answer_service import AnswerService
@@ -66,6 +68,12 @@ async def lifespan(app: FastAPI):
             ),
             checkpointer,
         )
+        # 摄取图与重建服务共享同一个图实例（编译有成本，检查点后端也必须一致）
+        ingest_graph = build_ingest_graph(
+            IngestDeps(store=store, ingest=ingest, settings=settings), checkpointer
+        )
+        reindex = ReindexService(store, ingest, graph=ingest_graph)
+
         ctx = AppContext(
             settings=settings,
             store=store,
@@ -74,8 +82,9 @@ async def lifespan(app: FastAPI):
             retrieval=retrieval,
             answer=AnswerService(qa_graph, settings=settings),
             ingest=ingest,
-            reindex=ReindexService(store, ingest),
+            reindex=reindex,
             checkpointer=checkpointer,
+            ingest_graph=ingest_graph,
         )
         app.state.ctx = ctx
         try:

@@ -76,6 +76,35 @@ class QaState(TypedDict, total=False):
     budget: dict
 
 
+class IngestState(TypedDict, total=False):
+    """摄取图 State（解析 → 分块 → 去重/版本比对 → 向量化 → 索引 → 自检，逐文档）。
+
+    `done` 是**断点**（与 tasks.checkpoint["done"] 同源同序）：重跑时按它跳过已完成文档。
+    """
+
+    task_id: str
+    #: upload（单文档上传）| reindex（全量重建，含灰度 ratio）
+    mode: str
+    ratio: float
+    version: str
+    #: upload 模式的输入
+    upload_path: str
+    upload_name: str
+    #: 文档归属（由身份决定，不由请求方声明）
+    acl: dict
+    #: 本次要处理的文档清单 / 未完成队列（doc_id）
+    docs: list[dict]
+    pending: list[str]
+    done: list[str]
+    failed: list[dict]
+    #: 单文档模式的摄取结果（HTTP 层用它写任务进度）
+    results: list[dict]
+    #: 增量统计：reused_vectors / embedded_chunks
+    stats: dict
+    error: str | None
+    trace_nodes: Annotated[list[dict], operator.add]
+
+
 def filters_to_dict(filters: Filters | None) -> dict:
     """Filters → State 里的普通 dict（dataclass 不进 State；检索节点再重建）。"""
     if filters is None:
