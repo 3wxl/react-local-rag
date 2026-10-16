@@ -294,8 +294,23 @@ export function searchKb(
       )
     : null;
 
+  /*
+   * 融合拒答的四个绝对门限**不适用于任意用户备份**，这里显式关掉：
+   * minIdfCoverage / minMaxCosine / minCosGap / minBm25 是在**固定评测语料**
+   * （119 块 / 61 条标注查询）上按「零误拒最宽切点」扫出来的，量纲随语料走 ——
+   * 尤其 minBm25：BM25 的 IDF 随语料规模变化，同一查询在小库里的最高分
+   * 天然比大库低一个量级，直接套用会把整库问句全判成「无关」。
+   * MCP 面向的是用户自己导出的备份（规模、领域、措辞都未知），
+   * 这里只保留与语料无关的两条判据：逐命中余弦门限 + 相对截断，
+   * 以及返回空结果时的「未找到相关片段」说明。
+   * （主线路径仍用默认四门限 —— 那里有同语料的评测门槛兜底。）
+   */
   const processed = postProcessRetrieval(candidates, bm25Scores, vecScores, {
     ...DEFAULT_RETRIEVAL_OPTIONS,
+    minIdfCoverage: 0,
+    minMaxCosine: 0,
+    minCosGap: 0,
+    minBm25: 0,
     topK,
   });
 

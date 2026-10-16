@@ -68,12 +68,21 @@ interface RawSentence {
   unknown_numbers: string[];
   citations: number[];
   invalid_citations: number[];
+  /** 引用强制闭环（M2）：主张句没有有效角标。老服务端不返回时按 false 处理 */
+  uncited?: boolean;
   trivial: boolean;
+}
+
+interface RawConvergence {
+  uncited_claims: number;
+  out_of_range_claims: number;
+  citations_subset_of_passages: boolean;
 }
 
 interface RawVerification {
   source: "semantic" | "lexical";
   scoped_chunk_count: number;
+  convergence?: RawConvergence;
   sentences: RawSentence[];
 }
 
@@ -146,8 +155,10 @@ export function mapVerification(raw: RawVerification): VerificationResult {
     unknownNumbers: s.unknown_numbers ?? [],
     citations: s.citations ?? [],
     invalidCitations: s.invalid_citations ?? [],
+    uncited: s.uncited ?? false,
     trivial: s.trivial,
   }));
+  const convergence = raw.convergence;
   return {
     verdict: verdictOf(sentences),
     sentences,
@@ -156,6 +167,22 @@ export function mapVerification(raw: RawVerification): VerificationResult {
     checkedAt: Date.now(),
     source: raw.source === "lexical" ? "lexical" : "semantic",
     scopedChunkCount: raw.scoped_chunk_count ?? 0,
+    // 服务端老版本不返回收敛块：从逐句结果本地复算（同一条规则，不会漂移）
+    convergence: convergence
+      ? {
+          uncitedClaims: convergence.uncited_claims,
+          outOfRangeClaims: convergence.out_of_range_claims,
+          citationsSubsetOfPassages: convergence.citations_subset_of_passages,
+        }
+      : {
+          uncitedClaims: sentences.filter((s) => !s.trivial && s.uncited).length,
+          outOfRangeClaims: sentences.filter(
+            (s) => !s.trivial && s.invalidCitations.length > 0,
+          ).length,
+          citationsSubsetOfPassages: sentences.every(
+            (s) => s.invalidCitations.length === 0,
+          ),
+        },
   };
 }
 

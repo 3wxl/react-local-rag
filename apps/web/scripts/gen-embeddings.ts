@@ -18,7 +18,7 @@
  * - dtype 用 q8：浏览器端 WＡSM 后端的默认 dtype 就是 q8（model_quantized.onnx），
  *   显式指定才能保证 Node 算出的向量与线上跑的是同一套权重
  */
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,6 +129,33 @@ async function main(): Promise<void> {
     "query",
   );
 
+  /*
+   * 查询扩展的改写也要固化向量：评测时给检索管线喂"多路变体"，
+   * 变体的向量必须在同一套模型/前缀口径下算出来（现算要求 CI 有模型，做不到）。
+   */
+  const expansionsPath = join(EVAL_DIR, "expansions.json");
+  const expansionVectors: Record<string, number[][]> = {};
+  if (existsSync(expansionsPath)) {
+    const expansions = JSON.parse(readFileSync(expansionsPath, "utf8")) as {
+      expansions: Record<string, string[]>;
+    };
+    const flat: { id: string; text: string }[] = [];
+    for (const [id, list] of Object.entries(expansions.expansions)) {
+      for (const text of list) flat.push({ id, text });
+    }
+    if (flat.length > 0) {
+      console.log(`  向量化查询改写…（${flat.length} 条）`);
+      const vecs = await embedBatch(
+        embedder,
+        flat.map((f) => f.text),
+        "query",
+      );
+      for (let i = 0; i < flat.length; i++) {
+        (expansionVectors[flat[i].id] ??= []).push(vecs[i]);
+      }
+    }
+  }
+
   const payload = {
     model: EMBEDDING_MODEL_NAME,
     // 带上生成时的分块参数：eval 侧 assertEmbeddingsConsistent 会比对，
@@ -144,6 +171,8 @@ async function main(): Promise<void> {
     queries: Object.fromEntries(
       golden.queries.map((q, i) => [q.id, queryVectors[i]]),
     ) as Record<string, number[]>,
+    // 查询扩展的改写向量（id → 各条改写的向量，顺序与 expansions.json 一致）
+    expansions: expansionVectors,
   };
 
   writeFileSync(OUT_PATH, JSON.stringify(payload) + "\n", "utf8");

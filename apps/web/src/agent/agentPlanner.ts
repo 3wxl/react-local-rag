@@ -5,6 +5,7 @@ import {
   workerTimeoutError,
 } from "../utils/errors";
 import { stripThinkTags } from "../utils/verifyAnswer";
+import { parseExpandedQueries } from "../utils/queryExpansion";
 import { acquireInferenceLock, type InferencePriority } from "../utils/inferenceLock";
 import { reportDevice } from "../utils/perf";
 import type { DeviceKind } from "../utils/deviceAccel";
@@ -527,4 +528,36 @@ export function parseSufficiency(raw: string): {
 
   // 兜底：无法解析，默认「不足」（更安全，触发后续补充检索）
   return { result: "insufficient", fallback: true };
+}
+
+// ──────────────────────────────────────────────
+//  expandQuery：口语化 → 术语化的查询扩展（检索侧增强）
+// ──────────────────────────────────────────────
+
+/** 扩展任务超时：与 condense 同量级（短输出），失败即回退原查询 */
+const EXPAND_TIMEOUT_MS = 15_000;
+
+/**
+ * 生成 2–3 条术语化改写。
+ *
+ * 定位：**增强项，不是必经路径**。任何失败（模型不可用、超时、输出不可解析）
+ * 都静默返回空数组，检索按原查询继续 —— 用户不该因为查询扩展挂了就问不了问题。
+ * 解析失败与"模型确实想不出改写"在这里不作区分，都是空数组。
+ */
+export async function expandQuery(
+  question: string,
+  onLoadProgress?: (progress: number) => void,
+): Promise<string[]> {
+  try {
+    const raw = await callWorker(
+      { type: "expand", text: question, max: 3 },
+      onLoadProgress,
+      EXPAND_TIMEOUT_MS,
+      "low",
+    );
+    return parseExpandedQueries(raw, question);
+  } catch (err) {
+    console.warn("查询扩展不可用，按原查询检索", err);
+    return [];
+  }
 }

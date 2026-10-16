@@ -27,6 +27,10 @@ COMPARED_FIELDS = (
     "top3NearDuplicateRate",
     "noHitQueryCount",
     "falseRefusalCount",
+    # 受保护人群（q+m）：门槛与相对门槛的判定对象，必须逐位相同
+    "protectedFalseRefusalCount",
+    "protectedRecallAt3",
+    "protectedBm25OnlyRecallAt3",
     "negativeCount",
     "negativeRefusedCount",
     "negativeRefusalRate",

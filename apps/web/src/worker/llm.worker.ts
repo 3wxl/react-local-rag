@@ -5,6 +5,7 @@ import type {
   TextGenerationPipeline,
 } from "@huggingface/transformers";
 import { buildAnswerPrompt } from "../utils/answerPrompt";
+import { buildExpandPrompt } from "../utils/expandPrompt";
 import type { DeviceKind } from "../utils/deviceAccel";
 
 //模型从本地 /models 加载,禁止远程，避免走 HF 官网
@@ -41,6 +42,8 @@ export type LlmRequest =
   | { type: "split"; id?: number; text: string }
   /** 多轮追问改写为独立问题（非流式） */
   | { type: "condense"; id?: number; text: string; history?: LlmHistoryTurn[] }
+  /** 查询扩展：把口语化提问改写成术语化检索词（返回多行，逐行一条） */
+  | { type: "expand"; id?: number; text: string; max?: number }
   /** 信息充足性判断（非流式，只输出「足够/不足」） */
   | { type: "evaluate"; id?: number; text: string; contextChunks: string[] }
   /** 释放模型 */
@@ -272,6 +275,31 @@ ${data.text}<|im_end|>
 `;
       const output = await generator(splitPrompt, {
         max_new_tokens: 256,
+        do_sample: false,
+        return_full_text: false,
+      });
+      self.postMessage({
+        type: "done",
+        id,
+        text: String(output[0].generated_text ?? "").trim(),
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      self.postMessage({ type: "error", id, error: message });
+    }
+    return;
+  }
+
+  // 查询扩展模式（口语化 → 术语化）：输出多行改写，逐行一条
+  if (data.type === "expand" && typeof data.text === "string") {
+    const id = data.id;
+    try {
+      self.postMessage({ type: "loading", id });
+      const generator = await getGenerator(() => {});
+      const prompt = buildExpandPrompt({ question: data.text, max: data.max });
+      const output = await generator(prompt, {
+        // 贪心：查询扩展要**可复现**（评测里固化的改写必须与线上一致）
+        max_new_tokens: 128,
         do_sample: false,
         return_full_text: false,
       });

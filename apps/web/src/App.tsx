@@ -34,6 +34,7 @@ import {
   buildRefusalResult,
   NO_RELEVANT_ANSWER,
 } from "./utils/verifyAnswer";
+import { maybeRetry } from "./utils/ragRetry";
 import {
   buildEvidence,
   toVerifyPassages,
@@ -996,9 +997,55 @@ function App() {
               sentences: verification?.sentences?.length || 0,
               scopedChunks: verification?.scopedChunkCount || 0,
             });
+
+            /*
+             * 低置信回退（M2）：数字捏造 / 越界角标 / 证据普遍偏弱时，
+             * 补一次**更宽的检索**（窗口半径 2、topK 8）后重生成一次。
+             * 只放宽召回、不动拒答阈值；最多一次；补检索为空则保留原答案。
+             * 编排逻辑在 utils/ragRetry.ts（纯函数，有单测），这里只提供 UI 适配。
+             */
+            const evidence = { passages: resultPassages, contexts: resultContexts, ctx };
+            const outcome = await maybeRetry(
+              { passages: evidence, answer: finalText, verification },
+              {
+                retrieve: (overrides) =>
+                  searchTopK(convId, text, overrides.topK, {
+                    retrieval: { windowRadius: overrides.windowRadius },
+                    rerank: agentSettings.enableRerank,
+                  }),
+                toPassages: (search) => {
+                  const e = buildEvidence(search.hits);
+                  return {
+                    passages: e.passages,
+                    contexts: e.contexts,
+                    ctx: e.passages.map((p) => p.text).join("\n\n"),
+                  };
+                },
+                generate: async (p) =>
+                  (
+                    await generateAnswer(text, p.passages, {
+                      onGenerating: () => {
+                        patchMessage(convId, assistantMsg.id, { status: "generating" });
+                      },
+                    })
+                  ).promise,
+                verify: async (answer, p) =>
+                  verifyAnswer(convId, answer, p.ctx, {
+                    passages: toVerifyPassages(p.contexts),
+                  }),
+                onRetry: (decision) => {
+                  console.info(`低置信回退：${decision.reason}，补检索后重生成`);
+                  patchMessage(convId, assistantMsg.id, { status: "retrieving" });
+                },
+              },
+            );
+
             patchMessage(convId, assistantMsg.id, {
               status: "done",
-              verification,
+              content: outcome.final.answer,
+              context: outcome.final.passages.ctx,
+              contexts: outcome.final.passages.contexts,
+              verification: outcome.final.verification,
             });
           } catch (verifyErr) {
             console.error("答案依据校验失败", verifyErr);

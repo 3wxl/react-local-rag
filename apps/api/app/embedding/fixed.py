@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +25,8 @@ class FixedEmbeddings:
     chunk_params: dict
     chunks: dict[str, np.ndarray]
     queries: dict[str, np.ndarray]
+    #: 查询扩展的改写向量（id → 各条改写的向量，顺序与 expansions.json 一致）
+    expansions: dict[str, list[np.ndarray]] = field(default_factory=dict)
 
     @property
     def chunk_count(self) -> int:
@@ -46,6 +48,10 @@ def load_fixed_embeddings(path: Path) -> FixedEmbeddings | None:
         chunk_params=raw.get("chunkParams", {}),
         chunks={k: _to_float32(v) for k, v in raw["chunks"].items()},
         queries={k: _to_float32(v) for k, v in raw["queries"].items()},
+        expansions={
+            k: [_to_float32(vec) for vec in vectors]
+            for k, vectors in (raw.get("expansions") or {}).items()
+        },
     )
 
 

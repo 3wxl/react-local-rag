@@ -35,6 +35,7 @@ import {
   dotProduct,
   postProcessRetrieval,
   applyThreshold,
+  computeRefusalSignals,
   dedupeByHash,
   mergeNeighbors,
   rrfFuse,
@@ -44,9 +45,13 @@ import {
   type SearchHitWithVector,
 } from "../src/utils/retrieval";
 import { buildAnswerPrompt } from "../src/utils/answerPrompt";
+import { buildExpandPrompt } from "../src/utils/expandPrompt";
+import { parseExpandedQueries } from "../src/utils/queryExpansion";
 import {
   splitSentences,
   parseCitations,
+  parseAllCitations,
+  isInvalidCitation,
   extractNumbers,
   findUnknownNumbers,
   lexicalCoverage,
@@ -339,6 +344,15 @@ function sectionRetrieval() {
       id: q.id,
       question: q.question,
       hybrid: vecScores !== null,
+      /*
+       * 查询级拒答信号（多信号融合拒答的取值本身也要跨语言逐位一致）：
+       * 只比 noRelevantHit 的话，两端阈值算出来略有差异也照样"看起来一致"，
+       * 直到某个边界样本上翻转才暴露。这里把四个取值直接导出比对。
+       */
+      refusalSignals: {
+        idfCoverage,
+        ...computeRefusalSignals(bm25Scores, vecScores),
+      },
       result: run(TOPK),
       // MRR 与宽候选口径（eval.ts 用 topK=10 的同一条管线）
       wide: run(10),
@@ -347,6 +361,31 @@ function sectionRetrieval() {
     };
   });
   return { topK: TOPK, mode: vecs ? "hybrid" : "bm25", queries: out };
+}
+
+function sectionExpand() {
+  // 查询扩展的 Prompt 必须逐字节一致（一端改一个字，改写就不同）
+  const cases = [
+    { name: "plain", question: "这台东西在严寒酷暑下还能正常干活吗？", max: 3 },
+    { name: "short", question: "年假怎么算", max: 2 },
+    { name: "empty-max", question: "网关最多接几个传感器", max: 1 },
+  ];
+  return {
+    cases: cases.map((c) => ({
+      ...c,
+      prompt: buildExpandPrompt({ question: c.question, max: c.max }),
+    })),
+    // 解析器的行为也要跨语言一致（弱模型的乱格式两端必须同样处理）
+    parseCases: [
+      { name: "numbered", raw: "1. 工作温度范围\n2) 防护等级\n- 高低温运行", original: "耐造吗" },
+      {
+        name: "dedupe-and-drops",
+        raw: "耐造吗\n工作温度范围\n工作温度范围\n" + "长".repeat(60),
+        original: "耐造吗",
+      },
+      { name: "trailing-explain", raw: "工作温度范围——这是术语化改写", original: "耐寒吗" },
+    ].map((c) => ({ ...c, parsed: parseExpandedQueries(c.raw, c.original) })),
+  };
 }
 
 function sectionPrompt() {
@@ -403,11 +442,39 @@ function sectionVerify() {
     "单次采购量上限为 100 升。",
   ].join("");
   const passages = [{ index: 1, chunkIds: ["c1", "c2"] }];
-  const cases = [
+  const cases: {
+    name: string;
+    answer: string;
+    semantic: number[];
+    /** 用例自己的编号段落表（缺省用共享的那张）—— 用于「编号不连续」这类边界 */
+    passages?: { index: number; chunkIds: string[] }[];
+  }[] = [
     {
       name: "supported-sentence",
       answer: "停机保养前必须切断主电源并挂牌[1]。",
       semantic: [0.82],
+    },
+    {
+      // [0] 永远不是合法编号：旧实现被 n>0 过滤静默当成"无引用"
+      name: "zero-citation",
+      answer: "停机保养前必须切断主电源并挂牌[0]。",
+      semantic: [0.9],
+    },
+    {
+      // 编号段不连续（1,3）时引用中间的 [2]：按集合判定应为越界
+      name: "gap-index-citation",
+      answer: "停机保养前必须切断主电源并挂牌[2]。",
+      semantic: [0.9],
+      passages: [
+        { index: 1, chunkIds: ["c1"] },
+        { index: 3, chunkIds: ["c3"] },
+      ],
+    },
+    {
+      // 有编号段落表却整句不标角标：引用强制闭环（uncited → 封顶 weak）
+      name: "uncited-claim",
+      answer: "停机保养前必须切断主电源并挂牌。",
+      semantic: [0.9],
     },
     {
       name: "fabricated-number",
@@ -447,6 +514,9 @@ function sectionVerify() {
     passages,
     thresholds: DEFAULT_VERIFY_THRESHOLDS,
     cases: cases.map((c) => {
+      const casePassages = c.passages ?? passages;
+      const passageIndexes = new Set(casePassages.map((p) => p.index));
+      const hasPassages = casePassages.length > 0;
       const segments = splitSentences(c.answer);
       // 模型按指令拒答：与 verifyAnswer 同判据（短 + 含拒答短语）→ 全句 trivial
       const refusal = c.answer.replace(/\s+/g, "").length <= 80 && REFUSAL_RE.test(c.answer);
@@ -454,7 +524,13 @@ function sectionVerify() {
       let semanticIdx = 0;
       const sentences = segments.map((text, idx) => {
         const citations = parseCitations(text);
-        const invalidCitations = citations.filter((n) => n > 1);
+        // 与 verifyAnswer 同口径：集合判定（不是"≤ 最大值"），[0] 也要抓出来
+        const invalidCitations = parseAllCitations(text).filter((n) =>
+          isInvalidCitation(n, passageIndexes, hasPassages),
+        );
+        /** 主张句没有任何有效角标（引用强制闭环） */
+        const uncited =
+          hasPassages && !refusal && claimFlags[idx] && !citations.some((n) => passageIndexes.has(n));
         // 拒答分支的 lexical 固定 1（verifyAnswer 的拒答结果就是这么构造的，
         // 不是"句子与上下文的重合度"）：这里必须照抄，否则两端对不上
         const lexical = refusal ? 1 : lexicalCoverage(text, contextTokens);
@@ -470,6 +546,7 @@ function sectionVerify() {
             unknownNumbers: [] as string[],
             citations,
             invalidCitations,
+            uncited: false,
             score: 1,
             level: "supported",
           };
@@ -483,6 +560,7 @@ function sectionVerify() {
           {
             fabricatedNumber: unknownNumbers.length > 0,
             danglingCitation: invalidCitations.length > 0,
+            uncitedClaim: uncited,
           },
         );
         return {
@@ -494,11 +572,20 @@ function sectionVerify() {
           unknownNumbers,
           citations,
           invalidCitations,
+          uncited,
           score,
           level: levelOf(score, DEFAULT_VERIFY_THRESHOLDS),
         };
       });
-      return { ...c, segments, sentences };
+      // 收敛汇总与 verifyAnswer 的 convergence 同口径（只统计主张句）
+      const claims = sentences.filter((s) => !s.trivial);
+      const outOfRangeClaims = claims.filter((s) => s.invalidCitations.length > 0).length;
+      const convergence = {
+        uncitedClaims: claims.filter((s) => s.uncited).length,
+        outOfRangeClaims,
+        citationsSubsetOfPassages: outOfRangeClaims === 0,
+      };
+      return { ...c, segments, sentences, convergence };
     }),
   };
 }
@@ -535,6 +622,7 @@ function build() {
   if (SECTION === "retrieval" || SECTION === "all") {
     payload.retrieval = sectionRetrieval();
   }
+  if (SECTION === "expand" || SECTION === "all") payload.expand = sectionExpand();
   if (SECTION === "prompt" || SECTION === "all") payload.prompt = sectionPrompt();
   if (SECTION === "verify" || SECTION === "all") payload.verify = sectionVerify();
   if (SECTION === "counts") {

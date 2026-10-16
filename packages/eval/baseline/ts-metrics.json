@@ -1,5 +1,5 @@
 {
-  "note": "apps/web/scripts/eval.ts 在 packages/eval 上的实测指标冻结副本（results/ 目录是 gitignore 的，CI 拿不到）。Python Harness 以此为同口径基准做断言：字段名与取值都必须一致。",
+  "note": "apps/web/scripts/eval.ts 在 packages/eval 上的实测指标冻结副本（results/ 目录是 gitignore 的，CI 拿不到），Python Harness 以此为同口径基准。由 scripts/eval-baseline.ts 生成，禁止手工编辑 —— 手工同步必然出现「改了指标忘了改基线」，红在基线过时上而不是真实分歧上。",
   "source": "apps/web/scripts/eval.ts",
   "topK": 5,
   "chunkParams": {
@@ -8,37 +8,41 @@
     "maxChunkChars": 600,
     "sentenceOverlap": 2
   },
+  "recordedAt": "2026-10-15T12:29:31.830Z",
   "metrics": {
     "queryCount": 61,
     "chunkCount": 119,
     "hybrid": true,
     "bm25OnlyRecallAt3": 0.7451,
-    "recallAt3": 0.7255,
-    "recallAt5": 0.8235,
-    "mrrAt10": 0.6615,
-    "keyPointHitRate": 0.8642,
-    "top3DuplicateRate": 0.098,
+    "recallAt3": 0.8235,
+    "recallAt5": 0.8431,
+    "mrrAt10": 0.6832,
+    "keyPointHitRate": 0.9012,
+    "top3DuplicateRate": 0.1373,
     "top3NearDuplicateRate": 0,
     "noHitQueryCount": 0,
     "falseRefusalCount": 0,
+    "protectedFalseRefusalCount": 0,
+    "protectedRecallAt3": 0.9459,
+    "protectedBm25OnlyRecallAt3": 0.9459,
     "rerank": {
-      "recallAt3": 0.8039,
-      "recallAt5": 0.8235,
-      "mrrAt10": 0.6967,
-      "keyPointHitRate": 0.8889,
-      "top1ChangedRate": 0.4118,
+      "recallAt3": 0.8431,
+      "recallAt5": 0.8431,
+      "mrrAt10": 0.7353,
+      "keyPointHitRate": 0.9012,
+      "top1ChangedRate": 0.4706,
       "missingPairs": 0,
       "top1LogitMedian": 0.9767,
       "byGroup": {
         "q": {
           "count": 25,
-          "recallAt3": 0.88,
-          "recallAt5": 0.88
+          "recallAt3": 0.96,
+          "recallAt5": 0.96
         },
         "s": {
           "count": 14,
           "recallAt3": 0.5714,
-          "recallAt5": 0.6429
+          "recallAt5": 0.5714
         },
         "m": {
           "count": 12,
@@ -48,13 +52,13 @@
       }
     },
     "negativeCount": 10,
-    "negativeRefusedCount": 4,
-    "negativeRefusalRate": 0.4,
+    "negativeRefusedCount": 5,
+    "negativeRefusalRate": 0.5,
     "byGroup": {
       "q": {
         "count": 25,
-        "recallAt3": 0.72,
-        "recallAt5": 0.88,
+        "recallAt3": 0.92,
+        "recallAt5": 0.92,
         "noHit": 0
       },
       "s": {

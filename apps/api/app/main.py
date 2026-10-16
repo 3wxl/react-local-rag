@@ -26,6 +26,7 @@ from .embedding.bge import get_embedder
 from .generation.factory import build_provider
 from .services.answer_service import AnswerService
 from .services.ingest_service import IngestService
+from .services.reindex_service import ReindexService
 from .services.retrieval_service import RetrievalService
 from .store import make_store
 
@@ -42,6 +43,13 @@ async def lifespan(app: FastAPI):
         ollama_base_url=settings.ollama_base_url,
     )
     retrieval = RetrievalService(store, embedder)
+    ingest = IngestService(
+        store,
+        embedder,
+        data_dir=settings.data_dir,
+        # 摄取完成后 BM25 缓存必须失效，否则检索到的还是旧语料
+        on_index_changed=lambda version=None: retrieval.invalidate(version),
+    )
     ctx = AppContext(
         settings=settings,
         store=store,
@@ -49,13 +57,8 @@ async def lifespan(app: FastAPI):
         provider=provider,
         retrieval=retrieval,
         answer=AnswerService(store, retrieval, embedder, provider),
-        ingest=IngestService(
-            store,
-            embedder,
-            data_dir=settings.data_dir,
-            # 摄取完成后 BM25 缓存必须失效，否则检索到的还是旧语料
-            on_index_changed=lambda version=None: retrieval.invalidate(version),
-        ),
+        ingest=ingest,
+        reindex=ReindexService(store, ingest),
     )
     app.state.ctx = ctx
     try:

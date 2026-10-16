@@ -18,6 +18,9 @@
  * 7. 拒答信号可用性诊断 —— 四路候选信号在「零误拒」前提下各能拒掉多少负样本。
  * 8. 向量路准入审计 —— hybrid recall@3 是被余弦准入线还是 MMR 重排拖低的
  *    （三种准入对比 + eval 口径下 λ 对 recall@3 的 q/m 分组影响）。
+ * 9. 查询扩展权重 × mmrLambda 联合扫描（M2）—— 扩展与 MMR 都在做"多样性"，
+ *    必须一起扫：λ=1.0 + 扩展开时 s 组 0.50，λ=0.9 时扩展的收益被 MMR 吃掉（s 0.36）。
+ *    当前默认值（mmrLambda=1.0、扩展权重 0.7、语义粗拒）就是这样定下来的。
  *
  * 设计原则（2026-10-02，方案 1）：检索侧只做粗滤，「文档未提及」的最终置信度裁决
  * 在答案侧由 verifyAnswer 的语义证据 + 词法证据 + 数字核查负责。
@@ -51,10 +54,12 @@ import {
   postProcessRetrieval,
   computeRefusalSignals,
   DEFAULT_RETRIEVAL_OPTIONS,
+  type QueryVariantScores,
   type RetrievalDoc,
 } from "../src/utils/retrieval";
 import {
   loadFixedEmbeddings,
+  loadFixedExpansions,
   findMissingChunkHashes,
   findMissingQueryIds,
 } from "./fixedEmbeddings";
@@ -185,6 +190,8 @@ interface RunOptions {
   bm25Weight?: number;
   /** 强制纯 BM25（忽略向量），用于 hybrid vs BM25-only 基线对比 */
   forceBm25?: boolean;
+  /** 查询扩展变体的 RRF 权重：undefined = 不开扩展，0 = 只抬拒答信号不参与排序 */
+  expansionWeight?: number;
   /**
    * 实时编码向量（绕过 fixedEmbeddings.json 固化文件）。
    * 用于 tune 扫 maxChunkTokens 时，对每个候选块大小动态生成对应向量，
@@ -252,6 +259,40 @@ function goldDocs(q: GoldenQuery, allDocs: string[]): Set<string> {
   return out;
 }
 
+/**
+ * 构造查询扩展变体（与 eval.ts 的 expansionRunsFor 同口径，读同一份固化产物）。
+ * weight === undefined 时返回 undefined（不开扩展）。
+ */
+function expansionRuns(
+  q: GoldenQuery,
+  bm25: BM25,
+  chunks: RetrievalDoc[],
+  fixed: ReturnType<typeof loadFixedEmbeddings>,
+  live: { chunkVectors: Record<string, number[]>; queryVectors: Record<string, number[]> } | undefined,
+  weight: number | undefined,
+): QueryVariantScores[] | undefined {
+  if (weight === undefined) return undefined;
+  const texts = loadFixedExpansions()?.[q.id] ?? [];
+  const vectors = fixed?.expansions?.[q.id] ?? [];
+  if (texts.length === 0 || vectors.length === 0) return undefined;
+  return texts.slice(0, vectors.length).map((text, i) => {
+    const qvec = vectors[i];
+    const vecScores =
+      chunks.length > 0
+        ? chunks.map((d) => {
+            const v = live?.chunkVectors[d.contentHash] ?? fixed!.chunks[d.contentHash];
+            return v ? dotProduct(Float32Array.from(qvec), Float32Array.from(v)) : 0;
+          })
+        : null;
+    return {
+      bm25Scores: bm25.scoreAll(text),
+      vecScores,
+      idfCoverage: bm25.idfWeightedCoverage(text),
+      weight,
+    };
+  });
+}
+
 function run(
   chunks: RetrievalDoc[],
   opts: RunOptions,
@@ -296,19 +337,22 @@ function run(
     const bm25Scores = bm25.scoreAll(q.question);
     // 与 eval.ts / worker 同口径：拒答信号 1 由同一份 BM25 统计算出
     const idfCoverage = bm25.idfWeightedCoverage(q.question);
-    const processed = postProcessRetrieval(chunks, bm25Scores, vecScores, {
-      topK,
-      ...DEFAULT_RETRIEVAL_OPTIONS,
-      ...retrievalOverrides,
-      idfCoverage,
-    });
+    const variants = expansionRuns(q, bm25, chunks, fixed, live, opts.expansionWeight);
+    const processed = postProcessRetrieval(
+      chunks,
+      bm25Scores,
+      vecScores,
+      { topK, ...DEFAULT_RETRIEVAL_OPTIONS, ...retrievalOverrides, idfCoverage },
+      variants,
+    );
     // MRR 与 eval.ts 同口径：同一条（可能降级的）管线、宽候选 top10 找首个相关块
-    const wide = postProcessRetrieval(chunks, bm25Scores, vecScores, {
-      topK: 10,
-      ...DEFAULT_RETRIEVAL_OPTIONS,
-      ...retrievalOverrides,
-      idfCoverage,
-    });
+    const wide = postProcessRetrieval(
+      chunks,
+      bm25Scores,
+      vecScores,
+      { topK: 10, ...DEFAULT_RETRIEVAL_OPTIONS, ...retrievalOverrides, idfCoverage },
+      variants,
+    );
     return { processed, wide };
   };
 
@@ -1414,6 +1458,98 @@ async function sweepSignalUsability(): Promise<void> {
   );
 }
 
+
+/**
+ * 9. 查询扩展权重 × mmrLambda 联合扫描（M2，2026-10-15）。
+ *
+ * 为什么这两件事必须一起扫：查询扩展与 MMR 做的是**同一件事** ——
+ * 让 top-k 别挤在一个主题上（前者靠"多问几种说法"，后者靠"惩罚相似结果"）。
+ * 两者同时开就是双重惩罚：实测 λ=0.9 时扩展把 s 组从 0.214 压回 0.143，
+ * 而 λ=1.0（关掉 MMR）时扩展的收益才释放出来（s 0.143 → 0.50）。
+ *
+ * 报告口径：s 组单独列出。run() 的调参口径只含 q+m（见文件头说明），
+ * 而这一段的结论恰恰是为 s 组服务的 —— 所以这里对 s 组单独跑同一条管线。
+ */
+function sGroupStats(
+  chunks: RetrievalDoc[],
+  bm25: BM25,
+  opts: RunOptions,
+): { r3: number; refused: number; n: number } {
+  const fixed = loadFixedEmbeddings();
+  let r3 = 0;
+  let refused = 0;
+  for (const q of semanticQueries) {
+    const qvec = fixed?.queries[q.id];
+    const vecScores =
+      qvec && fixed
+        ? chunks.map((d) => {
+            const v = fixed.chunks[d.contentHash];
+            return v ? dotProduct(Float32Array.from(qvec), Float32Array.from(v)) : 0;
+          })
+        : null;
+    const variants = expansionRuns(q, bm25, chunks, fixed, undefined, opts.expansionWeight);
+    const result = postProcessRetrieval(
+      chunks,
+      bm25.scoreAll(q.question),
+      vecScores,
+      {
+        topK: 5,
+        ...DEFAULT_RETRIEVAL_OPTIONS,
+        ...(opts.mmrLambda !== undefined ? { mmrLambda: opts.mmrLambda } : {}),
+        idfCoverage: bm25.idfWeightedCoverage(q.question),
+      },
+      variants,
+    );
+    if (result.noRelevantHit) refused++;
+    const relevant = q.relevant ?? [];
+    if (relevant.length > 0) {
+      r3 +=
+        relevant.filter((key) => result.hits.slice(0, 3).some((h) => h.content.includes(key)))
+          .length / relevant.length;
+    }
+  }
+  return { r3: semanticQueries.length === 0 ? 0 : r3 / semanticQueries.length, refused, n: semanticQueries.length };
+}
+
+function sweepExpansionWeight(): void {
+  console.log("\n===== 9. 查询扩展权重 × mmrLambda（M2）=====");
+  console.log(
+    "看分组 recall@3（q/s/m）与负样本拒答数。权重 0 = 只抬拒答信号、不参与排序（相当于只做否决权的扩展）。",
+  );
+  if (!loadFixedExpansions()) {
+    console.log("  [跳过] 没有 packages/eval/expansions.json（先跑 npm run gen:expansions）");
+    return;
+  }
+  const chunks = buildCorpus(DEFAULT_CHUNK_OPTIONS.maxChunkTokens);
+  const bm25 = new BM25(chunks.map((c) => c.content));
+  const w = [12, 6, 8, 8, 8, 10, 10];
+  printRow(["扩展权重", "λ", "q r3", "s r3", "s 被拒", "m r3", "负样本拒", "合计 r3"], w);
+
+  for (const lambda of [0.9, 1.0]) {
+    for (const weight of [undefined, 0, 0.5, 0.7, 1.0]) {
+      const m = run(chunks, { expansionWeight: weight, mmrLambda: lambda }, bm25);
+      const sStats = sGroupStats(chunks, bm25, { expansionWeight: weight, mmrLambda: lambda });
+      printRow(
+        [
+          weight === undefined ? "不开" : weight.toFixed(1),
+          lambda.toFixed(1),
+          pct(m.byGroup.single.r3),
+          pct(sStats.r3),
+          `${sStats.refused}/${sStats.n}`,
+          pct(m.byGroup.multi.r3),
+          pct(m.negativeRefusalRate),
+          pct(m.recallAt3),
+        ],
+        w,
+      );
+    }
+  }
+  console.log(
+    "  读法：λ=1.0（关 MMR）+ 扩展开 才同时拿到 q 高、s 高、m 不掉；" +
+      "λ=0.9 时扩展几乎全被 MMR 的多样性惩罚吃掉。",
+  );
+}
+
 async function main(): Promise<void> {
   const qCount = posQueries.filter((q) => q.type !== "multi_subject_single_doc").length;
   const mCount = posQueries.filter((q) => q.type === "multi_subject_single_doc").length;
@@ -1434,7 +1570,8 @@ async function main(): Promise<void> {
   );
 
   // 快速开关：--only=N 只跑第 N 段（都不加载模型，秒级）：
-  // 2 = RRF 权重×k 扫描，4 = mmrLambda 扫描，7 = 拒答信号诊断，8 = 向量路准入审计。
+  // 2 = RRF 权重×k 扫描，4 = mmrLambda 扫描，7 = 拒答信号诊断，8 = 向量路准入审计，
+  // 9 = 查询扩展权重 × mmrLambda 联合扫描。
   const only =
     process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length) ?? null;
   if (only === "7") {
@@ -1443,6 +1580,10 @@ async function main(): Promise<void> {
   }
   if (only === "2") {
     sweepRrfWeights();
+    return;
+  }
+  if (only === "9") {
+    sweepExpansionWeight();
     return;
   }
   if (only === "4") {

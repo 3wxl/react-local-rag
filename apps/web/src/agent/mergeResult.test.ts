@@ -10,6 +10,11 @@ function fakeVerification(): VerificationResult {
     checkedAt: Date.now(),
     source: "semantic",
     scopedChunkCount: 0,
+    convergence: {
+      uncitedClaims: 0,
+      outOfRangeClaims: 0,
+      citationsSubsetOfPassages: true,
+    },
   };
 }
 

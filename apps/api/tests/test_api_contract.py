@@ -70,7 +70,14 @@ def test_retrieve_shape_and_invariants(client: TestClient) -> None:
     assert body["query_id"].startswith("qry_")
     assert body["rewritten_query"] is None  # 未开启改写
     assert "no_relevant_hit" in body
-    assert set(body["refusal_signals"]) == {"idf_coverage", "top_relevance"}
+    # 多信号融合拒答的四路取值都必须回传：拒答要能归因到具体信号（2026-10-15 起）
+    assert set(body["refusal_signals"]) == {
+        "idf_coverage",
+        "top_relevance",
+        "max_cosine",
+        "cos_gap",
+        "max_bm25",
+    }
     if not body["no_relevant_hit"]:
         hit = body["hits"][0]
         # 契约 §0.1 的字段一个都不能少（前端按这些字段渲染引用卡片）

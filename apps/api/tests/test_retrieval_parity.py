@@ -20,6 +20,7 @@ from app.parity.eval_corpus import normalize_markdown_for_eval
 from app.parity.retrieval import (
     DEFAULT_RETRIEVAL_OPTIONS,
     RetrievalDoc,
+    compute_refusal_signals,
     dot_product,
     post_process_retrieval,
     to_float32,
@@ -100,6 +101,43 @@ def test_bm25_scores_match_ts(docs, golden, fixed_embeddings) -> None:
             assert py_score == pytest.approx(ts_score, abs=1e-6), (
                 f"{ts_query['id']} 第 {i} 块 BM25 分不一致：PY={py_score} TS={ts_score}"
             )
+
+
+@requires_node
+def test_refusal_signals_match_ts(docs, golden, fixed_embeddings) -> None:
+    """查询级拒答信号（idf 覆盖率 / 最高余弦 / 余弦对比度 / BM25 最高分）逐位比对。
+
+    只比 noRelevantHit 不够：两端阈值算出来略有差异也照样"看起来一致"，
+    直到某个边界样本翻转才暴露。信号取值本身必须同口径 —— 它们是融合拒答的输入。
+    """
+    dump = run_parity_dump("retrieval", timeout=900)
+    bm25 = BM25([d.content for d in docs])
+
+    checked = 0
+    for ts_query in dump["retrieval"]["queries"]:
+        question = ts_query["question"]
+        bm25_scores = bm25.score_all(question)
+        vec_scores = vec_scores_for(docs, ts_query["id"], fixed_embeddings)
+        signals = compute_refusal_signals(bm25_scores, vec_scores)
+        expected = ts_query["refusalSignals"]
+
+        assert bm25.idf_weighted_coverage(question) == pytest.approx(
+            expected["idfCoverage"], abs=SCORE_TOL
+        ), f"{ts_query['id']}: IDF 覆盖率不一致"
+        for py_value, ts_key in (
+            (signals.max_cosine, "maxCosine"),
+            (signals.cos_gap, "cosGap"),
+            (signals.max_bm25, "maxBm25"),
+        ):
+            ts_value = expected[ts_key]
+            if ts_value is None:
+                assert py_value is None, f"{ts_query['id']}: {ts_key} 应为空"
+            else:
+                assert py_value == pytest.approx(ts_value, abs=1e-9), (
+                    f"{ts_query['id']}: {ts_key} 不一致 PY={py_value} TS={ts_value}"
+                )
+        checked += 1
+    assert checked > 0, "没有比对任何信号：dump 结构可能变了"
 
 
 @requires_node

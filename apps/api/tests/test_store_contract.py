@@ -57,11 +57,18 @@ async def ready_store(store):
     await store.close()
 
 
-def _chunk(ordinal: int, doc_id: str, seed: int) -> ChunkRecord:
+def _chunk(
+    ordinal: int, doc_id: str, seed: int, *, version: str = VERSION, tag: str = ""
+) -> ChunkRecord:
+    """构造一条块记录。
+
+    chunk_id 全局唯一（真实切块每次都是新 UUID），所以换版本重切时要换 id ——
+    复用同一个 id 会撞 chunk_id 主键，那是**测试夹具**的问题，不是生产路径的问题。
+    """
     return ChunkRecord(
-        chunk_id=f"{doc_id}-c{ordinal}",
+        chunk_id=f"{doc_id}-c{ordinal}{tag}",
         doc_id=doc_id,
-        index_version=VERSION,
+        index_version=version,
         ord=ordinal,
         content=f"第 {ordinal} 块内容 {seed}",
         content_hash=f"{seed:08x}",
@@ -86,7 +93,7 @@ async def _seed_document(store, doc_id: str, count: int = 3) -> None:
         )
     )
     await store.replace_doc_chunks(
-        doc_id, [_chunk(i, doc_id, seed=ord(doc_id[0]) + i) for i in range(count)]
+        doc_id, VERSION, [_chunk(i, doc_id, seed=ord(doc_id[0]) + i) for i in range(count)]
     )
 
 
@@ -240,3 +247,147 @@ async def test_task_state_table(ready_store) -> None:
     assert task is not None and task.status == "running" and task.progress["total"] == 3
     with pytest.raises(ValueError):
         await ready_store.update_task("tsk_1", nope=1)
+
+
+# ---------------- 增量索引与灰度（M2） ----------------
+
+
+@pytest.mark.asyncio
+async def test_chunk_replacement_is_version_scoped(ready_store) -> None:
+    """灰度重建期间，写新版本**不能**动到在服务的旧版本。"""
+    await _seed_document(ready_store, "alpha")
+    await ready_store.upsert_version(
+        IndexVersionRecord(
+            version="v2",
+            state="building",
+            chunk_params={},
+            embedding_model="m",
+            prefix_scheme="p",
+        )
+    )
+    await ready_store.replace_doc_chunks(
+        "alpha", "v2", [_chunk(0, "alpha", seed=999, version="v2", tag="-v2")]
+    )
+    assert len(await ready_store.load_chunks(VERSION)) == 3, "旧版本的块必须原样保留"
+    assert len(await ready_store.load_chunks("v2")) == 1
+
+
+@pytest.mark.asyncio
+async def test_vector_cache_reuse_keyed_by_hash_and_model(ready_store) -> None:
+    vec = np.linspace(-1, 1, 512, dtype=np.float32)
+    await ready_store.put_cached_vectors(
+        [("hash-a", vec)], embedding_model="m1", prefix_scheme="p1"
+    )
+    hit = await ready_store.load_cached_vectors(
+        ["hash-a", "hash-missing"], embedding_model="m1", prefix_scheme="p1"
+    )
+    assert list(hit) == ["hash-a"]
+    assert np.array_equal(hit["hash-a"], vec), "缓存往返必须逐位相等"
+
+    # 换模型或换前缀 → 缓存自动失效（不靠手工清理）
+    assert (
+        await ready_store.load_cached_vectors(
+            ["hash-a"], embedding_model="m2", prefix_scheme="p1"
+        )
+        == {}
+    )
+    assert (
+        await ready_store.load_cached_vectors(
+            ["hash-a"], embedding_model="m1", prefix_scheme="p2"
+        )
+        == {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_gc_only_removes_non_ready_versions(ready_store) -> None:
+    await _seed_document(ready_store, "alpha")
+    await ready_store.activate_version(VERSION)
+    with pytest.raises(ValueError):
+        await ready_store.gc_version(VERSION)  # ready 版本还在服务，拒绝 GC
+
+    await ready_store.upsert_version(
+        IndexVersionRecord(
+            version="old",
+            state="building",
+            chunk_params={},
+            embedding_model="m",
+            prefix_scheme="p",
+        )
+    )
+    await ready_store.replace_doc_chunks(
+        "alpha", "old", [_chunk(0, "alpha", seed=7, version="old", tag="-old")]
+    )
+    await ready_store.activate_version("old")  # VERSION 转 stale
+    removed = await ready_store.gc_version(VERSION)
+    assert removed == 3
+    assert await ready_store.load_chunks(VERSION) == []
+
+
+# ---------------- ACL：召回层过滤（两种后端必须一致） ----------------
+
+
+@pytest.mark.asyncio
+async def test_acl_filter_applies_in_recall(ready_store) -> None:
+    """租户/密级/部门在**召回层**生效：过滤与打分同一条 SQL，不是取回后再筛。"""
+    await ready_store.upsert_document(
+        DocumentRecord(
+            doc_id="v",
+            doc_name="v.md",
+            content_hash="hv",
+            index_version=VERSION,
+            tenant_id="t1",
+            department="",
+            classification=0,
+        )
+    )
+    await ready_store.upsert_document(
+        DocumentRecord(
+            doc_id="s",
+            doc_name="s.md",
+            content_hash="hs",
+            index_version=VERSION,
+            tenant_id="t1",
+            department="eng",
+            classification=2,
+        )
+    )
+    await ready_store.replace_doc_chunks(
+        "v", VERSION, [_chunk(0, "v", seed=1)]
+    )
+    await ready_store.replace_doc_chunks(
+        "s", VERSION, [_chunk(0, "s", seed=2)]
+    )
+    await ready_store.upsert_document(
+        DocumentRecord(
+            doc_id="t2",
+            doc_name="t2.md",
+            content_hash="h2",
+            index_version=VERSION,
+            tenant_id="t2",
+        )
+    )
+    await ready_store.replace_doc_chunks("t2", VERSION, [_chunk(0, "t2", seed=3)])
+
+    vec = np.ones(512, dtype=np.float32)
+    await ready_store.put_vectors(
+        VERSION, [(c.chunk_id, vec) for c in await ready_store.load_chunks(VERSION)]
+    )
+
+    # 低密级 + 无部门限制：看不到机密文档
+    low = await ready_store.load_chunks(
+        VERSION, filters=Filters(tenant_id="t1", max_classification=1)
+    )
+    assert {c.doc_id for c in low} == {"v"}
+
+    # 跨租户：命中数与向量检索都为空
+    other = await ready_store.load_chunks(VERSION, filters=Filters(tenant_id="t9"))
+    assert other == []
+    assert await ready_store.cosine_all(VERSION, vec, filters=Filters(tenant_id="t9")) == []
+
+    # 部门过滤：本部门 + 全员可见
+    eng = await ready_store.load_chunks(
+        VERSION,
+        filters=Filters(tenant_id="t1", max_classification=2, departments=("eng",)),
+    )
+    assert {c.doc_id for c in eng} == {"v", "s"}

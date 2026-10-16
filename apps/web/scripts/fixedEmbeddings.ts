@@ -24,6 +24,7 @@ import { DEFAULT_CHUNK_OPTIONS, EMBEDDING_MODEL_NAME } from "../src/utils/chunk"
 import { EVAL_DIR } from "./evalDir";
 
 /** 与 packages/eval/ 下其他评测数据同处一地（构建机生成后提交） */
+const EXPANSIONS_PATH = join(EVAL_DIR, "expansions.json");
 const EMBEDDINGS_PATH = join(EVAL_DIR, "embeddings.json");
 
 export interface FixedEmbeddings {
@@ -38,6 +39,8 @@ export interface FixedEmbeddings {
   chunks: Record<string, number[]>;
   /** 查询 id -> 向量 */
   queries: Record<string, number[]>;
+  /** 查询 id -> 各条术语化改写的向量（顺序与 expansions.json 一致；无扩展时缺省） */
+  expansions?: Record<string, number[][]>;
 }
 
 let cached: FixedEmbeddings | null = null;
@@ -55,6 +58,23 @@ export function loadFixedEmbeddings(): FixedEmbeddings | null {
     cached = null;
   }
   return cached;
+}
+
+/**
+ * 读取查询扩展的固化产物（packages/eval/expansions.json）。
+ * 不存在返回 null：没做扩展时检索就是单查询路径（行为与引入扩展前一致）。
+ */
+export function loadFixedExpansions(): Record<string, string[]> | null {
+  if (!existsSync(EXPANSIONS_PATH)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(EXPANSIONS_PATH, "utf8")) as {
+      expansions: Record<string, string[]>;
+    };
+    return raw.expansions ?? null;
+  } catch (err) {
+    console.error(`[warn] 读取查询扩展失败，按无扩展处理：${String(err)}`);
+    return null;
+  }
 }
 
 /** 是否具备向量路（决定指标是 hybrid 还是 bm25-only） */

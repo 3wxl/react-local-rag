@@ -72,7 +72,18 @@ class VerifiedSentence:
     unknown_numbers: list[str] = field(default_factory=list)
     citations: list[int] = field(default_factory=list)
     invalid_citations: list[int] = field(default_factory=list)
+    #: 主张句但没有**有效**角标（"根本没引"，区别于 invalid_citations 的"引错了"）
+    uncited: bool = False
     trivial: bool = False
+
+
+@dataclass
+class CitationConvergence:
+    """引用闭环收敛情况（逐句角标 → 越界检测 → 证据收敛）。"""
+
+    uncited_claims: int = 0
+    out_of_range_claims: int = 0
+    citations_subset_of_passages: bool = True
 
 
 @dataclass
@@ -81,6 +92,7 @@ class VerificationResult:
     sentences: list[VerifiedSentence]
     source: str  # semantic | lexical
     scoped_chunk_count: int = 0
+    convergence: CitationConvergence = field(default_factory=CitationConvergence)
 
 
 # ---------------- 打分与裁决 ----------------
@@ -93,11 +105,13 @@ def compute_sentence_score(
     *,
     fabricated_number: bool = False,
     dangling_citation: bool = False,
+    uncited_claim: bool = False,
 ) -> float:
-    """单句依据分（两个硬信号力度不同，见 TS 注释）。
+    """单句依据分（三个硬信号力度不同，见 TS 注释）。
 
     - 数字捏造且语义依据不强（<0.6）→ 压到 weak 之下（判 unsupported，红色告警）
     - 编造引用 → 一律封顶到 weak（黄色告警）：句子本身可能真，但角标对不上原文
+    - 无角标主张句 → 同样封顶到 weak：句子可能完全为真，但**无法回跳核对**
     """
     score = (
         semantic * thresholds.sem_weight + lexical * thresholds.lex_weight
@@ -107,6 +121,8 @@ def compute_sentence_score(
     if fabricated_number and (semantic is None or semantic < 0.6):
         score = min(score, thresholds.weak - 0.01)
     if dangling_citation:
+        score = min(score, thresholds.weak)
+    if uncited_claim:
         score = min(score, thresholds.weak)
     return score
 
@@ -133,15 +149,64 @@ def strip_think_tags(text: str) -> str:
     return js_trim(out.replace(open_tag, "").replace(close_tag, ""))
 
 
-def parse_citations(text: str) -> list[int]:
-    """解析句子中的引用编号（去重升序）。"""
+def _scan_citations(text: str, minimum: int) -> list[int]:
+    """扫描角标编号：minimum=1 只取合法编号；minimum=0 连 [0] 一起取（越界检测用）。"""
     out: set[int] = set()
     for m in _CITATION_RE.finditer(text):
         for part in re.split(r"[,，]", m.group(1)):
             n = int(part.strip())
-            if n > 0:
+            if n >= minimum:
                 out.add(n)
     return sorted(out)
+
+
+def parse_citations(text: str) -> list[int]:
+    """解析句子中的引用编号（去重升序）。"""
+    return _scan_citations(text, 1)
+
+
+def parse_all_citations(text: str) -> list[int]:
+    """解析**全部**角标编号（含 [0] 这类永远不合法的编号）。
+
+    旧实现用 `n > 0` 过滤，`[0]` 被静默丢弃当作"无引用"，随后走 fallback 范围
+    比语义分 —— 反而最容易判成 supported。编造引用不能因为编号难看就装作没看见。
+    """
+    return _scan_citations(text, 0)
+
+
+def should_refuse(result: VerificationResult) -> bool:
+    """拒答裁决（答案侧细拒，M2）——与 TS shouldRefuse 同一套规则。
+
+    职责划分：检索侧只做**粗拒**（明显的无关查询），「文档里有没有这件事」的细判归这里，
+    依据是逐句证据（语义 + 词法 + 数字核查）。三条判据：
+    1. verdict == "refused"：模型自己按指令拒答，合规
+    2. verdict == "unsupported"：全部主张句都无依据
+    3. source == "lexical" 且 verdict != "supported"：只剩词法证据时宁严勿宽
+
+    刻意**不**因为 partial 就拒答：部分句子弱依据（含"无角标"这类格式问题）
+    不等于答案无价值，那属于 UI 告警层。拒答越激进，正样本误拒越多。
+    """
+    if result.verdict == "refused":
+        return True
+    if result.verdict == "unsupported":
+        return True
+    if result.source == "lexical" and result.verdict != "supported":
+        return True
+    return False
+
+
+def summarize_verdict(sentences: Sequence[VerifiedSentence]) -> VerifyVerdict:
+    """整体裁决（只统计主张句）——与 TS summarizeVerdict 同一套聚合规则。"""
+    claims = [s for s in sentences if not s.trivial]
+    if not claims:
+        return "supported"
+    unsupported = [s for s in claims if s.level == "unsupported"]
+    weak = [s for s in claims if s.level == "weak"]
+    if len(unsupported) == len(claims):
+        return "unsupported"
+    if unsupported or weak:
+        return "partial"
+    return "supported"
 
 
 # ---------------- 词法层 ----------------
@@ -239,6 +304,18 @@ def build_refusal_result(answer: str) -> VerificationResult:
     )
 
 
+def is_invalid_citation(n: int, passage_indexes: set[int], has_passages: bool) -> bool:
+    """引用编号合法性判据（**集合判定**，不是"≤ 最大值"）。
+
+    旧实现用 `c > max_passage_index` 判越界，有两个洞：`[0]` 被 parse_citations 的
+    `n > 0` 提前吞掉（永远检测不到）；编号段不连续时（1,3）引用中间的 [2] 会被当成合法。
+    passages 为空（旧调用：没有编号可引）时沿用旧口径（正编号一律视为越界），行为不变。
+    """
+    if not has_passages:
+        return n > 0
+    return n <= 0 or n not in passage_indexes
+
+
 def verify_answer(
     answer: str,
     context_text: str,
@@ -246,6 +323,7 @@ def verify_answer(
     passages: Sequence[VerifyPassage] = (),
     thresholds: VerifyThresholds = DEFAULT_VERIFY_THRESHOLDS,
     semantic_scorer: Callable[[list[str], list[str] | None], list[float]] | None = None,
+    require_citation: bool = True,
 ) -> VerificationResult:
     """对模型最终答案做事后校验。
 
@@ -254,8 +332,10 @@ def verify_answer(
     @param passages 编号段落表（语义范围收敛）；为空则对全文上下文校验
     @param semantic_scorer 语义打分回调 (sentences, scope_chunk_ids) -> 每句最大余弦；
                             为 None 或抛错时降级纯词法（对应 TS 里 worker 不可用）
+    @param require_citation 是否强制逐句角标（默认 True；仅在提供 passages 时生效）。False 只用于对照测量
     """
-    max_passage_index = max((p.index for p in passages), default=0)
+    has_passages = len(passages) > 0
+    passage_indexes = {p.index for p in passages}
     segments = split_sentences(answer)
 
     # 模型按指令拒答：答案短且含拒答短语，判为合规，不算幻觉
@@ -274,9 +354,25 @@ def verify_answer(
 
     # 只把主张句送进语义比对，保持顺序对齐
     claim_flags = [is_claim_sentence(s) for s in segments]
+    # citations 保持"正编号"语义（契约不变）；越界检测另用含 [0] 的全量扫描
     cited_per_sentence = [parse_citations(s) for s in segments]
     invalid_per_sentence = [
-        [c for c in cs if c > max_passage_index] for cs in cited_per_sentence
+        [
+            c
+            for c in parse_all_citations(text)
+            if is_invalid_citation(c, passage_indexes, has_passages)
+        ]
+        for text in segments
+    ]
+    # 有编号段落表时，主张句必须带**有效**角标（引用强制闭环）
+    require = has_passages and require_citation
+    uncited_per_sentence = [
+        bool(
+            require
+            and claim_flags[idx]
+            and not any(c in passage_indexes for c in cited_per_sentence[idx])
+        )
+        for idx in range(len(segments))
     ]
 
     context_tokens = tokenize_set(context_text)
@@ -284,7 +380,7 @@ def verify_answer(
 
     # 按「引用范围」分组：同一范围的句子合并成一次打分调用
     def scope_key(citations: list[int]) -> str:
-        if not passages:
+        if not has_passages:
             return "all"
         if not citations:
             return "fallback"
@@ -295,7 +391,7 @@ def verify_answer(
         if not claim_flags[idx]:
             continue
         # 越界引用不参与范围计算（视为无引用，走 fallback 范围）
-        valid = [c for c in cited_per_sentence[idx] if c <= max_passage_index]
+        valid = [c for c in cited_per_sentence[idx] if c in passage_indexes]
         key = scope_key(valid)
         scope = _scope_for(valid, passages)
         if key in groups:
@@ -347,6 +443,7 @@ def verify_answer(
             thresholds,
             fabricated_number=bool(unknown_numbers),
             dangling_citation=bool(invalid_per_sentence[idx]),
+            uncited_claim=uncited_per_sentence[idx],
         )
         sentences.append(
             VerifiedSentence(
@@ -358,26 +455,24 @@ def verify_answer(
                 unknown_numbers=unknown_numbers,
                 citations=cited_per_sentence[idx],
                 invalid_citations=invalid_per_sentence[idx],
+                uncited=uncited_per_sentence[idx],
                 trivial=False,
             )
         )
 
-    # 整体裁决（只统计主张句）
     claims = [s for s in sentences if not s.trivial]
-    unsupported = [s for s in claims if s.level == "unsupported"]
-    weak = [s for s in claims if s.level == "weak"]
-    if not claims:
-        verdict = "supported"
-    elif len(unsupported) == len(claims):
-        verdict = "unsupported"
-    elif unsupported or weak:
-        verdict = "partial"
-    else:
-        verdict = "supported"
+    out_of_range_claims = sum(1 for s in claims if s.invalid_citations)
+    convergence = CitationConvergence(
+        uncited_claims=sum(1 for s in claims if s.uncited),
+        out_of_range_claims=out_of_range_claims,
+        # 收敛判据：不存在任何越界角标（每个引用编号都能在编号段落表里找到）
+        citations_subset_of_passages=out_of_range_claims == 0,
+    )
 
     return VerificationResult(
-        verdict=verdict,
+        verdict=summarize_verdict(sentences),
         sentences=sentences,
         source=source,
         scoped_chunk_count=scoped_chunk_count,
+        convergence=convergence,
     )

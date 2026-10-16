@@ -18,6 +18,7 @@ from ..embedding.bge import BgeOnnxEmbedder
 from ..generation.base import LlmProvider
 from ..services.answer_service import AnswerService
 from ..services.ingest_service import IngestService
+from ..services.reindex_service import ReindexService
 from ..services.retrieval_service import RetrievalService
 from ..store import Store
 
@@ -33,6 +34,8 @@ class AppContext:
     retrieval: RetrievalService
     answer: AnswerService
     ingest: IngestService
+    #: 索引灰度重建（进程内任务，断点写 tasks 表）
+    reindex: ReindexService
     #: 进程内任务（评测 / 摄取）：不引队列框架，状态写 tasks 表
     tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 

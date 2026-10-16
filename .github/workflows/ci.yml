@@ -42,6 +42,15 @@ jobs:
       - name: Verify component P/R
         run: npm run eval:verify -- --check
 
+      # 答案侧拒答裁决的 P/R（读固化现场，无模型依赖）——
+      # 「拒答 ≥0.60 且正样本误拒 = 0」这条 M2 验收的口径就在这个脚本里
+      - name: Refusal adjudication P/R
+        run: npm run eval:verdict -- --check
+
+      # 自一致性（读固化采样，无模型依赖）
+      - name: Self-consistency
+        run: npm run eval:consistency -- --check
+
   api:
     runs-on: ubuntu-latest
     steps:

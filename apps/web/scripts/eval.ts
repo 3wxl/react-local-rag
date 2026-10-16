@@ -30,10 +30,12 @@ import {
   dotProduct,
   postProcessRetrieval,
   DEFAULT_RETRIEVAL_OPTIONS,
+  type QueryVariantScores,
   type RetrievalDoc,
 } from "../src/utils/retrieval";
 import {
   loadFixedEmbeddings,
+  loadFixedExpansions,
   hasFixedEmbeddings,
   assertEmbeddingsConsistent,
 } from "./fixedEmbeddings";
@@ -279,31 +281,74 @@ function evaluate(golden: Golden, chunks: RetrievalDoc[], topK: number): {
   let nearDupQueries = 0;
   const perQuery: unknown[] = [];
 
+  /**
+   * 查询扩展：把固化的改写变成检索管线的额外路。
+   *
+   * 权重默认 0.7（见 queryExpansion.buildQueryVariants 的注释）；
+   * 评测与线上必须用同一个默认值 —— 否则测的是另一套配置（口径纪律）。
+   * `EXPANSION_WEIGHT` 环境变量只用于 tune 扫描，不改变默认行为。
+   */
+  const expansionWeight = Number(process.env.EXPANSION_WEIGHT ?? "") || 0.7;
+  const fixed = loadFixedEmbeddings();
+  const expansions = loadFixedExpansions();
+  const expansionRunsFor = (q: GoldenQuery): QueryVariantScores[] => {
+    const vectors = fixed?.expansions?.[q.id];
+    if (!vectors || vectors.length === 0) return [];
+    return vectors.map((vec, i) => {
+      const text = expansions?.[q.id]?.[i] ?? "";
+      return {
+        bm25Scores: bm25.scoreAll(text),
+        vecScores: chunks.map((c) => {
+          const cv = fixed?.chunks[c.contentHash];
+          return cv ? dotProduct(Float32Array.from(vec), Float32Array.from(cv)) : 0;
+        }),
+        idfCoverage: bm25.idfWeightedCoverage(text),
+        weight: expansionWeight,
+      };
+    });
+  };
+
   const runQuery = (
     q: GoldenQuery,
     overrides: Partial<typeof DEFAULT_RETRIEVAL_OPTIONS> = {},
     /** true = 强制关掉向量路，用于算 BM25-only 基线（相对门槛的分母） */
     vecDisabled = false,
+    /** false = 只用原查询（用于量"扩展开 vs 未扩展开"这条相对门槛） */
+    withExpansions = true,
   ) => {
     const bm25Scores = bm25.scoreAll(q.question);
     const vecScores = vecDisabled ? null : computeVectorScores(chunks, q.id);
     // 拒答信号 1：IDF 加权覆盖率必须在评测里也算出来，否则评测与线上口径不一致
     const idfCoverage = bm25.idfWeightedCoverage(q.question);
-    const result = postProcessRetrieval(chunks, bm25Scores, vecScores, {
-      topK,
-      ...DEFAULT_RETRIEVAL_OPTIONS,
-      ...overrides,
-      idfCoverage,
-    });
+    const variants =
+      withExpansions && !vecDisabled ? expansionRunsFor(q) : undefined;
+    const result = postProcessRetrieval(
+      chunks,
+      bm25Scores,
+      vecScores,
+      {
+        topK,
+        ...DEFAULT_RETRIEVAL_OPTIONS,
+        ...overrides,
+        idfCoverage,
+      },
+      variants,
+    );
     // MRR 与正式指标必须走**同一条 hybrid 管线**，只把候选放宽到 top10
     // （避免 topK=5 截断把第 6~10 名的相关块算成 0）。
     // 旧实现这里传 vecScores=null 退回纯 BM25，导致 MRR 与 recall 口径不一致。
-    const wide = postProcessRetrieval(chunks, bm25Scores, vecScores, {
-      topK: 10,
-      ...DEFAULT_RETRIEVAL_OPTIONS,
-      ...overrides,
-      idfCoverage,
-    });
+    const wide = postProcessRetrieval(
+      chunks,
+      bm25Scores,
+      vecScores,
+      {
+        topK: 10,
+        ...DEFAULT_RETRIEVAL_OPTIONS,
+        ...overrides,
+        idfCoverage,
+      },
+      variants,
+    );
     return { result, wide };
   };
 
@@ -847,36 +892,20 @@ function main(): void {
    * q 0.92→0.72、s 0.29→0.50、m 1.0→1.0：技术措辞组因近义块被 MMR 降权而下降，
    * 口语化组反而明显受益（相似块不再挤占 top3）。门槛按新实测值重取（各留 ~0.04 余量）。
    *
-   * 2026-10-15 再取：把 mmrLambda 从 0.7 提到 0.9（旧 0.7 同样出自 MMR 失效的扫描，
-   * 见 retrieval.ts 的 mmrLambda 注释），q 组从 0.72 回到 0.88、m 组维持 1.0。
-   * q 门槛随之收紧到 0.84（实测 0.88 往下留 0.04）—— 否则 0.68 这条旧门会放过
-   * 最大 20 个点的真实退化。
+   * 2026-10-15 终取：检索侧改为**语义粗拒**（词表信号降为提示）+ 查询扩展 + 关闭 MMR
+   * （依据见 retrieval.ts 的 mmrLambda / minMaxCosine 注释）。三组实测
+   * q 0.92 / s 0.50 / m 1.00，s 组从 0.07 回到 0.50 —— 路线图 M2 的「口语化 ≥0.50」达成，
+   * 因此 s 恢复为**执行项**（此前的观察项处理已删除）。
    */
   const BY_GROUP_GATE: Record<string, number> = {
-    q: 0.84, // 技术措辞：实测 0.88（2026-10-15，mmrLambda=0.9）
-    s: 0.45, //  口语化：实测 0.50（2026-10-12）；**2026-10-15 起降为观察项**（见下）
+    q: 0.88, // 技术措辞：实测 0.92（2026-10-15，语义粗拒 + 查询扩展 + MMR 关）
+    s: 0.45, // 口语化：实测 0.50（2026-10-15，同上）—— 路线图目标 0.50 达成，门槛留 0.05 余量
     m: 0.9, //  单文档多主题：跨块合并/多窗口是设计目标，必须高命中（实测 1.0）
   };
   for (const [g, min] of Object.entries(BY_GROUP_GATE)) {
     const v = metrics.byGroup[g];
     if (!v) {
       failed.push(`缺少分组 ${g}`);
-      continue;
-    }
-    /*
-     * s（口语化难例）**只观察、不计门槛**。
-     *
-     * 2026-10-15 起检索侧启用多信号融合拒答（默认保护调参口径 q+m），
-     * s 的部分样本会被粗拒 —— 被拒的 s 贡献 0 覆盖，会同时压低 recall@3 与拉高 noHit。
-     * 这是「拒答 ≥0.60」的已知代价：按调参口径，检索侧只保证 q+m 零误拒，
-     * s 的「文档未提及」交给答案侧 verifyAnswer 裁决。
-     * 若把 s 也设成门槛，等于要求拒答能力提升与 s 零误拒同时成立 —— 实测下不可能（上限 50%）。
-     */
-    if (g === "s") {
-      console.log(
-        `[note] s 组观察：recall@3=${v.recallAt3}（参考线 ${min}，不计门槛）、` +
-          `被拒 ${v.noHit}/${v.count} 条（调参口径下检索侧不保护 s）`,
-      );
       continue;
     }
     if (v.recallAt3 < min) failed.push(`${g}.recall@3<${min}`);
@@ -920,10 +949,11 @@ function main(): void {
      * 实测当前 9/10，留 3 条余量 —— 既能在融合拒答真的塌掉时变红
      * （把融合信号关掉会退化为 4/10 → 红），也不会因个别样本抖动误报。
      *
-     * 取值依据与日期：2026-10-15，融合拒答下实测 9/10，门槛取 6/10。
+     * 取值依据与日期：2026-10-15，语义粗拒下实测 5/10，门槛取 4/10；
+     * **最终拒答能力以 `npm run eval:verdict` 为准**（那里是检索+答案合计口径）。
      */
     const minGates: Gate[] = [
-      ["negativeRefusedCount", metrics.negativeRefusedCount, 6],
+      ["negativeRefusedCount", metrics.negativeRefusedCount, 4],
     ];
     for (const [name, actual, min] of minGates) {
       if (actual < min) failed.push(`${name}<${min}`);

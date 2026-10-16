@@ -126,19 +126,19 @@ describe("契约字段 → UI 类型", () => {
     expect(verdictOf([])).toBe("supported");
     expect(
       verdictOf([
-        { text: "a", level: "supported", score: 1, semantic: null, lexical: 1, unknownNumbers: [], citations: [], invalidCitations: [], trivial: false },
-        { text: "b", level: "weak", score: 0.4, semantic: null, lexical: 0.4, unknownNumbers: [], citations: [], invalidCitations: [], trivial: false },
+        { text: "a", level: "supported", score: 1, semantic: null, lexical: 1, unknownNumbers: [], citations: [], invalidCitations: [], uncited: false, trivial: false },
+        { text: "b", level: "weak", score: 0.4, semantic: null, lexical: 0.4, unknownNumbers: [], citations: [], invalidCitations: [], uncited: false, trivial: false },
       ]),
     ).toBe("partial");
     expect(
       verdictOf([
-        { text: "a", level: "unsupported", score: 0.1, semantic: null, lexical: 0.1, unknownNumbers: [], citations: [], invalidCitations: [], trivial: false },
+        { text: "a", level: "unsupported", score: 0.1, semantic: null, lexical: 0.1, unknownNumbers: [], citations: [], invalidCitations: [], uncited: false, trivial: false },
       ]),
     ).toBe("unsupported");
     // 全是寒暄句（如拒答文本）：不判为幻觉
     expect(
       verdictOf([
-        { text: "好的。", level: "supported", score: 1, semantic: null, lexical: 1, unknownNumbers: [], citations: [], invalidCitations: [], trivial: true },
+        { text: "好的。", level: "supported", score: 1, semantic: null, lexical: 1, unknownNumbers: [], citations: [], invalidCitations: [], uncited: false, trivial: true },
       ]),
     ).toBe("supported");
   });
