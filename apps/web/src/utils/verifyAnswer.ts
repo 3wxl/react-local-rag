@@ -34,8 +34,25 @@ export interface VerifiedSentence {
   citations: number[];
   /** 越界引用（引用了不存在的编号），是编造引用的强信号 */
   invalidCitations: number[];
+  /**
+   * 主张句但没有**有效**角标（引用强制闭环的第三只眼）。
+   *
+   * 与 invalidCitations 的区别：那是"引错了"，这是"根本没引"。
+   * 只在提供了编号段落表（passages）时才有意义 —— 没有编号可引的旧调用不算未标注。
+   */
+  uncited: boolean;
   /** 过短的寒暄/语气句，不参与裁决 */
   trivial: boolean;
+}
+
+/** 引用闭环的收敛情况（逐句角标 → 越界检测 → 证据收敛的汇总） */
+export interface CitationConvergence {
+  /** 主张句里没有有效角标的条数 */
+  uncitedClaims: number;
+  /** 主张句里引用了不存在编号的条数 */
+  outOfRangeClaims: number;
+  /** 所有有效角标是否都落在编号段落表内（false = 有越界） */
+  citationsSubsetOfPassages: boolean;
 }
 
 export interface VerificationResult {
@@ -46,6 +63,8 @@ export interface VerificationResult {
   source: "semantic" | "lexical";
   /** 实际参与语义比对的块数（范围收敛后；0 表示退化为纯词法） */
   scopedChunkCount: number;
+  /** 引用闭环收敛情况（逐句角标 → 越界 → 收敛） */
+  convergence: CitationConvergence;
 }
 
 /* ---------------- 阈值 ---------------- */
@@ -94,7 +113,12 @@ export function computeSentenceScore(
   semantic: number | null,
   lexical: number,
   thresholds: VerifyThresholds,
-  flags: { fabricatedNumber?: boolean; danglingCitation?: boolean } = {},
+  flags: {
+    fabricatedNumber?: boolean;
+    danglingCitation?: boolean;
+    /** 主张句没有任何有效角标（引用强制闭环：无角标不予采信） */
+    uncitedClaim?: boolean;
+  } = {},
 ): number {
   let score =
     semantic !== null
@@ -104,6 +128,16 @@ export function computeSentenceScore(
     score = Math.min(score, thresholds.weak - 0.01);
   }
   if (flags.danglingCitation) {
+    score = Math.min(score, thresholds.weak);
+  }
+  /*
+   * 无角标主张句同样封顶到 weak —— 与「引错编号」同一档力度，理由也相同：
+   * 句子本身可能完全为真，只是**无法回跳核对**，所以不给绿（supported），
+   * 但也不判红（unsupported，那是"判定为编造"）。
+   * 强弱模型都适用：弱模型正是因为不产出逐句角标才需要这条兜底，
+   * 强制闭环的意义就是让"没引"和"引错"一样可见，而不是静默放行。
+   */
+  if (flags.uncitedClaim) {
     score = Math.min(score, thresholds.weak);
   }
   return score;
@@ -180,18 +214,34 @@ export function splitSentences(text: string): string[] {
   return merged;
 }
 
-/** 解析句子中的引用编号（去重升序） */
-export function parseCitations(text: string): number[] {
+/** 扫描角标编号：min=1 只取合法编号；min=0 连 [0] 这类非法编号一起取（越界检测用） */
+function scanCitations(text: string, min: number): number[] {
   const out = new Set<number>();
   CITATION_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = CITATION_RE.exec(text))) {
     for (const part of m[1].split(/[,，]/)) {
       const n = Number(part.trim());
-      if (Number.isInteger(n) && n > 0) out.add(n);
+      if (Number.isInteger(n) && n >= min) out.add(n);
     }
   }
   return [...out].sort((a, b) => a - b);
+}
+
+/** 解析句子中的引用编号（去重升序） */
+export function parseCitations(text: string): number[] {
+  return scanCitations(text, 1);
+}
+
+/**
+ * 解析句子中的**全部**角标编号，含 [0] 这类永远不合法的编号。
+ *
+ * 为什么必须单独有这个函数：旧实现用 `n > 0` 过滤，`[0]` 被静默丢弃当作"无引用"，
+ * 随后走 fallback 范围（= 全部段落）比语义分 —— 反而最容易判成 supported。
+ * 「引用了一个根本不存在的编号」是编造引用的强信号，不能因为编号难看就装作没看见。
+ */
+export function parseAllCitations(text: string): number[] {
+  return scanCitations(text, 0);
 }
 
 /* ---------------- 词法层 ---------------- */
@@ -270,8 +320,12 @@ export function lexicalCoverage(sentence: string, contextTokens: Set<string>): n
   return hit / tokens.size;
 }
 
-/** 判断句子是否为主张句（含足够实质内容） */
-function isClaimSentence(s: string): boolean {
+/**
+ * 判断句子是否为主张句（含足够实质内容）。
+ * 导出：引用闭环的可观测指标（角标率/未标注数）要在评测脚本里按**同一判据**统计，
+ * 否则"哪些句子需要角标"这个口径会两处漂移。
+ */
+export function isClaimSentence(s: string): boolean {
   const core = s.replace(
     /[\s\p{P}\p{S}。！？!?；;，,、：:""'（）()【】\-—…·]/gu,
     "",
@@ -297,6 +351,11 @@ export interface VerifyOptions {
   passages?: VerifyPassage[];
   /** 阈值覆盖（校准脚本用） */
   thresholds?: Partial<VerifyThresholds>;
+  /**
+   * 是否强制逐句角标（默认 true，且仅在提供 passages 时生效）。
+   * 关掉只用于**对照测量**（"有角标要求 vs 没有"差多少），不作为线上默认。
+   */
+  requireCitation?: boolean;
 }
 
 /** 按引用编号取校验范围（块 id 集合）；无引用则用全部段落（退化为上下文校验） */
@@ -306,6 +365,26 @@ function scopeFor(citations: number[], passages: VerifyPassage[]): string[] {
   const byIndex = new Map(passages.map((p) => [p.index, p]));
   const scoped = citations.flatMap((c) => byIndex.get(c)?.chunkIds ?? []);
   return scoped.length > 0 ? scoped : all;
+}
+
+/**
+ * 引用编号合法性判据（**集合判定**，不是"≤ 最大值"）。
+ *
+ * 旧实现用 `c > maxPassageIndex` 判越界，只要编号段是 1..n 连续就等价；
+ * 但它有两个洞：`[0]` 被 parseCitations 的 `n > 0` 提前吞掉（永远检测不到），
+ * 以及编号段不连续时（1,3）引用中间的 [2] 会被当成合法。
+ * 现在统一为：编号必须**存在**于段落表里。
+ *
+ * passages 为空（旧调用：没有编号可引）时沿用旧口径 —— 正编号一律视为越界，
+ * 行为不变，避免改动历史路径的裁决。
+ */
+export function isInvalidCitation(
+  n: number,
+  passageIndexes: Set<number>,
+  hasPassages: boolean,
+): boolean {
+  if (!hasPassages) return n > 0;
+  return n <= 0 || !passageIndexes.has(n);
 }
 
 /* ---------------- 拒答（检索无相关命中时由调用方直接使用） ---------------- */
@@ -320,6 +399,11 @@ export function buildRefusalResult(answer: string): VerificationResult {
     source: "lexical",
     checkedAt: Date.now(),
     scopedChunkCount: 0,
+    convergence: {
+      uncitedClaims: 0,
+      outOfRangeClaims: 0,
+      citationsSubsetOfPassages: true,
+    },
     sentences: splitSentences(answer).map((text) => ({
       text,
       level: "supported",
@@ -329,12 +413,215 @@ export function buildRefusalResult(answer: string): VerificationResult {
       unknownNumbers: [],
       citations: [],
       invalidCitations: [],
+      uncited: false,
       trivial: true,
     })),
   };
 }
 
+/**
+ * 整体裁决（只统计主张句）。
+ *
+ * 抽成导出纯函数：服务端 parity/verify.py 必须用**同一套**聚合规则，
+ * 否则「两端 verdict 相同」只能靠人肉保证；评测脚本也要直接调用它复算。
+ */
+export function summarizeVerdict(sentences: VerifiedSentence[]): VerifyVerdict {
+  const claims = sentences.filter((s) => !s.trivial);
+  if (claims.length === 0) return "supported";
+  const unsupportedCount = claims.filter((s) => s.level === "unsupported").length;
+  const weakCount = claims.filter((s) => s.level === "weak").length;
+  if (unsupportedCount === claims.length) return "unsupported";
+  if (unsupportedCount > 0 || weakCount > 0) return "partial";
+  return "supported";
+}
+
 /* ---------------- 主入口 ---------------- */
+
+/**
+ * 拒答裁决（答案侧细拒，M2）。**纯函数**，两端同一套规则。
+ *
+ * 职责划分：检索侧只做**粗拒**（明显的无关查询，见 retrieval.applyThreshold），
+ * 「文档里有没有这件事」的细判归这里 —— 依据是逐句证据（语义 + 词法 + 数字核查）。
+ *
+ * 三条判据：
+ * 1. `refused`：模型自己按指令拒答了（短答案 + 拒答短语），合规，不算幻觉
+ * 2. `unsupported`：全部主张句都无依据 —— 答不出有依据的内容
+ * 3. 语义路径不可用（source="lexical"）且 verdict 非 supported：
+ *    只剩词法证据时宁严勿宽（覆盖率高的句子未必真实，只是用词重合）
+ *
+ * 刻意**不**因为 `partial` 就拒答：部分句子弱依据（含"无角标"这种格式问题）
+ * 不等于答案无价值，那属于 UI 告警层，不属于拒答。拒答越激进，正样本误拒越多。
+ */
+export function shouldRefuse(result: VerificationResult): boolean {
+  if (result.verdict === "refused") return true;
+  if (result.verdict === "unsupported") return true;
+  if (result.source === "lexical" && result.verdict !== "supported") return true;
+  return false;
+}
+
+/** 纯内核的输入：句子切分与角标分类的产物（含语义分来源） */
+interface VerifyCoreInput {
+  answer: string;
+  contextText: string;
+  passages: VerifyPassage[];
+  requireCitation: boolean;
+  thresholds: VerifyThresholds;
+  /** 句子 → 语义分；null = 语义不可用（降级纯词法） */
+  semanticMap: Map<string, number> | null;
+  scopedChunkCount: number;
+  checkedAt: number;
+}
+
+/**
+ * 校验内核（**纯函数**：不碰 worker、不碰模型）。
+ *
+ * 抽出来的理由不是"代码整洁"，而是**评测可回放**：CI 没有模型，
+ * `scripts/eval-verdict.ts --check` 要拿固化好的语义分复算一遍拒答裁决，
+ * 若它与线上走两份实现，"CI 说没问题"就证明不了任何事。
+ */
+export function verifyCore(input: VerifyCoreInput): VerificationResult {
+  const { answer, contextText, passages, thresholds, checkedAt } = input;
+  const hasPassages = passages.length > 0;
+  const passageIndexes = new Set(passages.map((p) => p.index));
+  const segments = splitSentences(answer);
+
+  // 模型按指令拒答：答案短且含拒答短语，判为合规，不算幻觉
+  const compact = answer.replace(/\s+/g, "");
+  if (compact.length <= 80 && REFUSAL_RE.test(answer)) {
+    return {
+      verdict: "refused",
+      source: "lexical",
+      checkedAt,
+      scopedChunkCount: 0,
+      convergence: {
+        uncitedClaims: 0,
+        outOfRangeClaims: 0,
+        citationsSubsetOfPassages: true,
+      },
+      sentences: segments.map((text) => ({
+        text,
+        level: "supported",
+        score: 1,
+        semantic: null,
+        lexical: 1,
+        unknownNumbers: [],
+        citations: [],
+        invalidCitations: [],
+        uncited: false,
+        trivial: true,
+      })),
+    };
+  }
+
+  // 只把主张句送进语义比对，保持顺序对齐
+  const claimFlags = segments.map(isClaimSentence);
+  // citations 保持"正编号"语义（UI/契约不变）；越界检测另用含 [0] 的全量扫描
+  const citedPerSentence = segments.map(parseCitations);
+  const invalidPerSentence = segments.map((_, idx) =>
+    parseAllCitations(segments[idx]).filter((c) =>
+      isInvalidCitation(c, passageIndexes, hasPassages),
+    ),
+  );
+  /** 有编号段落表时，主张句必须带**有效**角标（引用强制闭环） */
+  const requireCitation = hasPassages && input.requireCitation;
+  const uncitedPerSentence = segments.map(
+    (_, idx) =>
+      requireCitation &&
+      claimFlags[idx] &&
+      citedPerSentence[idx].every((c) => !passageIndexes.has(c)),
+  );
+
+  const contextTokens = tokenize(contextText);
+  const contextNumbers = new Set(extractNumbers(contextText));
+  const semanticMap = input.semanticMap;
+  const source: "semantic" | "lexical" = semanticMap ? "semantic" : "lexical";
+
+  const sentences: VerifiedSentence[] = segments.map((text, idx) => {
+    const lexical = lexicalCoverage(text, contextTokens);
+    const unknownNumbers = findUnknownNumbers(text, contextText, contextNumbers);
+
+    // 寒暄/语气句不参与裁决
+    if (!claimFlags[idx]) {
+      return {
+        text,
+        level: "supported",
+        score: 1,
+        semantic: null,
+        lexical,
+        unknownNumbers: [],
+        citations: citedPerSentence[idx],
+        invalidCitations: invalidPerSentence[idx],
+        uncited: false,
+        trivial: true,
+      };
+    }
+
+    const semantic =
+      source === "semantic" && semanticMap?.has(text)
+        ? semanticMap.get(text)!
+        : null;
+    const score = computeSentenceScore(semantic, lexical, thresholds, {
+      fabricatedNumber: unknownNumbers.length > 0,
+      danglingCitation: invalidPerSentence[idx].length > 0,
+      uncitedClaim: uncitedPerSentence[idx],
+    });
+    const level = levelOf(score, thresholds);
+
+    return {
+      text,
+      level,
+      score,
+      semantic,
+      lexical,
+      unknownNumbers,
+      citations: citedPerSentence[idx],
+      invalidCitations: invalidPerSentence[idx],
+      uncited: uncitedPerSentence[idx],
+      trivial: false,
+    };
+  });
+
+  const claims = sentences.filter((s) => !s.trivial);
+  const outOfRangeClaims = claims.filter((s) => s.invalidCitations.length > 0).length;
+  const convergence: CitationConvergence = {
+    uncitedClaims: claims.filter((s) => s.uncited).length,
+    outOfRangeClaims,
+    // 收敛判据：不存在任何越界角标 —— 即"答案引用的每一个编号都能在编号段落表里找到"
+    citationsSubsetOfPassages: outOfRangeClaims === 0,
+  };
+
+  return {
+    verdict: summarizeVerdict(sentences),
+    sentences,
+    checkedAt,
+    source,
+    scopedChunkCount: input.scopedChunkCount,
+    convergence,
+  };
+}
+
+/**
+ * 用**已算好的语义分**跑一遍校验（评测脚本在无模型环境下的回放入口）。
+ * 语义分缺失（传 null）等价于 worker 不可用 → 走纯词法降级。
+ */
+export function verifyAnswerWithScores(
+  answer: string,
+  contextText: string,
+  passages: VerifyPassage[],
+  semanticMap: Map<string, number> | null,
+  options: VerifyOptions = {},
+): VerificationResult {
+  return verifyCore({
+    answer,
+    contextText,
+    passages,
+    requireCitation: options.requireCitation ?? true,
+    thresholds: { ...DEFAULT_VERIFY_THRESHOLDS, ...options.thresholds },
+    semanticMap,
+    scopedChunkCount: 0,
+    checkedAt: Date.now(),
+  });
+}
 
 /**
  * 对模型最终答案做事后校验
@@ -355,44 +642,31 @@ export async function verifyAnswer(
     ...options.thresholds,
   };
   const passages = options.passages ?? [];
-  const maxPassageIndex = passages.reduce((m, p) => Math.max(m, p.index), 0);
+  const hasPassages = passages.length > 0;
+  const passageIndexes = new Set(passages.map((p) => p.index));
   const segments = splitSentences(answer);
 
-  // 模型按指令拒答：答案短且含拒答短语，判为合规，不算幻觉
+  // 提前短路的拒答分支不必进分组/worker，直接交给内核（内核里同一判据）
   const compact = answer.replace(/\s+/g, "");
   if (compact.length <= 80 && REFUSAL_RE.test(answer)) {
-    return {
-      verdict: "refused",
-      source: "lexical",
-      checkedAt,
+    return verifyCore({
+      answer,
+      contextText,
+      passages,
+      requireCitation: options.requireCitation ?? true,
+      thresholds,
+      semanticMap: null,
       scopedChunkCount: 0,
-      sentences: segments.map((text) => ({
-        text,
-        level: "supported",
-        score: 1,
-        semantic: null,
-        lexical: 1,
-        unknownNumbers: [],
-        citations: [],
-        invalidCitations: [],
-        trivial: true,
-      })),
-    };
+      checkedAt,
+    });
   }
 
-  // 只把主张句送进 worker 算语义依据分，保持顺序对齐
   const claimFlags = segments.map(isClaimSentence);
   const citedPerSentence = segments.map(parseCitations);
-  const invalidPerSentence = citedPerSentence.map((cs) =>
-    cs.filter((c) => c > maxPassageIndex),
-  );
-
-  const contextTokens = tokenize(contextText);
-  const contextNumbers = new Set(extractNumbers(contextText));
 
   // 按「引用范围」分组：同一范围的句子合并成一次 worker 调用（通常只有 1~2 组）
   const scopeKey = (citations: number[]) =>
-    passages.length === 0
+    !hasPassages
       ? "all"
       : citations.length === 0
         ? "fallback"
@@ -401,7 +675,7 @@ export async function verifyAnswer(
   segments.forEach((text, idx) => {
     if (!claimFlags[idx]) return;
     // 越界引用不参与范围计算（视为无引用，走 fallback 范围）
-    const valid = citedPerSentence[idx].filter((c) => c <= maxPassageIndex);
+    const valid = citedPerSentence[idx].filter((c) => passageIndexes.has(c));
     const key = scopeKey(valid);
     const scope = scopeFor(valid, passages);
     const group = groups.get(key);
@@ -439,65 +713,15 @@ export async function verifyAnswer(
     source = "lexical";
   }
 
-  const sentences: VerifiedSentence[] = segments.map((text, idx) => {
-    const lexical = lexicalCoverage(text, contextTokens);
-    const unknownNumbers = findUnknownNumbers(text, contextText, contextNumbers);
-
-    // 寒暄/语气句不参与裁决
-    if (!claimFlags[idx]) {
-      return {
-        text,
-        level: "supported",
-        score: 1,
-        semantic: null,
-        lexical,
-        unknownNumbers: [],
-        citations: citedPerSentence[idx],
-        invalidCitations: invalidPerSentence[idx],
-        trivial: true,
-      };
-    }
-
-    const semantic =
-      source === "semantic" && semanticMap.has(text)
-        ? semanticMap.get(text)!
-        : null;
-    const score = computeSentenceScore(semantic, lexical, thresholds, {
-      fabricatedNumber: unknownNumbers.length > 0,
-      danglingCitation: invalidPerSentence[idx].length > 0,
-    });
-    const level = levelOf(score, thresholds);
-
-    return {
-      text,
-      level,
-      score,
-      semantic,
-      lexical,
-      unknownNumbers,
-      citations: citedPerSentence[idx],
-      invalidCitations: invalidPerSentence[idx],
-      trivial: false,
-    };
+  // 句级裁决/收敛/整体裁决统一走纯内核（与评测回放同一份实现，杜绝两处口径漂移）
+  return verifyCore({
+    answer,
+    contextText,
+    passages,
+    requireCitation: options.requireCitation ?? true,
+    thresholds,
+    semanticMap: source === "semantic" ? semanticMap : null,
+    scopedChunkCount,
+    checkedAt,
   });
-
-  /* 整体裁决（只统计主张句） */
-  const claims = sentences.filter((s) => !s.trivial);
-  const unsupportedCount = claims.filter(
-    (s) => s.level === "unsupported",
-  ).length;
-  const weakCount = claims.filter((s) => s.level === "weak").length;
-
-  let verdict: VerifyVerdict;
-  if (claims.length === 0) {
-    verdict = "supported";
-  } else if (unsupportedCount === claims.length) {
-    verdict = "unsupported";
-  } else if (unsupportedCount > 0 || weakCount > 0) {
-    verdict = "partial";
-  } else {
-    verdict = "supported";
-  }
-
-  return { verdict, sentences, checkedAt, source, scopedChunkCount };
 }

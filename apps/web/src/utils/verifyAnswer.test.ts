@@ -6,7 +6,15 @@ vi.mock("./embeddingClient", () => ({
 }));
 
 import { verifySentences } from "./embeddingClient";
-import { stripThinkTags, splitSentences, verifyAnswer } from "./verifyAnswer";
+import {
+  stripThinkTags,
+  splitSentences,
+  summarizeVerdict,
+  shouldRefuse,
+  verifyAnswer,
+  verifyAnswerWithScores,
+} from "./verifyAnswer";
+import type { VerificationResult, VerifiedSentence } from "./verifyAnswer";
 import type { SentenceScore } from "./embeddingClient";
 
 const mockedVerify = vi.mocked(verifySentences);
@@ -273,6 +281,129 @@ describe("verifyAnswer 引用与校验范围", () => {
   });
 });
 
+/* ---------------- 引用强制闭环：边界用例 ---------------- */
+
+describe("verifyAnswer 引用闭环边界", () => {
+  const CONTEXT = "成本是 100 元。周期是 3 个月。";
+  const PASSAGES = [
+    { index: 1, chunkIds: ["c1"] },
+    { index: 2, chunkIds: ["c2"] },
+  ];
+
+  it("[0] 不是合法编号：记为越界并封顶（旧实现被 n>0 过滤静默放行）", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。[0]", 0.95));
+    const result = await verifyAnswer("conv1", "成本是 100 元。[0]", CONTEXT, {
+      passages: PASSAGES,
+    });
+    const s = result.sentences[0];
+    expect(s.invalidCitations).toEqual([0]);
+    expect(s.level).toBe("weak");
+    expect(result.convergence.outOfRangeClaims).toBe(1);
+    expect(result.convergence.citationsSubsetOfPassages).toBe(false);
+  });
+
+  it("编号段不连续（1,3）时引用中间的 [2]：按集合判定为越界", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。[2]", 0.95));
+    const result = await verifyAnswer("conv1", "成本是 100 元。[2]", CONTEXT, {
+      passages: [
+        { index: 1, chunkIds: ["c1"] },
+        { index: 3, chunkIds: ["c3"] },
+      ],
+    });
+    // 旧实现用「≤ 最大值」判定，[2] ≤ 3 会被当成合法编号
+    expect(result.sentences[0].invalidCitations).toEqual([2]);
+    expect(result.sentences[0].level).toBe("weak");
+  });
+
+  it("全角逗号 [1，2] 与连续角标 [1][2] 都解析为多编号引用", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("都在这里。[1，2]", 0.9));
+    const a = await verifyAnswer("conv1", "都在这里。[1，2]", CONTEXT, {
+      passages: PASSAGES,
+    });
+    expect(a.sentences[0].citations).toEqual([1, 2]);
+    mockedVerify.mockResolvedValue(semanticScores("都在这里。[1][2]", 0.9));
+    const b = await verifyAnswer("conv1", "都在这里。[1][2]", CONTEXT, {
+      passages: PASSAGES,
+    });
+    expect(b.sentences[0].citations).toEqual([1, 2]);
+  });
+
+  it("句号后的游离角标归并到前一句（引用与句子始终绑定）", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。[1]", 0.9));
+    const result = await verifyAnswer("conv1", "成本是 100 元。[1]", CONTEXT, {
+      passages: PASSAGES,
+    });
+    expect(result.sentences).toHaveLength(1);
+    expect(result.sentences[0].citations).toEqual([1]);
+  });
+
+  it("主张句没有有效角标：uncited=true 且封顶到 weak（强制逐句角标）", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。", 0.95));
+    const result = await verifyAnswer("conv1", "成本是 100 元。", CONTEXT, {
+      passages: PASSAGES,
+    });
+    const s = result.sentences[0];
+    expect(s.uncited).toBe(true);
+    expect(s.level).toBe("weak");
+    expect(result.verdict).toBe("partial");
+    expect(result.convergence.uncitedClaims).toBe(1);
+  });
+
+  it("requireCitation=false 仅用于对照测量：不封顶、不标记 uncited", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。", 0.95));
+    const result = await verifyAnswer("conv1", "成本是 100 元。", CONTEXT, {
+      passages: PASSAGES,
+      requireCitation: false,
+    });
+    expect(result.sentences[0].uncited).toBe(false);
+    expect(result.sentences[0].level).toBe("supported");
+    expect(result.verdict).toBe("supported");
+  });
+
+  it("不传 passages 时不做角标强制（没有编号可引，旧调用行为不变）", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。", 0.95));
+    const result = await verifyAnswer("conv1", "成本是 100 元。", CONTEXT);
+    expect(result.sentences[0].uncited).toBe(false);
+    expect(result.sentences[0].level).toBe("supported");
+  });
+
+  it("重复编号去重；寒暄句不参与 uncited 统计", async () => {
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。[1][1]", 0.9));
+    const result = await verifyAnswer("conv1", "好的。成本是 100 元。[1][1]", CONTEXT, {
+      passages: PASSAGES,
+    });
+    expect(result.sentences[0].citations).toEqual([]); // 「好的。」是寒暄句
+    expect(result.sentences[1].citations).toEqual([1]);
+    expect(result.convergence.uncitedClaims).toBe(0);
+  });
+
+  it("多句部分带角标：只统计未标注的那句", async () => {
+    mockedVerify.mockResolvedValue(
+      semanticScores("成本是 100 元。[1]", 0.9, "周期是 3 个月。", 0.9),
+    );
+    const result = await verifyAnswer(
+      "conv1",
+      "成本是 100 元。[1]周期是 3 个月。",
+      CONTEXT,
+      { passages: PASSAGES },
+    );
+    expect(result.convergence.uncitedClaims).toBe(1);
+    expect(result.verdict).toBe("partial");
+  });
+
+  it("拒答结果与全 trivial 答案的 convergence 均为零（不得触发依赖告警）", async () => {
+    const refusal = await verifyAnswer("conv1", "文档中没有找到相关内容。", CONTEXT, {
+      passages: PASSAGES,
+    });
+    expect(refusal.verdict).toBe("refused");
+    expect(refusal.convergence).toEqual({
+      uncitedClaims: 0,
+      outOfRangeClaims: 0,
+      citationsSubsetOfPassages: true,
+    });
+  });
+});
+
 /* ---------------- worker 不可用：词法降级 ---------------- */
 
 describe("verifyAnswer 词法降级", () => {
@@ -299,5 +430,92 @@ describe("verifyAnswer 词法降级", () => {
     expect(result.source).toBe("lexical");
     expect(result.verdict).toBe("unsupported");
     expect(result.sentences[0].unknownNumbers).toEqual(["8888万"]);
+  });
+});
+
+/* ---------------- 拒答裁决（答案侧细拒） ---------------- */
+
+/** 造一个最小 VerificationResult（只填拒答判据用得到的字段） */
+function fakeResult(
+  partial: Partial<VerificationResult> & { level?: VerifiedSentence["level"] },
+): VerificationResult {
+  const { level = "supported", ...rest } = partial;
+  const sentences: VerifiedSentence[] = [
+    {
+      text: "句子",
+      level,
+      score: 0.9,
+      semantic: 0.9,
+      lexical: 0.9,
+      unknownNumbers: [],
+      citations: [1],
+      invalidCitations: [],
+      uncited: false,
+      trivial: false,
+    },
+  ];
+  return {
+    // verdict 由逐句结果推导（与线上一致：顶层裁决不允许与句子自相矛盾）
+    verdict: partial.verdict ?? summarizeVerdict(sentences),
+    source: partial.source ?? "semantic",
+    checkedAt: 0,
+    scopedChunkCount: 0,
+    convergence: {
+      uncitedClaims: 0,
+      outOfRangeClaims: 0,
+      citationsSubsetOfPassages: true,
+    },
+    sentences,
+    ...rest,
+  };
+}
+
+describe("summarizeVerdict / shouldRefuse", () => {
+  it("全部主张句无依据 → unsupported → 拒答", () => {
+    const r = fakeResult({ level: "unsupported" });
+    expect(summarizeVerdict(r.sentences)).toBe("unsupported");
+    expect(shouldRefuse(r)).toBe(true);
+  });
+
+  it("部分弱依据 → partial → **不拒答**（属于 UI 告警层，不是拒答）", () => {
+    const r = fakeResult({ level: "weak" });
+    expect(summarizeVerdict(r.sentences)).toBe("partial");
+    expect(shouldRefuse(r)).toBe(false);
+  });
+
+  it("模型自己拒答（verdict=refused）→ 拒答", () => {
+    expect(shouldRefuse(fakeResult({ verdict: "refused" }))).toBe(true);
+  });
+
+  it("语义路降级 + 非全绿 → 拒答（只剩词法证据时宁严勿宽）", () => {
+    expect(shouldRefuse(fakeResult({ source: "lexical", level: "weak" }))).toBe(true);
+    // 全绿则放行：词法与语义一致时没有拒答理由
+    expect(shouldRefuse(fakeResult({ source: "lexical" }))).toBe(false);
+  });
+});
+
+describe("verifyAnswerWithScores（无模型回放）", () => {
+  it("给定语义分时等价于线上语义路径", async () => {
+    const passages = [{ index: 1, chunkIds: ["c1"] }];
+    const scores = new Map([["成本是 100 元。[1]", 0.9]]);
+    const replayed = verifyAnswerWithScores(
+      "成本是 100 元。[1]",
+      "成本是 100 元。",
+      passages,
+      scores,
+    );
+    mockedVerify.mockResolvedValue(semanticScores("成本是 100 元。[1]", 0.9));
+    const live = await verifyAnswer("conv1", "成本是 100 元。[1]", "成本是 100 元。", {
+      passages,
+    });
+    expect(replayed.sentences[0].score).toBeCloseTo(live.sentences[0].score, 12);
+    expect(replayed.sentences[0].level).toBe(live.sentences[0].level);
+    expect(replayed.verdict).toBe(live.verdict);
+    expect(replayed.source).toBe("semantic");
+  });
+
+  it("语义分为 null：降级纯词法（与 worker 不可用同路）", () => {
+    const r = verifyAnswerWithScores("成本是 100 元。[1]", "成本是 100 元。", [], null);
+    expect(r.source).toBe("lexical");
   });
 });

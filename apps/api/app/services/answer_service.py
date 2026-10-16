@@ -31,6 +31,7 @@ from ..parity.verify import (
     DEFAULT_VERIFY_THRESHOLDS,
     VerificationResult,
     build_refusal_result,
+    should_refuse,
     strip_think_tags,
     verify_answer,
 )
@@ -39,6 +40,30 @@ from .retrieval_service import RetrievalService, SearchOutcome
 
 #: 本地模型成本为 0（账单口径：只统计 token，成本为 0；接云端通道时按 provider 价目折算）
 LOCAL_COST_USD = 0.0
+
+
+def _fired_signals(search: SearchOutcome) -> list[str]:
+    """列出本次触发的拒答信号（多信号融合的归因）。
+
+    向量降级（mode="bm25"）时融合拒答**不参与**判定，此时拒答只可能来自
+    逐命中相关度门限/相对截断 —— 如实说明，避免把降级路径误读成"信号触发了"。
+    """
+    if search.mode != "hybrid":
+        return ["向量路降级：融合拒答不参与（仅逐命中相关度门限）"]
+    opts = DEFAULT_RETRIEVAL_OPTIONS
+    signals = search.signals
+    fired: list[str] = []
+    if search.idf_coverage < opts.min_idf_coverage:
+        fired.append(f"idf_coverage={search.idf_coverage:.4f}<{opts.min_idf_coverage}")
+    if signals.max_cosine is not None and signals.max_cosine < opts.min_max_cosine:
+        fired.append(f"max_cosine={signals.max_cosine:.4f}<{opts.min_max_cosine}")
+    if signals.cos_gap is not None and signals.cos_gap < opts.min_cos_gap:
+        fired.append(f"cos_gap={signals.cos_gap:.4f}<{opts.min_cos_gap}")
+    if signals.max_bm25 is not None and signals.max_bm25 < opts.min_bm25:
+        fired.append(f"max_bm25={signals.max_bm25:.4f}<{opts.min_bm25}")
+    if not fired:
+        fired.append("融合信号均未触发（逐命中相关度门限/相对截断）")
+    return fired
 
 
 @dataclass
@@ -121,11 +146,8 @@ class AnswerService:
                     "status": "ok",
                     "duration_ms": 0,
                     "input_summary": f"idf_coverage={search.idf_coverage:.4f}",
-                    "output_summary": (
-                        f"idf_coverage={search.idf_coverage:.4f} ≥ "
-                        f"{DEFAULT_RETRIEVAL_OPTIONS.min_idf_coverage}; "
-                        f"top_relevance=∅ → 拒答"
-                    ),
+                    # 拒答要能归因到具体信号：只说"拒了"无法区分是阈值太紧还是查询真的无关
+                    "output_summary": "多信号融合拒答命中 → 拒答；触发：" + "，".join(_fired_signals(search)),
                 }
             )
             return await self._refuse(
@@ -203,10 +225,47 @@ class AnswerService:
                 "input_summary": f"sentences={len(verification.sentences)}",
                 "output_summary": (
                     f"verdict={verification.verdict}, source={verification.source}, "
-                    f"scoped_chunks={verification.scoped_chunk_count}"
+                    f"scoped_chunks={verification.scoped_chunk_count}, "
+                    f"uncited={verification.convergence.uncited_claims}, "
+                    f"out_of_range={verification.convergence.out_of_range_claims}"
                 ),
             }
         )
+
+        # ── 6. 拒答裁决（答案侧细拒：检索侧只做粗拒，见 parity/verify.should_refuse）──
+        if should_refuse(verification):
+            nodes.append(
+                {
+                    "seq": 5,
+                    "name": "adjudicate",
+                    "status": "ok",
+                    "duration_ms": 0,
+                    "input_summary": f"verdict={verification.verdict}, source={verification.source}",
+                    "output_summary": (
+                        "逐句证据不足以支撑回答 → 拒答"
+                        "（模型自己拒答 / 全部主张句无依据 / 语义证据不可用且非全绿）"
+                    ),
+                }
+            )
+            return await self._refuse(
+                answer_id=answer_id,
+                trace_id=trace_id,
+                question=question,
+                reason="answer_unsupported",
+                nodes=nodes,
+                breakdown=breakdown,
+                search=search,
+                version=version,
+                prompt_template_id=prompt_template_id,
+                started=started,
+                # 拒答要能复盘：把逐句裁决与引用闭环的摘要一并落库
+                detail={
+                    "verdict": verification.verdict,
+                    "verify_source": verification.source,
+                    "uncited_claims": verification.convergence.uncited_claims,
+                    "out_of_range_claims": verification.convergence.out_of_range_claims,
+                },
+            )
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         cost = {
@@ -258,6 +317,7 @@ class AnswerService:
         version: str,
         prompt_template_id: str,
         started: float,
+        detail: dict | None = None,
     ) -> AnswerOutcome:
         latency_ms = int((time.perf_counter() - started) * 1000)
         cost = {
@@ -279,7 +339,13 @@ class AnswerService:
                 "signals": {
                     "idf_coverage": search.idf_coverage,
                     "top_relevance": None,
+                    # 融合拒答的四路取值（与 /v1/retrieve 同一组字段，便于归因）
+                    "max_cosine": search.signals.max_cosine,
+                    "cos_gap": search.signals.cos_gap,
+                    "max_bm25": search.signals.max_bm25,
                 },
+                # 答案侧细拒的判据（reason="answer_unsupported" 时给出逐句证据摘要）
+                **(detail or {}),
             },
             verification=build_refusal_result(NO_RELEVANT_ANSWER),
             evidence_snapshot=self._evidence_snapshot(
@@ -357,7 +423,12 @@ class AnswerService:
                 "vec_weight": opts.vec_weight,
                 "bm25_weight": opts.bm25_weight,
                 "min_vec_score": opts.min_vec_score,
+                # 多信号融合拒答的四路门限（2026-10-15 起生效）：快照必须冻结它们，
+                # 否则「当时为什么拒答」事后无法复核（口径纪律：线上配置 = 评测配置）
                 "min_idf_coverage": opts.min_idf_coverage,
+                "min_max_cosine": opts.min_max_cosine,
+                "min_cos_gap": opts.min_cos_gap,
+                "min_bm25": opts.min_bm25,
                 "window_radius": opts.window_radius,
                 "mmr_lambda": opts.mmr_lambda,
             },

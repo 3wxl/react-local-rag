@@ -1,0 +1,383 @@
+{
+  "name": "答案侧拒答裁决标注集（M2）",
+  "description": "每条查询标注「这次回答**应当**被拒答吗」。判据不是答案文本质量，而是「知识库里到底有没有这件事」——这正是答案侧细拒要判的东西。标签来源：packages/eval/golden.json 的人工 negative 标注（负样本 = 文档未提及 → 应拒答；正样本 = 文档包含答案 → 不应拒答）。改 golden 的 negative 标注后必须重新生成本文件。",
+  "source": "packages/eval/golden.json",
+  "gate": {
+    "negativeRefusalRecall": 0.6,
+    "positiveFalseRefusal": 0,
+    "note": "与 apps/api/app/harness/gates.py 的 VERDICT_GATES 同值；positiveFalseRefusal 只统计**我方裁决**造成的误拒 —— 模型自己说「没有找到」（答案短 + 含拒答短语）属合规行为，单列观察，不计入门槛。"
+  },
+  "counts": {
+    "total": 61,
+    "expectRefuse": 10,
+    "expectAnswer": 51
+  },
+  "samples": [
+    {
+      "id": "q001",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q002",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q003",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q004",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q005",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q006",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q007",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q008",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q009",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q010",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q011",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q012",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q013",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q014",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q015",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q016",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q017",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q018",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q019",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q020",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q021",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q022",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q023",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q024",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "q025",
+      "expectRefuse": false,
+      "group": "q",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s001",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s002",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s003",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s004",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s005",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s006",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s007",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s008",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s009",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s010",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s011",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s012",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s013",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "s014",
+      "expectRefuse": false,
+      "group": "s",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m001",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m002",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m003",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m004",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m005",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m006",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m007",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m008",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m009",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m010",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m011",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "m012",
+      "expectRefuse": false,
+      "group": "m",
+      "note": "正样本：文档包含该问题的答案"
+    },
+    {
+      "id": "n001",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n002",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n003",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n004",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n005",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n006",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n007",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n008",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n009",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    },
+    {
+      "id": "n010",
+      "expectRefuse": true,
+      "group": "n",
+      "note": "负样本：文档未提及该问题"
+    }
+  ]
+}
