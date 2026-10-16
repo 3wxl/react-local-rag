@@ -21,9 +21,12 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import AsyncIterator
 
 from ..api.serializers import context_from_dict
 from ..core.config import Settings
+from ..generation.base import ModelUnavailableError
+from ..graphs.budget import BudgetExceeded
 from ..graphs.state import filters_to_dict
 from ..parity.citation import ContextRef
 from ..store import Filters
@@ -99,16 +102,7 @@ class AnswerService:
             "trace_nodes": [],
             "breakdown": {},
         }
-        final = await self.graph.ainvoke(
-            seed,
-            config={
-                "configurable": {"thread_id": trace_id},
-                # 兜底防跑飞：**预算守卫先触发**（给出"超了哪道上限"的友好原因），
-                # 这里只是最后的保险，所以留出余量，避免 LangGraph 的 GraphRecursionError
-                # 抢在 budget_exceeded 之前把请求打断（错误语义会变成"内部错误"）
-                "recursion_limit": self.settings.graph_max_steps + RECURSION_HEADROOM,
-            },
-        )
+        final = await self.graph.ainvoke(seed, config=self._config(trace_id))
         outcome = final.get("outcome") or {}
         return AnswerOutcome(
             answer_id=outcome["answer_id"],
@@ -123,3 +117,69 @@ class AnswerService:
             cost=outcome["cost"],
             trace_nodes=outcome["trace_nodes"],
         )
+
+    async def answer_stream(
+        self,
+        question: str,
+        *,
+        version: str,
+        top_k: int = 5,
+        filters: Filters | None = None,
+        prompt_template_id: str = "qa-v1",
+        rewrite: bool = False,
+    ) -> AsyncIterator[dict]:
+        """流式问答：逐条产出 `{"event", "data"}`（路由负责转 SSE 帧）。
+
+        与非流式**同一个图、同一条节点路径**（`stream_mode="custom"` 只是多开了一条
+        输出通道）；`final` 事件的数据就是非流式响应体本身。
+
+        错误语义（契约 §2）：预检类错误在流开始前由路由抛真 HTTP 状态码；
+        流开始之后的错误一律**带内**（`error` 事件），因为 HTTP 头已经发出去了。
+        """
+        answer_id = "ans_" + uuid.uuid4().hex[:16]
+        trace_id = "trc_" + uuid.uuid4().hex[:16]
+        self.preflight(question, top_k=top_k)
+
+        seed = {
+            "answer_id": answer_id,
+            "trace_id": trace_id,
+            "question": question,
+            "version": version,
+            "top_k": top_k,
+            "filters_dict": filters_to_dict(filters),
+            "prompt_template_id": prompt_template_id,
+            "rewrite": rewrite,
+            "stream": True,
+            "started_perf": time.perf_counter(),
+            "trace_nodes": [],
+            "breakdown": {},
+        }
+        try:
+            async for payload in self.graph.astream(
+                seed, config=self._config(trace_id), stream_mode="custom"
+            ):
+                yield payload
+        except ModelUnavailableError as err:
+            yield _error_event("model_unavailable", str(err))
+        except BudgetExceeded as err:
+            yield _error_event("budget_exceeded", str(err), err.detail)
+        except Exception as err:  # noqa: BLE001 —— 流内错误必须带内交付，不能只留 500
+            yield _error_event("internal_error", f"流式问答失败：{err}")
+
+    def _config(self, trace_id: str) -> dict:
+        return {
+            # thread_id = trace_id：检查点按轨迹可查（M4 的轨迹回放依赖这一点）
+            "configurable": {"thread_id": trace_id},
+            # 兜底防跑飞：**预算守卫先触发**（给出"超了哪道上限"的友好原因），
+            # 这里只是最后的保险，所以留出余量，避免 LangGraph 的 GraphRecursionError
+            # 抢在 budget_exceeded 之前把请求打断（错误语义会变成"内部错误"）
+            "recursion_limit": self.settings.graph_max_steps + RECURSION_HEADROOM,
+        }
+
+
+def _error_event(code: str, message: str, detail: dict | None = None) -> dict:
+    """带内错误事件（形状与错误体 §0.5 一致）。"""
+    return {
+        "event": "error",
+        "data": {"error": {"code": code, "message": message, "detail": detail or {}}},
+    }

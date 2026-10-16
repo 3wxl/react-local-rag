@@ -46,6 +46,25 @@ class FakeProvider:
             sampling={"deterministic": True, "max_new_tokens": max_new_tokens},
         )
 
+    def stream(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int = 512,
+        on_delta=None,
+    ) -> Completion:
+        """流式（测试用）：确定性分片，拼接结果与 complete() 逐字相同。
+
+        分片口径固定（每 8 个字符一片）—— 断言"token 事件拼接 == 最终答案"才有意义，
+        随机分片会让流式测试变成碰运气。
+        """
+        completion = self.complete(prompt, max_new_tokens=max_new_tokens)
+        text = completion.text
+        for i in range(0, len(text), 8):
+            if on_delta is not None:
+                on_delta(text[i : i + 8])
+        return completion
+
 
 def _parse_passages(prompt: str) -> list[tuple[int, str]]:
     """从 Prompt 的【文档内容】段里解析出 `[n] label\\n正文`（与 prompt 模板同构）。"""

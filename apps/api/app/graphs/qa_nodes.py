@@ -37,6 +37,7 @@ from ..parity.verify import (
 )
 from ..store import AnswerRecord, Store, TraceRecord
 from .budget import BudgetLimits, charge
+from .events import EVENT_FINAL, EVENT_TOKEN, emit
 from .state import QaState, filters_from_dict
 from .trace import trace_row
 
@@ -241,9 +242,19 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
             )
         )
         t1 = time.perf_counter()
-        completion = deps.provider.complete(
-            prompt, max_new_tokens=deps.settings.max_new_tokens
-        )
+        # 流式：provider 支持 stream() 才发 token 事件（best-effort，见 generation/base.py）。
+        # 发的是**原始**文本（未去思考标签），客户端以 final 事件里的 answer 为准。
+        stream_fn = getattr(deps.provider, "stream", None)
+        if state.get("stream") and callable(stream_fn):
+            completion = stream_fn(
+                prompt,
+                max_new_tokens=deps.settings.max_new_tokens,
+                on_delta=lambda delta: emit(EVENT_TOKEN, {"delta": delta}),
+            )
+        else:
+            completion = deps.provider.complete(
+                prompt, max_new_tokens=deps.settings.max_new_tokens
+            )
         ledger = charge(
             state.get("budget"),
             limits=BudgetLimits.from_settings(deps.settings),
@@ -317,6 +328,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
     async def refuse_no_relevant(state: QaState) -> dict:
         outcome = _refusal_outcome(state, reason="no_relevant_hit")
         await _persist(deps.store, outcome, version=state["version"])
+        emit(EVENT_FINAL, public_outcome(outcome))
         return _refusal_updates(outcome)
 
     async def refuse_unsupported(state: QaState) -> dict:
@@ -332,6 +344,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         )
         outcome = _refusal_outcome(state, reason="answer_unsupported", detail=detail, extra_rows=[row])
         await _persist(deps.store, outcome, version=state["version"])
+        emit(EVENT_FINAL, public_outcome(outcome))
         return {**_refusal_updates(outcome), "trace_nodes": [row]}
 
     # ---------------- 6. 成功收尾 ----------------
@@ -367,6 +380,8 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
             "trace_nodes": state["trace_nodes"],
         }
         await _persist(deps.store, outcome, version=state["version"])
+        # final 事件与非流式响应体是同一个对象（落库与发事件同点，见 docs/api-contract.md §2）
+        emit(EVENT_FINAL, public_outcome(outcome))
         return {"outcome": outcome, "cost": cost}
 
     return {
@@ -491,6 +506,26 @@ def _refusal_outcome(
         ),
         "cost": _cost_dict(state, latency_ms=latency_ms, prompt_tokens=0, completion_tokens=0),
         "trace_nodes": nodes,
+    }
+
+
+def public_outcome(outcome: dict) -> dict:
+    """契约响应体（`final` 事件的载荷）：与 `/v1/answer` 非流式响应**逐字段相同**。
+
+    `outcome` 里额外带着 `trace_nodes`（落库用），但它不属于响应体 —— 直接把它当
+    final 事件发出去会让"流式 vs 非流式"多出一个字段（`test_sse_stream.py` 会红）。
+    """
+    return {
+        "answer_id": outcome["answer_id"],
+        "trace_id": outcome["trace_id"],
+        "question": outcome["question"],
+        "answer": outcome["answer"],
+        "verdict": outcome["verdict"],
+        "citations": outcome["citations"],
+        "refusal": outcome["refusal"],
+        "verification": outcome["verification"],
+        "evidence_snapshot": outcome["evidence_snapshot"],
+        "cost": outcome["cost"],
     }
 
 

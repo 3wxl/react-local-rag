@@ -39,6 +39,10 @@ class QaState(TypedDict, total=False):
     filters_dict: dict
     prompt_template_id: str
     rewrite: bool
+    #: 是否流式请求（generate 节点据此决定发不发 token 事件）。
+    #: 注意：**必须是声明过的字段** —— LangGraph 只保留 schema 里声明过的 State 键，
+    #: 没声明的键在进图时会被丢掉（曾因此让 token 事件静默消失）。
+    stream: bool
     #: 请求开始时刻（perf_counter）。QA 图不跨进程续跑，所以单调时钟可用；
     #: 需要跨进程的 Agent 图改用 ISO 时间戳（见 agent 图）。
     started_perf: float

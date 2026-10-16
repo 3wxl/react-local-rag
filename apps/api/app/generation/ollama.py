@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -71,6 +72,71 @@ class OllamaProvider:
             text=data.get("response", ""),
             prompt_tokens=int(data.get("prompt_eval_count", 0) or 0),
             completion_tokens=int(data.get("eval_count", 0) or 0),
+            model=self.model,
+            provider=self.name,
+            latency_ms=int((time.time() - started) * 1000),
+            sampling={
+                "temperature": self.temperature,
+                "seed": self.seed,
+                "max_new_tokens": max_new_tokens,
+            },
+        )
+
+    def stream(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int = 512,
+        on_delta=None,
+    ) -> Completion:
+        """流式生成（NDJSON 逐行解析）。
+
+        与 complete() 用同一个 Prompt 模板与采样参数，所以"流不流"不改变口径；
+        用量在最后一行（done=true）才给全 —— 与 complete() 的字段一一对应。
+        """
+        if not self.available():
+            raise ModelUnavailableError(
+                f"Ollama 不可用或未拉取模型 {self.model}："
+                f"先启动 ollama serve，再执行 ollama pull {self.model}"
+            )
+        started = time.time()
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": True,
+            "raw": True,
+            "options": {
+                "temperature": self.temperature,
+                "seed": self.seed,
+                "num_predict": max_new_tokens,
+            },
+        }
+        parts: list[str] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        with httpx.stream(
+            "POST",
+            f"{self.base_url}/api/generate",
+            json=payload,
+            timeout=self.timeout,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                delta = chunk.get("response", "")
+                if delta:
+                    parts.append(delta)
+                    if on_delta is not None:
+                        on_delta(delta)
+                if chunk.get("done"):
+                    prompt_tokens = int(chunk.get("prompt_eval_count", 0) or 0)
+                    completion_tokens = int(chunk.get("eval_count", 0) or 0)
+        return Completion(
+            text="".join(parts),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             model=self.model,
             provider=self.name,
             latency_ms=int((time.time() - started) * 1000),
