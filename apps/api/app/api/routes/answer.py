@@ -12,6 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from ...generation.base import ModelUnavailableError
+from ...graphs.budget import BudgetExceeded
 from ...parity.retrieval import DEFAULT_RETRIEVAL_OPTIONS
 from ...services.reindex_service import select_index_version
 from ...store import Filters
@@ -59,6 +60,9 @@ async def answer(
         )
     except ModelUnavailableError as err:
         raise ApiError("model_unavailable", str(err)) from err
+    except BudgetExceeded as err:
+        # 超预算是一等拒绝（契约 §0.5：422 budget_exceeded），detail 说明超的是哪道上限
+        raise ApiError("budget_exceeded", str(err), err.detail) from err
 
     return {
         "answer_id": outcome.answer_id,

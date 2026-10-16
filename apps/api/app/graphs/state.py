@@ -68,6 +68,8 @@ class QaState(TypedDict, total=False):
     trace_nodes: Annotated[list[dict], operator.add]
     #: 阶段耗时表 {retrieve: ms, generate: ms, verify: ms}
     breakdown: Annotated[dict, merge_dicts]
+    #: 预算账本（app/graphs/budget.py 的 new_ledger()；每次模型调用后整份写回）
+    budget: dict
 
 
 def filters_to_dict(filters: Filters | None) -> dict:

@@ -28,6 +28,9 @@ from ..graphs.state import filters_to_dict
 from ..parity.citation import ContextRef
 from ..store import Filters
 
+#: `recursion_limit` 相对步数预算的余量（见 answer() 里的注释）
+RECURSION_HEADROOM = 4
+
 
 @dataclass
 class AnswerOutcome:
@@ -54,6 +57,20 @@ class AnswerService:
         self.graph = graph
         self.settings = settings
 
+    def preflight(self, question: str, *, top_k: int) -> None:
+        """进图前的预算预检（流式请求也必须在**流开始前**跑，才会返回真 422）。
+
+        超限抛 `BudgetExceeded`；调用方（路由）把它转成 422 budget_exceeded。
+        """
+        from ..graphs.budget import preflight
+
+        preflight(
+            self.settings,
+            question=question,
+            top_k=top_k,
+            max_new_tokens=self.settings.max_new_tokens,
+        )
+
     async def answer(
         self,
         question: str,
@@ -66,6 +83,8 @@ class AnswerService:
     ) -> AnswerOutcome:
         answer_id = "ans_" + uuid.uuid4().hex[:16]
         trace_id = "trc_" + uuid.uuid4().hex[:16]
+        # 预检（超限直接拒绝，一次模型都不调）；路由在流式路径也会先调一遍
+        self.preflight(question, top_k=top_k)
 
         seed = {
             "answer_id": answer_id,
@@ -84,8 +103,10 @@ class AnswerService:
             seed,
             config={
                 "configurable": {"thread_id": trace_id},
-                # 兜底防跑飞；友好原因由 app/graphs/budget.py 的守卫给出（见 M3 预算提交）
-                "recursion_limit": self.settings.graph_max_steps,
+                # 兜底防跑飞：**预算守卫先触发**（给出"超了哪道上限"的友好原因），
+                # 这里只是最后的保险，所以留出余量，避免 LangGraph 的 GraphRecursionError
+                # 抢在 budget_exceeded 之前把请求打断（错误语义会变成"内部错误"）
+                "recursion_limit": self.settings.graph_max_steps + RECURSION_HEADROOM,
             },
         )
         outcome = final.get("outcome") or {}

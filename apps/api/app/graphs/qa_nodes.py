@@ -36,6 +36,7 @@ from ..parity.verify import (
     verify_answer,
 )
 from ..store import AnswerRecord, Store, TraceRecord
+from .budget import BudgetLimits, charge
 from .state import QaState, filters_from_dict
 from .trace import trace_row
 
@@ -100,12 +101,22 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         """
         t0 = time.perf_counter()
         expansions: list[str] = []
+        ledger = state.get("budget")
         status = "ok"
         summary = "无可用改写 → 仅原查询"
         try:
             completion = deps.provider.complete(
                 build_expand_prompt(ExpandPromptInput(question=state["question"], max=3)),
                 max_new_tokens=128,
+            )
+            # 改写也是一次模型调用：同样计入预算（超限抛 BudgetExceeded）
+            ledger = charge(
+                ledger,
+                limits=BudgetLimits.from_settings(deps.settings),
+                settings=deps.settings,
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=completion.completion_tokens,
+                stage="rewrite",
             )
             expansions = parse_expanded_queries(completion.text or "", state["question"])
             if expansions:
@@ -129,6 +140,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         return {
             "expansions": expansions,
             "rewritten_query": expansions[0] if expansions else None,
+            "budget": ledger,
             "breakdown": {"rewrite": duration_ms},
             "trace_nodes": [row],
         }
@@ -232,6 +244,14 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         completion = deps.provider.complete(
             prompt, max_new_tokens=deps.settings.max_new_tokens
         )
+        ledger = charge(
+            state.get("budget"),
+            limits=BudgetLimits.from_settings(deps.settings),
+            settings=deps.settings,
+            prompt_tokens=completion.prompt_tokens,
+            completion_tokens=completion.completion_tokens,
+            stage="generate",
+        )
         duration_ms = int((time.perf_counter() - t1) * 1000)
         final_text = strip_think_tags(completion.text or "")
         row = trace_row(
@@ -243,6 +263,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         )
         return {
             "answer": final_text,
+            "budget": ledger,
             "completion_meta": {
                 "prompt_tokens": completion.prompt_tokens,
                 "completion_tokens": completion.completion_tokens,
@@ -419,7 +440,8 @@ def _cost_dict(
             "completion": completion_tokens,
             "total": prompt_tokens + completion_tokens,
         },
-        "estimated_cost_usd": LOCAL_COST_USD,
+        # 成本口径：按价目折算（默认价目 0 → 本地通道仍是 0.0，与 M2 逐字段一致）
+        "estimated_cost_usd": float((state.get("budget") or {}).get("cost_usd", LOCAL_COST_USD) or LOCAL_COST_USD),
     }
 
 

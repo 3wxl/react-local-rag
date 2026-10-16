@@ -31,56 +31,11 @@ NEGATIVE_Q = "公司的股票代码是多少？"
 CORPUS_DOCS = ["产品手册.md", "员工手册.md", "会议纪要.md"]
 
 
-# ---------------- 自建环境（独立数据目录 + 真实摄取） ----------------
+# 自建环境（独立数据目录 + 真实摄取）在 conftest.py 的 `qa_env` fixture 里，
+# 与 test_budget.py 共用。
 
 
-@pytest.fixture
-async def qa_env(tmp_path):
-    from app.core.config import Settings
-    from app.embedding.bge import BgeOnnxEmbedder
-    from app.generation.fake import FakeProvider
-    from app.graphs.qa_graph import build_qa_graph
-    from app.graphs.qa_nodes import QaDeps
-    from app.services.answer_service import AnswerService
-    from app.services.ingest_service import IngestService
-    from app.services.retrieval_service import RetrievalService
-    from app.store import make_store
-
-    settings = Settings(data_dir=tmp_path)
-    store = make_store("", tmp_path)
-    await store.init()
-    # 自建实例（不用 get_embedder 的进程内单例）：单例会被别的用例改 enabled，
-    # 本环境必须与测试顺序无关。权重缺失时 available=False，检索退化为 BM25-only。
-    embedder = BgeOnnxEmbedder(settings.bge_model_dir)
-    provider = FakeProvider()
-    retrieval = RetrievalService(store, embedder)
-    ingest = IngestService(
-        store,
-        embedder,
-        data_dir=tmp_path,
-        on_index_changed=lambda version=None: retrieval.invalidate(version),
-    )
-    for name in CORPUS_DOCS:
-        await ingest.ingest_path(EVAL_CORPUS_DIR / name, doc_name=name)
-
-    deps = QaDeps(
-        store=store,
-        retrieval=retrieval,
-        embedder=embedder,
-        provider=provider,
-        settings=settings,
-    )
-    graph = build_qa_graph(deps, None)
-    version = (await store.list_ready_versions())[0].version
-    try:
-        yield SimpleNamespace(
-            settings=settings, store=store, deps=deps, graph=graph, version=version
-        )
-    finally:
-        await store.close()
-
-
-async def _answer(env, question: str, *, provider=None):
+async def _answer(env, question: str, *, provider=None, rewrite: bool = False):
     import dataclasses
 
     from app.graphs.qa_graph import build_qa_graph
@@ -93,7 +48,11 @@ async def _answer(env, question: str, *, provider=None):
     graph = env.graph if provider is None else build_qa_graph(deps, None)
     service = AnswerService(graph, settings=env.settings)
     return await service.answer(
-        question, version=env.version, top_k=3, filters=Filters(tenant_id="default")
+        question,
+        version=env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=rewrite,
     )
 
 
@@ -342,24 +301,29 @@ async def test_state_is_json_native_and_deterministic(qa_env) -> None:
 # ---------------- HTTP 层：路由确实接到了图上 ----------------
 
 
+def _ingest(client: TestClient, names: list[str]) -> None:
+    """走 HTTP 摄取并等到终态（202 + 轮询，与前端同一套流程）。"""
+    for name in names:
+        with (EVAL_CORPUS_DIR / name).open("rb") as fh:
+            response = client.post(
+                "/v1/documents", files={"file": (name, fh, "text/markdown")}
+            )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["task_id"]
+        for _ in range(200):
+            task = client.get(f"/v1/tasks/{task_id}").json()
+            if task["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.2)
+        assert task["status"] == "succeeded", task
+
+
 @pytest.fixture(scope="module")
 def client() -> TestClient:
     from app.main import app
 
     with TestClient(app) as test_client:
-        for name in CORPUS_DOCS:
-            with (EVAL_CORPUS_DIR / name).open("rb") as fh:
-                response = test_client.post(
-                    "/v1/documents", files={"file": (name, fh, "text/markdown")}
-                )
-            assert response.status_code == 202, response.text
-            task_id = response.json()["task_id"]
-            for _ in range(200):
-                task = test_client.get(f"/v1/tasks/{task_id}").json()
-                if task["status"] in ("succeeded", "failed"):
-                    break
-                time.sleep(0.2)
-            assert task["status"] == "succeeded", task
+        _ingest(test_client, CORPUS_DOCS)
         yield test_client
 
 
