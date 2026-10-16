@@ -35,6 +35,15 @@ services:
       MODELS_DIR: /models
       EVAL_DIR: /eval
       LLM_PROVIDER: onnx
+      # M3：成本预算（超限拒绝并说明原因）；本地通道价目为 0，接云端通道时配 COST_PER_1K_*
+      REQUEST_TOKEN_BUDGET: "4096"
+      REQUEST_COST_LIMIT_USD: "0.5"
+      GRAPH_MAX_STEPS: "12"
+      # 检查点：SQLite 文件落在 /data 卷上（单副本部署；多副本时换 Postgres saver）
+      CHECKPOINT_BACKEND: sqlite
+      # MCP 工具（可选，默认关闭）：挂仓库自带 TS server 时取消注释
+      # MCP_SERVER_COMMAND: "node --import tsx /web/scripts/mcp/server.ts --backup /data/backup.json"
+      # MCP_ALLOWLIST: "search_docs,doc_outline,read_chunks"
     volumes:
       # 模型权重与评测资产都以只读挂载，镜像里不打包上百 MB 的权重
       - ../../apps/web/public/models:/models:ro
