@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,8 @@ def run_eval(
         )
         docs = load_corpus_docs(eval_dir, chunk_vectors=fixed.chunks)
         query_vectors = fixed.queries
+        # 查询扩展：与 TS 用同一份固化产物（expansions.json 的文本 + embeddings.json 的向量）
+        expansions = load_expansions(eval_dir)
 
         def query_vector_of(query) -> np.ndarray | None:
             return query_vectors.get(query.id)
@@ -83,6 +86,8 @@ def run_eval(
             for doc, vec in zip(docs, vectors):
                 doc.vector = vec
 
+        expansions = {} if fixed is None else load_expansions(eval_dir)
+
         def query_vector_of(query) -> np.ndarray | None:
             if embedder is None or not embedder.available:
                 return None
@@ -91,7 +96,13 @@ def run_eval(
         mode = "live"
 
     metrics = evaluate(
-        docs, golden.queries, top_k=top_k, options=options, query_vector_of=query_vector_of
+        docs,
+        golden.queries,
+        top_k=top_k,
+        options=options,
+        query_vector_of=query_vector_of,
+        expansions=(expansions or {}).get("texts"),
+        expansion_vectors=fixed.expansions if fixed is not None else None,
     )
     passed, failed = check_gates(metrics)
     config = {
@@ -109,7 +120,11 @@ def run_eval(
             "bm25_weight": options.bm25_weight,
             "min_vec_score": options.min_vec_score,
             "bm25_exempt_rank": options.bm25_exempt_rank,
+            # 多信号融合拒答的四路门限（2026-10-15 起生效）：评测配置必须记录生效值
             "min_idf_coverage": options.min_idf_coverage,
+            "min_max_cosine": options.min_max_cosine,
+            "min_cos_gap": options.min_cos_gap,
+            "min_bm25": options.min_bm25,
             "relative_cut_ratio": options.relative_cut_ratio,
             "max_window_chars": options.max_window_chars,
             "window_radius": options.window_radius,
@@ -127,6 +142,19 @@ def run_eval(
         metrics_raw=metrics,
         latency_ms=int((time.perf_counter() - started) * 1000),
     )
+
+
+def load_expansions(eval_dir: Path) -> dict | None:
+    """读取查询扩展的固化产物（packages/eval/expansions.json）；不存在返回 None。
+
+    与 TS 侧 loadFixedExpansions 同一份文件 —— 双端评测必须吃同一批改写，
+    否则"双端同口径"就只剩检索算法本身，输入却已经不同了。
+    """
+    path = Path(eval_dir) / "expansions.json"
+    if not path.exists():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {"texts": raw.get("expansions", {})}
 
 
 def _apply_overrides(options, overrides: dict):

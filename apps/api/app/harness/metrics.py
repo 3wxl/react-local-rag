@@ -20,6 +20,7 @@ import numpy as np
 from ..parity.bm25 import BM25
 from ..parity.retrieval import (
     DEFAULT_RETRIEVAL_OPTIONS,
+    QueryVariantScores,
     RetrievalDoc,
     RetrievalOptions,
     post_process_retrieval,
@@ -45,6 +46,12 @@ class Metrics:
     top3_near_duplicate_rate: float = 0.0
     no_hit_query_count: int = 0
     false_refusal_count: int = 0
+    #: 受保护人群（q+m，不含口语化 s）的误拒条数 —— 门槛只卡这一批（2026-10-15 起）
+    protected_false_refusal_count: int = 0
+    #: 受保护人群（q+m）的 recall@3（相对门槛的分子）
+    protected_recall_at_3: float = 0.0
+    #: 受保护人群的 BM25-only recall@3（相对门槛的分母）；无向量路时为 None
+    protected_bm25_only_recall_at_3: float | None = None
     negative_count: int = 0
     negative_refused_count: int = 0
     negative_refusal_rate: float = 0.0
@@ -67,6 +74,9 @@ class Metrics:
             "top3NearDuplicateRate": self.top3_near_duplicate_rate,
             "noHitQueryCount": self.no_hit_query_count,
             "falseRefusalCount": self.false_refusal_count,
+            "protectedFalseRefusalCount": self.protected_false_refusal_count,
+            "protectedRecallAt3": self.protected_recall_at_3,
+            "protectedBm25OnlyRecallAt3": self.protected_bm25_only_recall_at_3,
             "negativeCount": self.negative_count,
             "negativeRefusedCount": self.negative_refused_count,
             "negativeRefusalRate": self.negative_refusal_rate,
@@ -110,6 +120,10 @@ def _fallback_bm25_only(
     )
 
 
+#: 查询扩展变体的 RRF 权重（与 TS 的 EXPANSION_WEIGHT 默认值一致）
+EXPANSION_WEIGHT = 0.7
+
+
 def evaluate(
     docs: list[RetrievalDoc],
     queries,
@@ -117,11 +131,15 @@ def evaluate(
     top_k: int = 5,
     options: RetrievalOptions = DEFAULT_RETRIEVAL_OPTIONS,
     query_vector_of: Callable[[object], np.ndarray | None] | None = None,
+    expansions: dict[str, list[str]] | None = None,
+    expansion_vectors: dict[str, list[np.ndarray]] | None = None,
 ) -> Metrics:
     """跑一遍检索评测（与 TS evaluate 同序）。
 
     `query_vector_of`：查询 id → 查询向量。固化向量（CI/可复现）与本地 ONNX（真实模型）
     两种来源都从调用方注入，指标算法本身不关心向量从哪来。
+    `expansions` / `expansion_vectors`：固化的查询改写与它们的向量（缺省 = 不开扩展，
+    与 TS 侧"没有 expansions.json 时按单查询跑"一致）。
     """
     bm25 = BM25([d.content for d in docs])
     hybrid = any(d.vector is not None for d in docs)
@@ -135,6 +153,35 @@ def evaluate(
         return [
             float(np.dot(d.vector, qvec)) if d.vector is not None else 0.0 for d in docs
         ]
+
+    def variants_for(query) -> list[QueryVariantScores]:
+        """查询扩展变体：与 TS eval.ts 的 expansionRunsFor 同口径（同一份固化产物）。"""
+        texts = (expansions or {}).get(query.id) or []
+        vectors = (expansion_vectors or {}).get(query.id) or []
+        if not texts or not vectors:
+            return []
+        out: list[QueryVariantScores] = []
+        for i, text in enumerate(texts):
+            if i >= len(vectors):
+                break
+            qvec = vectors[i]
+            vec_scores = (
+                [
+                    float(np.dot(d.vector, qvec)) if d.vector is not None else 0.0
+                    for d in docs
+                ]
+                if hybrid
+                else None
+            )
+            out.append(
+                QueryVariantScores(
+                    bm25_scores=bm25.score_all(text),
+                    vec_scores=vec_scores,
+                    idf_coverage=bm25.idf_weighted_coverage(text),
+                    weight=EXPANSION_WEIGHT,
+                )
+            )
+        return out
     positives = [q for q in queries if not q.negative]
     negatives = [q for q in queries if q.negative]
 
@@ -145,13 +192,21 @@ def evaluate(
     point_hits = point_total = 0
     no_hit = 0
     dup_queries = near_dup_queries = 0
+    # 受保护人群（q+m）累计：误拒门槛与相对门槛只在这批上判定（s 已按调参口径降为观察项）
+    protected_count = 0
+    protected_r3 = 0.0
+    protected_bm25_only_r3 = 0.0
+    protected_no_hit = 0
     by_group: dict[str, dict] = {}
 
     for q in positives:
         bm25_scores = bm25.score_all(q.question)
         vec_scores = vec_scores_for(q)
         idf = bm25.idf_weighted_coverage(q.question)
-        result = post_process_retrieval(docs, bm25_scores, vec_scores, options, idf_coverage=idf)
+        variants = variants_for(q)
+        result = post_process_retrieval(
+            docs, bm25_scores, vec_scores, options, idf_coverage=idf, variants=variants
+        )
         # MRR 与正式指标必须走同一条管线，只把候选放宽到 top10
         wide = post_process_retrieval(
             docs,
@@ -159,6 +214,7 @@ def evaluate(
             vec_scores,
             RetrievalOptions(**{**options.__dict__, "top_k": 10}),
             idf_coverage=idf,
+            variants=variants,
         )
 
         if result.no_relevant_hit:
@@ -167,11 +223,24 @@ def evaluate(
         covered = _coverage(result.hits, q.relevant, 3)
         recall3 += covered
         recall5 += _coverage(result.hits, q.relevant, 5)
+        # 分组：q=技术措辞，s=口语化改写（观察项），m=单文档多主题
+        group = q.id[0] if q.id[0] in ("s", "m") else "q"
+        #: 受保护人群：q+m（不含口语化 s）
+        is_protected = group != "s"
+        # 相对门槛（hybrid ≥ BM25-only × 0.95）同样只算受保护人群：
+        # s 已被检索侧刻意粗拒，让它当分母等于用「已知要放弃的人群」去卡向量质量，必然误报
         if hybrid:
             only = _fallback_bm25_only(docs, bm25, q.question, options)
-            bm25_only_r3 += _coverage(only.hits, q.relevant, 3)
+            base_r3 = _coverage(only.hits, q.relevant, 3)
+            bm25_only_r3 += base_r3
+            if is_protected:
+                protected_bm25_only_r3 += base_r3
 
-        group = q.id[0] if q.id[0] in ("s", "m") else "q"
+        if is_protected:
+            protected_count += 1
+            protected_r3 += covered
+            if result.no_relevant_hit:
+                protected_no_hit += 1
         bucket = by_group.setdefault(group, {"count": 0, "r3": 0.0, "r5": 0.0, "noHit": 0})
         bucket["count"] += 1
         bucket["r3"] += covered
@@ -226,7 +295,14 @@ def evaluate(
         bm25_scores = bm25.score_all(q.question)
         vec_scores = vec_scores_for(q)
         idf = bm25.idf_weighted_coverage(q.question)
-        result = post_process_retrieval(docs, bm25_scores, vec_scores, options, idf_coverage=idf)
+        result = post_process_retrieval(
+            docs,
+            bm25_scores,
+            vec_scores,
+            options,
+            idf_coverage=idf,
+            variants=variants_for(q),
+        )
         refused = result.no_relevant_hit
         negative_refused += int(refused)
         metrics.negative_detail.append(
@@ -249,6 +325,16 @@ def evaluate(
     metrics.top3_near_duplicate_rate = _round4(near_dup_queries / n)
     metrics.no_hit_query_count = no_hit
     metrics.false_refusal_count = no_hit
+    # 受保护人群（q+m）：误拒门槛与相对门槛的取值来源，与 eval.ts 逐位同口径
+    metrics.protected_false_refusal_count = protected_no_hit
+    metrics.protected_recall_at_3 = (
+        _round4(protected_r3 / protected_count) if protected_count else 0.0
+    )
+    metrics.protected_bm25_only_recall_at_3 = (
+        _round4(protected_bm25_only_r3 / protected_count)
+        if hybrid and protected_count
+        else None
+    )
     metrics.negative_count = len(negatives)
     metrics.negative_refused_count = negative_refused
     metrics.negative_refusal_rate = (
