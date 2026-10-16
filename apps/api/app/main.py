@@ -24,6 +24,7 @@ from .api.router import api_router, v1_router
 from .core.config import settings
 from .embedding.bge import get_embedder
 from .generation.factory import build_provider
+from .graphs import open_checkpointer
 from .services.answer_service import AnswerService
 from .services.ingest_service import IngestService
 from .services.reindex_service import ReindexService
@@ -50,23 +51,26 @@ async def lifespan(app: FastAPI):
         # 摄取完成后 BM25 缓存必须失效，否则检索到的还是旧语料
         on_index_changed=lambda version=None: retrieval.invalidate(version),
     )
-    ctx = AppContext(
-        settings=settings,
-        store=store,
-        embedder=embedder,
-        provider=provider,
-        retrieval=retrieval,
-        answer=AnswerService(store, retrieval, embedder, provider),
-        ingest=ingest,
-        reindex=ReindexService(store, ingest),
-    )
-    app.state.ctx = ctx
-    try:
-        yield
-    finally:
-        for task in list(ctx.tasks.values()):
-            task.cancel()
-        await store.close()
+    # 检查点必须在这里打开（而不是模块导入时）：AsyncSqliteSaver 绑定当前事件循环
+    async with open_checkpointer(settings) as checkpointer:
+        ctx = AppContext(
+            settings=settings,
+            store=store,
+            embedder=embedder,
+            provider=provider,
+            retrieval=retrieval,
+            answer=AnswerService(store, retrieval, embedder, provider),
+            ingest=ingest,
+            reindex=ReindexService(store, ingest),
+            checkpointer=checkpointer,
+        )
+        app.state.ctx = ctx
+        try:
+            yield
+        finally:
+            for task in list(ctx.tasks.values()):
+                task.cancel()
+            await store.close()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)

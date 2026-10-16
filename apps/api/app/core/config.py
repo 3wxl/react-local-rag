@@ -44,6 +44,31 @@ class Settings(BaseSettings):
     # ---------------- 服务 ----------------
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
+    # ---------------- 图编排（M3） ----------------
+    #: 检查点后端：sqlite（默认，落 checkpoint_db_path）| memory（测试 / 无盘环境）
+    checkpoint_backend: str = "sqlite"
+    #: 单请求图深度上限（同时作为 recursion_limit 兜底；友好原因由 budget 模块给出）
+    graph_max_steps: int = 12
+    #: 单请求 token 预算（预检 + 逐步记账，超限 422 budget_exceeded）
+    request_token_budget: int = 4096
+    #: 单请求成本上限（本地模型按 0 计；接云端通道时配合下面的价目）
+    request_cost_limit_usd: float = 0.5
+    #: 价目（每 1K token，美元）：默认 0 = 本地口径，estimated_cost_usd 随之保持 0
+    cost_per_1k_prompt_usd: float = 0.0
+    cost_per_1k_completion_usd: float = 0.0
+    #: Agent 无进展检测：连续 N 次没有新增证据即提前收敛（多跳何时停）
+    agent_no_progress_limit: int = 2
+    #: MCP 工具服务（stdio 启动命令，空 = 禁用；CI 与默认部署都不起外部进程）
+    mcp_server_command: str = ""
+    #: MCP 工具 allowlist（空 = 全部放行的前提是显式配置了服务；见 app/mcp/client.py）
+    mcp_allowlist: list[str] = []
+    mcp_timeout_s: float = 20.0
+
+    @property
+    def checkpoint_db_path(self) -> Path:
+        """检查点库：与业务库分离的 SQLite 文件（单副本部署，见 docs/ROADMAP-FULLSTACK.md §5）。"""
+        return Path(self.data_dir) / "graph_checkpoints.sqlite3"
+
     @property
     def bge_model_dir(self) -> Path:
         return self.models_dir / "Xenova" / "bge-small-zh-v1.5"

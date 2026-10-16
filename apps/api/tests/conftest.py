@@ -16,6 +16,8 @@ import tempfile
 # 必须在 import app.* 之前：测试只允许写临时目录，且默认用假生成模型（不下载权重）
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="rag-api-test-"))
 os.environ.setdefault("LLM_PROVIDER", "fake")
+# 检查点默认走内存：大多数测试不关心落盘；持久化本身由 test_checkpoint.py 用临时 SQLite 单独证明
+os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 
 import pytest
 

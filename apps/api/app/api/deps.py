@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import Request
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from ..core.config import Settings
 from ..embedding.bge import BgeOnnxEmbedder
@@ -36,7 +37,9 @@ class AppContext:
     ingest: IngestService
     #: 索引灰度重建（进程内任务，断点写 tasks 表）
     reindex: ReindexService
-    #: 进程内任务（评测 / 摄取）：不引队列框架，状态写 tasks 表
+    #: LangGraph 检查点（M3）：interrupt 恢复与断点续跑都在这里落盘
+    checkpointer: BaseCheckpointSaver | None = None
+    #: 进程内任务（评测 / 摄取 / Agent 续跑）：不引队列框架，状态写 tasks 表
     tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 
     def spawn(self, task_id: str, coro) -> None:
