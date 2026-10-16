@@ -15,6 +15,7 @@ GET  /v1/agent/{run_id}/trace   → 与 answer trace 同形（自包含回放）
 from __future__ import annotations
 
 import uuid
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -113,6 +114,19 @@ async def agent_resume(
     if task.status != "interrupted":
         raise ApiError("invalid_request", f"该 run 没有待审批的工具调用（状态：{task.status}）")
 
+    if body.stream:
+        # 批准后继续看流式输出：事件协议与 /v1/agent/run 完全一致（前端复用同一套解析）
+        await ctx.store.update_task(run_id, status="running")
+        return StreamingResponse(
+            _sse_events(
+                ctx,
+                run_id,
+                ctx.agent.resume_stream(run_id, approved=body.approved, note=body.note),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     await ctx.store.update_task(run_id, status="running")
 
     async def run() -> None:
@@ -195,6 +209,16 @@ async def _sse_run(ctx: AppContext, body: AgentRunRequest, *, run_id, version, t
     events = ctx.agent.run_stream(
         body.question, run_id=run_id, version=version, top_k=top_k, filters=filters
     )
+    async for frame in _sse_events(ctx, run_id, events):
+        yield frame
+
+
+async def _sse_events(ctx: AppContext, run_id: str, events) -> AsyncIterator[str]:
+    """把 Agent 事件流转成 SSE，并同步任务表状态（中断/成功/失败三种终态）。
+
+    `run` 与 `resume`（stream=true）共用这一处：状态机的写入点只有一个，
+    否则"批准之后任务表还停在 running"这类不一致迟早出现。
+    """
     async for payload in events:
         if payload["event"] == "interrupt":
             await ctx.store.update_task(
@@ -207,7 +231,10 @@ async def _sse_run(ctx: AppContext, body: AgentRunRequest, *, run_id, version, t
             await ctx.store.update_task(
                 run_id,
                 status="succeeded",
-                progress={"steps": data.get("steps", 0), "tool_calls": data.get("tool_calls", [])},
+                progress={
+                    "steps": data.get("steps", 0),
+                    "tool_calls": data.get("tool_calls", []),
+                },
                 checkpoint={"thread_id": run_id},
             )
         elif payload["event"] == "error":

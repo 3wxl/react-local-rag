@@ -117,3 +117,68 @@ def test_agent_trace_not_found_before_completion(client: TestClient) -> None:
     """未完成的 run 没有轨迹（自包含回放的前提是"跑完了"）。"""
     response = client.get("/v1/agent/run_pending/trace")
     assert response.status_code == 404
+
+
+def test_hitl_run_and_streaming_resume(client: TestClient, monkeypatch) -> None:
+    """HITL 全链路（HTTP）：需审批工具 → interrupted → 批准 → 流式续跑到 final。
+
+    注入脚本化 planner 与一个"需要审批的工具"：默认配置里没有 MCP server，
+    真模型又不会稳定地规划出工具调用 —— 而这里要验的是**状态机与事件流**。
+    """
+    from app.graphs.tools.registry import ToolOutcome, ToolSpec
+
+    from .test_agent_graph import ScriptedProvider, _ANSWER, _tool_call
+
+    async def handler(args: dict) -> ToolOutcome:
+        return ToolOutcome(text=f"已写入：{args.get('text', '')}")
+
+    approval_tool = ToolSpec(
+        name="mcp:write_note",
+        description="写外部系统（需要审批）",
+        parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+        handler=handler,
+        source="mcp",
+        requires_approval=True,
+    )
+
+    ctx = client.app.state.ctx
+    monkeypatch.setattr(
+        ctx.agent,
+        "provider",
+        ScriptedProvider([_tool_call("mcp:write_note", {"text": "记一下"}), _ANSWER]),
+    )
+    monkeypatch.setattr(ctx.agent, "mounted_tools", [approval_tool])
+
+    started = client.post("/v1/agent/run", json={"question": "把结论记到外部系统"})
+    assert started.status_code == 200, started.text
+    body = started.json()
+    assert body["status"] == "interrupted"
+    assert body["pending_approval"]["tool"] == "mcp:write_note"
+    assert "args_preview" in body["pending_approval"]
+
+    run_id = body["run_id"]
+    status = client.get(f"/v1/agent/{run_id}").json()
+    assert status["status"] == "interrupted"
+    assert status["pending_approval"]["tool"] == "mcp:write_note"
+
+    # 批准 → 流式续跑：事件协议与首次运行相同
+    with client.stream(
+        "POST",
+        f"/v1/agent/{run_id}/resume",
+        json={"approved": True, "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _read_sse(response)
+
+    finals = [data for event, data in events if event == "final"]
+    assert len(finals) == 1
+    assert finals[0]["tool_calls"][0]["tool"] == "mcp:write_note"
+    assert finals[0]["tool_calls"][0]["ok"] is True
+
+    # 终态与轨迹都落地（自包含回放）
+    assert client.get(f"/v1/agent/{run_id}").json()["status"] == "succeeded"
+    trace = client.get(f"/v1/agent/{run_id}/trace").json()
+    names = [row["name"] for row in trace["nodes"]]
+    assert names.count("act") == 1, names
+    assert trace["evidence_snapshot"]["tool_calls"][0]["ok"] is True

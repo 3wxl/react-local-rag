@@ -62,6 +62,11 @@ const ORIGIN_META: Record<
     square: "bg-indigo-500",
     text: "text-indigo-600 dark:text-indigo-400",
   },
+  "server-agent": {
+    label: "服务端 Agent",
+    square: "bg-amber-500",
+    text: "text-amber-600 dark:text-amber-400",
+  },
 };
 
 /** 来源标记小徽标：彩色方块 + 文案 */

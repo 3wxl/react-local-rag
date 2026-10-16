@@ -53,10 +53,15 @@ class AgentRunRequest(StrictModel):
 
 
 class AgentResumeRequest(StrictModel):
-    """POST /v1/agent/{run_id}/resume：人工审批（HITL）的决定。"""
+    """POST /v1/agent/{run_id}/resume：人工审批（HITL）的决定。
+
+    `stream=true` 时以 SSE 继续同一条流（事件协议与 /v1/agent/run 相同）——
+    前端"点批准 → 继续看流式输出"就是这条路径。
+    """
 
     approved: bool
     note: str | None = None
+    stream: bool = False
 
 
 class EvalRunRequest(StrictModel):
