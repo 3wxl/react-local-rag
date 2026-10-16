@@ -188,6 +188,124 @@ async def test_answer_side_refusal_is_first_class_branch(qa_env) -> None:
     assert outcome.verification["source"] == "lexical"
 
 
+async def test_rewrite_is_off_by_default(qa_env) -> None:
+    """默认不开改写：轨迹里没有 rewrite 行，快照里没有 rewrite 字段（逐字节保真）。"""
+    outcome = await _answer(qa_env, POSITIVE_Q)
+
+    assert "rewrite" not in [n["name"] for n in outcome.trace_nodes]
+    assert "rewrite" not in outcome.evidence_snapshot
+    assert "rewrite" not in outcome.cost["latency_breakdown_ms"]
+
+
+async def test_rewrite_enabled_adds_node_and_freezes_snapshot(qa_env) -> None:
+    """rewrite=true：图从 rewrite 节点进，快照冻结实际生效的改写词。"""
+    from app.generation.base import Completion
+    from app.generation.fake import FakeProvider
+    from app.store import Filters
+    from app.services.answer_service import AnswerService
+    from app.graphs.qa_graph import build_qa_graph
+    import dataclasses
+
+    fake = FakeProvider()
+
+    class _ExpandingProvider:
+        name = "stub"
+        model = "stub-expand"
+
+        def available(self) -> bool:
+            return True
+
+        def complete(self, prompt: str, *, max_new_tokens: int = 512) -> Completion:
+            # 改写 Prompt 没有【文档内容】段；问答 Prompt 有（桩模型按此分流）
+            if "【文档内容】" in prompt:
+                return fake.complete(prompt, max_new_tokens=max_new_tokens)
+            return Completion(
+                text="智能网关 标准版 售价\n网关 价格 参数",
+                prompt_tokens=40,
+                completion_tokens=12,
+                model=self.model,
+                provider=self.name,
+                sampling={"deterministic": True},
+            )
+
+    deps = dataclasses.replace(qa_env.deps, provider=_ExpandingProvider())
+    service = AnswerService(build_qa_graph(deps, None), settings=qa_env.settings)
+    outcome = await service.answer(
+        POSITIVE_Q,
+        version=qa_env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=True,
+    )
+
+    names = [n["name"] for n in outcome.trace_nodes]
+    assert names[0] == "rewrite", names
+    assert outcome.trace_nodes[0]["status"] == "ok"
+    assert set(outcome.cost["latency_breakdown_ms"]) == {
+        "rewrite",
+        "retrieve",
+        "generate",
+        "verify",
+    }
+    # 快照冻结"实际生效"的改写（而不是"请求了改写"）
+    rewrite_info = outcome.evidence_snapshot["rewrite"]
+    assert rewrite_info["enabled"] is True
+    assert rewrite_info["applied"] is True
+    assert rewrite_info["expansions"], rewrite_info
+
+
+async def test_rewrite_with_unavailable_model_marks_skipped(qa_env) -> None:
+    """模型不可用时改写降级：节点记 skipped，问答照常走原查询（增强项不挡主路径）。"""
+    import dataclasses
+
+    from app.generation.base import ModelUnavailableError
+    from app.generation.fake import FakeProvider
+    from app.graphs.qa_graph import build_qa_graph
+    from app.services.answer_service import AnswerService
+    from app.store import Filters
+
+    fake = FakeProvider()
+
+    class _NoModelProvider:
+        name = "stub"
+        model = "stub-no-model"
+
+        def available(self) -> bool:
+            return False
+
+        def complete(self, prompt: str, *, max_new_tokens: int = 512):
+            if "【文档内容】" in prompt:
+                return fake.complete(prompt, max_new_tokens=max_new_tokens)
+            raise ModelUnavailableError("模型未就绪（测试桩）")
+
+    deps = dataclasses.replace(qa_env.deps, provider=_NoModelProvider())
+    service = AnswerService(build_qa_graph(deps, None), settings=qa_env.settings)
+    outcome = await service.answer(
+        POSITIVE_Q,
+        version=qa_env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=True,
+    )
+
+    row = outcome.trace_nodes[0]
+    assert row["name"] == "rewrite"
+    assert row["status"] == "skipped"
+    assert "模型不可用" in row["output_summary"]
+    assert outcome.evidence_snapshot["rewrite"] == {
+        "enabled": True,
+        "applied": False,
+        "expansions": [],
+    }
+    # 主路径不受影响：检索/生成照常
+    assert [n["name"] for n in outcome.trace_nodes][1:] == [
+        "retrieve",
+        "gate",
+        "generate",
+        "verify",
+    ]
+
+
 async def test_state_is_json_native_and_deterministic(qa_env) -> None:
     """State 必须能被 JSON 序列化（检查点前提），且同题两次的裁决一致。"""
     first = await _answer(qa_env, POSITIVE_Q)

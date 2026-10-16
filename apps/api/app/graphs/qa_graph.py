@@ -23,6 +23,8 @@ def build_qa_graph(deps: QaDeps, checkpointer: BaseCheckpointSaver | None = None
     nodes = build_qa_nodes(deps)
 
     graph = StateGraph(QaState)
+    # 改写是条件入口：默认（rewrite=false）不进图，默认路径轨迹与 M2 逐行一致
+    graph.add_node("rewrite", nodes["rewrite"])
     graph.add_node("retrieve", nodes["retrieve"])
     graph.add_node("gate", nodes["gate"])
     graph.add_node("generate", nodes["generate"])
@@ -31,7 +33,12 @@ def build_qa_graph(deps: QaDeps, checkpointer: BaseCheckpointSaver | None = None
     graph.add_node("refuse_unsupported", nodes["refuse_unsupported"])
     graph.add_node("finalize", nodes["finalize"])
 
-    graph.add_edge(START, "retrieve")
+    graph.add_conditional_edges(
+        START,
+        nodes["route_rewrite"],
+        {"rewrite": "rewrite", "retrieve": "retrieve"},
+    )
+    graph.add_edge("rewrite", "retrieve")
     graph.add_edge("retrieve", "gate")
     graph.add_conditional_edges(
         "gate",

@@ -55,6 +55,7 @@ async def answer(
             version=active.version,
             top_k=body.top_k or DEFAULT_RETRIEVAL_OPTIONS.top_k,
             filters=filters,
+            rewrite=body.rewrite,
         )
     except ModelUnavailableError as err:
         raise ApiError("model_unavailable", str(err)) from err

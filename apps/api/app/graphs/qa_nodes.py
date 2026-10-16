@@ -21,9 +21,11 @@ import numpy as np
 from ..api.serializers import context_from_dict, context_to_dict, verification_to_dict
 from ..core.config import Settings
 from ..embedding.bge import BgeOnnxEmbedder
-from ..generation.base import LlmProvider
+from ..generation.base import LlmProvider, ModelUnavailableError
 from ..parity.answer_prompt import AnswerPromptInput, PromptPassage, build_answer_prompt
 from ..parity.citation import build_evidence, to_verify_passages
+from ..parity.expand_prompt import ExpandPromptInput, build_expand_prompt
+from ..parity.query_expansion import parse_expanded_queries
 from ..parity.retrieval import DEFAULT_RETRIEVAL_OPTIONS
 from ..parity.verify import (
     DEFAULT_VERIFY_THRESHOLDS,
@@ -87,6 +89,58 @@ def fired_signals(summary: dict) -> list[str]:
 def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
     """构造 QA 图节点（闭包持有依赖）。"""
 
+    # ---------------- 0. 改写（按请求开启；默认关，见 AnswerRequest.rewrite） ----------------
+
+    async def rewrite(state: QaState) -> dict:
+        """口语化提问 → 术语化检索关键词（与 /v1/retrieve 的 rewrite 同一份实现）。
+
+        为什么默认关：线上默认配置 = 评测默认配置，且浏览器 Lite 模式的普通 RAG 分支
+        不改写 —— 默认开启会让双端口径分叉（M2 的改写收益在 /v1/retrieve 已验证，
+        随时可以用 `rewrite: true` 升级默认值，但那要两端一起改）。
+        """
+        t0 = time.perf_counter()
+        expansions: list[str] = []
+        status = "ok"
+        summary = "无可用改写 → 仅原查询"
+        try:
+            completion = deps.provider.complete(
+                build_expand_prompt(ExpandPromptInput(question=state["question"], max=3)),
+                max_new_tokens=128,
+            )
+            expansions = parse_expanded_queries(completion.text or "", state["question"])
+            if expansions:
+                summary = f"expansions={len(expansions)}：" + "；".join(expansions)
+            else:
+                # 模型没产出可用改写（输出是废话/复述原句）也如实记录，不假装改写过
+                status = "skipped"
+        except ModelUnavailableError:
+            # 扩展是增强项，模型不可用不该把问答整个挡掉（与 /v1/retrieve 同一条降级纪律）
+            status = "skipped"
+            summary = "模型不可用 → 仅原查询"
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        row = trace_row(
+            state,
+            "rewrite",
+            status=status,
+            duration_ms=duration_ms,
+            input_summary=state["question"],
+            output_summary=summary,
+        )
+        return {
+            "expansions": expansions,
+            "rewritten_query": expansions[0] if expansions else None,
+            "breakdown": {"rewrite": duration_ms},
+            "trace_nodes": [row],
+        }
+
+    def route_rewrite(state: QaState) -> str:
+        """条件入口：只有真的请求了改写才让 rewrite 节点进图。
+
+        默认路径的轨迹因此与 M2 逐行一致（rewrite 行只在执行过时才出现），
+        trace 差异即"这次有没有改写"，不留模糊。
+        """
+        return "rewrite" if state.get("rewrite") else "retrieve"
+
     # ---------------- 1. 检索 ----------------
 
     async def retrieve(state: QaState) -> dict:
@@ -96,6 +150,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
             version=state["version"],
             top_k=state["top_k"],
             filters=filters_from_dict(state.get("filters_dict") or {}),
+            expansions=state.get("expansions") or None,
         )
         duration_ms = int((time.perf_counter() - t0) * 1000)
         # 段落编号与引用卡片**同一次调用**产出：契约不变量 3（passages 与 citations 同源同序）
@@ -275,6 +330,7 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
             prompt_template_id=state["prompt_template_id"],
             model={"name": meta.get("model", ""), "provider": meta.get("provider", "")},
             sampling=meta.get("sampling") or {},
+            rewrite_info=_rewrite_info(state),
         )
         outcome = {
             "answer_id": state["answer_id"],
@@ -293,6 +349,8 @@ def build_qa_nodes(deps: QaDeps) -> dict[str, NodeFn]:
         return {"outcome": outcome, "cost": cost}
 
     return {
+        "rewrite": rewrite,
+        "route_rewrite": route_rewrite,  # type: ignore[dict-item]
         "retrieve": retrieve,
         "gate": gate,
         "route_gate": route_gate,  # type: ignore[dict-item]
@@ -407,6 +465,7 @@ def _refusal_outcome(
             prompt_template_id=state["prompt_template_id"],
             model={"name": "n/a", "provider": "none"},
             sampling={},
+            rewrite_info=_rewrite_info(state),
         ),
         "cost": _cost_dict(state, latency_ms=latency_ms, prompt_tokens=0, completion_tokens=0),
         "trace_nodes": nodes,
@@ -427,6 +486,18 @@ def _refusal_updates(outcome: dict) -> dict:
     }
 
 
+def _rewrite_info(state: QaState) -> dict | None:
+    """改写节点的实际执行情况（只在请求了改写时进快照）。
+
+    默认路径（rewrite=false）**不加这个字段**：契约「只增不改」允许新增字段，
+    但默认路径连"多一个字段"都不要 —— 双端快照逐字节可比是评测纪律的一部分。
+    """
+    if not state.get("rewrite"):
+        return None
+    expansions = list(state.get("expansions") or [])
+    return {"enabled": True, "applied": bool(expansions), "expansions": expansions}
+
+
 def evidence_snapshot(
     *,
     passages: list[dict],
@@ -434,10 +505,11 @@ def evidence_snapshot(
     prompt_template_id: str,
     model: dict,
     sampling: dict,
+    rewrite_info: dict | None = None,
 ) -> dict:
     """把「模型当时看到了什么 + 用什么配置」冻结下来（事后不依赖在线状态即可复核）。"""
     opts = DEFAULT_RETRIEVAL_OPTIONS
-    return {
+    snapshot = {
         "passages": [
             {"index": p["index"], "label": p["label"], "text": p["text"]} for p in passages
         ],
@@ -470,6 +542,10 @@ def evidence_snapshot(
         "index_version": f"fnv1a32:{version}",
         "created_at": _now(),
     }
+    if rewrite_info is not None:
+        # 只增字段：请求了改写才出现，默认路径快照逐字节不变
+        snapshot["rewrite"] = rewrite_info
+    return snapshot
 
 
 async def _persist(store: Store, outcome: dict, *, version: str) -> None:
