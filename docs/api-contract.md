@@ -62,7 +62,11 @@
   "model": { "name": "qwen2.5-7b-instruct", "provider": "ollama" },
   "retrieval_config": {         // 本次检索的实际参数（含覆盖值），非默认值全集
     "top_k": 5, "rrf_k": 60, "vec_weight": 1.0, "bm25_weight": 1.0,
-    "min_vec_score": 0.5, "min_idf_coverage": 0.35, "window_radius": 1
+    "min_vec_score": 0.5,
+    // 多信号融合拒答的四路门限（2026-10-15 起生效）：拒答原因事后要能复核
+    "min_idf_coverage": 0.2277, "min_max_cosine": 0.5426,
+    "min_cos_gap": 0.0776, "min_bm25": 8.2246,
+    "window_radius": 1, "mmr_lambda": 0.9
   },
   "verify_thresholds": { "supported": 0.55, "weak": 0.38, "sem_weight": 0.75, "lex_weight": 0.25 },
   "index_version": "sha256:a1b2c3…",   // 索引版本（对应 Lite 模式 indexVersion 机制）
@@ -127,17 +131,22 @@
   "rewritten_query": null,            // rewrite=true 时给出改写结果
   "hits": [ Citation, … ],            // 按融合分降序；结构同 0.1
   "no_relevant_hit": false,           // true = 门限全滤空，调用方应走拒答分支
-  "refusal_signals": {                // 拒答信号快照（检索侧只做粗滤）
+  "refusal_signals": {                // 拒答信号快照（检索侧只做粗滤，细拒在答案侧 verifyAnswer）
     "idf_coverage": 0.72,             // 信号1：IDF 加权查询覆盖率
-    "top_relevance": 0.87             // 信号2：最高归一化相关度
+    "top_relevance": 0.87,            // 信号2：最高归一化相关度（空候选时 null）
+    "max_cosine": 0.66,               // 信号3：全语料最高余弦（查询级，2026-10-15 起参与判定）
+    "cos_gap": 0.11,                  // 信号4：余弦对比度 = 最高余弦 − 全语料余弦均值
+    "max_bm25": 12.4                  // 信号5：全语料 BM25 最高分
   },
   "dropped_count": 3,                 // 门限/自适应K丢弃的候选数（可观测性）
   "cost": { "latency_ms": 210, "latency_breakdown_ms": { "retrieve": 180, "rerank": 30 } }
 }
 ```
 
-> 判据与 Lite 模式 `applyThreshold` 一致：向量可用时只看余弦门限（不给 BM25 豁免）；
-> 降级纯 BM25 时用 `bm25_exempt_rank` 豁免。精排不参与拒答判定。
+> 判据与 Lite 模式 `applyThreshold` 一致：向量可用时做**多信号融合拒答**
+> （IDF 覆盖率 ∪ 最高余弦 ∪ 余弦对比度 ∪ BM25 最高分，任一触发即拒；**并集、构造上对调参人群零误拒**）,
+> 再做逐命中余弦门限（不给 BM25 豁免）；降级纯 BM25 时用 `bm25_exempt_rank` 豁免，
+> **融合拒答不参与**（保持 BM25-only 基线可比）。精排不参与拒答判定。
 
 ---
 
@@ -302,6 +311,18 @@ M4 轨迹回放 CLI、M6 trace_id 成本归因。
 - 租户隔离：M1 单租户硬编码 `tenant_id`；M2 起从 token 解出，**ACL 过滤在检索层生效**
   （`filters` 与租户/部门/密级条件在服务端合并，客户端传入的 filters 只能收紧不能放宽）
 - 角色：`admin`（可触发 eval/run、看全量 trace）/ `member`（answer、retrieve、自己的 trace）
+
+**M2 现状（2026-10-15 落地）**：
+
+- 身份在 `app/api/identity.py`（当前单租户硬编码，接 JWT 时只改这一处），
+  文档的归属在摄取时**由身份决定**（不由请求方声明）
+- 三元组：`documents.tenant_id / department / classification`（0 公开 / 1 内部 / 2 机密；
+  `department=''` 表示全员可见）。过滤与打分在**同一条 SQL** 里完成 ——
+  先过滤后打分，无权文档不参与 BM25 的 df/IDF 统计
+- **存在性不可推断**：越权查询返回 200 + 空结果 + 拒答，与"文档里确实没有"**逐字段同形**；
+  没有任何接口返回总数/聚合（`tests/test_acl.py` 的响应不变性用例钉住这一点）
+- `POST /v1/index/rebuild` 与 `POST /v1/index/{version}/activate` 见 §4.1：
+  灰度期间新版本按 query 哈希确定性分桶接流量
 
 ## 6. 版本化与兼容
 

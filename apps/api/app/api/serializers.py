@@ -33,6 +33,12 @@ def verification_to_dict(v: VerificationResult) -> dict:
     return {
         "source": v.source,
         "scoped_chunk_count": v.scoped_chunk_count,
+        # 引用闭环收敛情况（M2）：未标注 / 越界 / 是否全部角标都能回跳到编号段落
+        "convergence": {
+            "uncited_claims": v.convergence.uncited_claims,
+            "out_of_range_claims": v.convergence.out_of_range_claims,
+            "citations_subset_of_passages": v.convergence.citations_subset_of_passages,
+        },
         "sentences": [
             {
                 "text": s.text,
@@ -43,6 +49,7 @@ def verification_to_dict(v: VerificationResult) -> dict:
                 "unknown_numbers": s.unknown_numbers,
                 "citations": s.citations,
                 "invalid_citations": s.invalid_citations,
+                "uncited": s.uncited,
                 "trivial": s.trivial,
             }
             for s in v.sentences

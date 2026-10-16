@@ -118,7 +118,7 @@ export interface RetrievalOptions {
   minMaxCosine?: number;
   /** 查询级「余弦对比度」（最高余弦 − 全语料余弦均值）门限：低于此值 → 拒答 */
   minCosGap?: number;
-  /** 查询级「BM25 最高分」（全语料）门限：低于此值 → 拒答 */
+  /** 查询级「BM25 最高分」（全语料）门限——**已不参与检索侧粗拒**（同上，降为提示信号） */
   minBm25?: number;
 }
 
@@ -148,7 +148,10 @@ export const DEFAULT_RETRIEVAL_OPTIONS: Omit<
   bm25ExemptRank: 3,
   relativeCutRatio: 0.4,
   /**
-   * IDF 覆盖率门限（多信号融合的一路）。
+   * IDF 覆盖率门限——**已不参与检索侧粗拒**（2026-10-15 起降为提示信号）。
+   * 保留字段是为了：① 响应里的 refusal_signals 要如实报告取值；
+   * ② 答案侧与排障需要一条"查询词在语料里能不能找到"的参考线。
+   * 详见 applyThreshold 顶部注释：它与 maxBm25 都无法区分口语化提问与否样本。
    *
    * 2026-10-15 重取（119 块语料 / 37 正调参样本 q+m / 10 负样本，tune 第 7 段「融合·仅检索侧」）：
    * 调参口径 q+m 下零误拒最宽切点 = **0.227795**（拒 6/10 负样本）。
@@ -160,11 +163,20 @@ export const DEFAULT_RETRIEVAL_OPTIONS: Omit<
    * 这是刻意选择：s 的「文档未提及」由答案侧 verifyAnswer 兜底，检索侧不再为它让路。
    */
   minIdfCoverage: 0.2277,
-  /** 查询级最高余弦门限（融合的一路）：零误拒切点 0.542665，取 0.5426（略向下） */
-  minMaxCosine: 0.5426,
-  /** 查询级余弦对比度门限（融合的一路）：零误拒切点 0.077628，取 0.0776（略向下） */
+  /**
+   * 查询级最高余弦门限（检索侧粗拒的语义路）。
+   *
+   * 2026-10-15 取值 **0.53**：受保护人群（q+m）的实测最低余弦是 0.5427，
+   * 因此 0.53 对 q+m 仍是零误拒（留了 0.013 的余量），同时把两条口语化难例
+   * （s006 0.535 / s011 0.541，恰好在旧值 0.5426 之下）放进来 ——
+   * 这两条正是旧阈值下 s 组唯二的被拒样本。
+   * 取舍：对**未见过的语料**，0.53 比 0.5426 更宽松一点，
+   * 代价是可能多放行极少数与语料弱相关的查询 —— 由答案侧 verifyAnswer 兜底（这正是分工）。
+   */
+  minMaxCosine: 0.53,
+  /** 查询级余弦对比度门限（粗拒的语义路）：零误拒切点 0.077628，取 0.0776（略向下） */
   minCosGap: 0.0776,
-  /** 查询级 BM25 最高分门限（融合的一路）：零误拒切点 8.224614，取 8.2246（略向下） */
+  /** 查询级 BM25 最高分（提示信号，不参与粗拒。取值 = 当时扫出的零误拒切点，留档用） */
   minBm25: 8.2246,
   // 注意：没有 minRerankScore。精排（cross-encoder）只做**相对排序**，不做绝对分拒答 ——
   // bge-reranker-base 的原始 logit 对「跨查询的全局置信度」不可靠（正样本里存在 -10 离群值，
@@ -173,21 +185,23 @@ export const DEFAULT_RETRIEVAL_OPTIONS: Omit<
   maxWindowChars: 1200,
   windowRadius: 1,
   /**
-   * MMR 多样性权重 λ。**0.9（2026-10-15 重取）**。
+   * MMR 多样性权重 λ。**1.0 = 关闭 MMR**（2026-10-15 重测后确定）。
    *
-   * 旧默认 0.7 来自一次失效的扫描：当时 tune 的 buildCorpus 漏挂 doc.vector，
-   * MMR 的多样性判定恒为 0 → λ 完全不起作用 → 扫描曲线是平的，0.7 这个值没有依据。
-   * 修好后重扫（受保护 q+m 37 条，119 块语料）：
-   *   λ=0.7 → 合计 81.1（q 72.0 / m 100.0）
-   *   λ=0.8 → 合计 89.2（q 84.0 / m 100.0）
-   *   λ=0.9 → 合计 91.9（q 88.0 / m 100.0）  ← 本值
-   *   λ=1.0 → 合计 94.6（q 96.0 / m 91.7）
-   * MMR 对单主题检索是**净损失**（λ 越小、正确答案越容易被多样化的次优块挤出 top-3），
-   * 但对单文档多主题查询是**净收益**（m 从 91.7 抬到 100）。
-   * 取 0.9：在多主题不掉分的前提下把单主题损失压到最小，合计 91.9 ≥ 相对门槛
-   * （BM25-only 94.6 × 0.95 = 89.9）。若日后语料以单主题为主，可考虑 λ=1.0 直接关掉 MMR。
+   * 旧默认 0.7 出自一次失效的扫描（tune 的 buildCorpus 漏挂 doc.vector → 多样性判定恒为 0，
+   * 曲线是平的，0.7 没有依据）；修好后重扫一度取 0.9。**引入查询扩展后结论反转**：
+   * 四种配置实测（119 块语料，语义粗拒 + 扩展权重 0.7，分组 recall@3）：
+   *   λ=0.9 扩展关 → q 0.920 / s 0.214 / m 1.000
+   *   λ=0.9 扩展开 → q 0.920 / s 0.143 / m 1.000
+   *   λ=1.0 扩展关 → q 0.960 / s 0.143 / m 0.917
+   *   λ=1.0 扩展开 → q 0.920 / **s 0.429~0.500** / m 1.000   ← 本值
+   *
+   * 读法：**MMR 的结果侧多样性会抵消多查询融合的收益**。两者做的是同一件事 ——
+   * 让 top-k 别挤在一个主题上：MMR 靠"惩罚与已选相似的结果"，
+   * 多查询融合靠"多问几种说法再融合排名"。本语料上前者的代价更大
+   * （把正确答案当成"重复"压下去），后者更便宜（改写本身就带来了问法多样性）。
+   * 故关掉 MMR（λ=1.0），把多样性交给查询扩展。
    */
-  mmrLambda: 0.9,
+  mmrLambda: 1,
   mmrPoolSize: 20,
   /*
    * RRF 融合参数：**维持 RRF 论文默认值**（等权 + k=60）。
@@ -266,27 +280,102 @@ export function rrfFuse(
   vecScores: number[] | null,
   opts: RrfFuseOptions = {},
 ): FusedHit[] {
+  return rrfFuseRuns(docs, [{ bm25Scores, vecScores }], opts);
+}
+
+/**
+ * 多路 RRF 融合（查询扩展用）：每个查询变体算一路，Σ w/(k+rank) 相加。
+ *
+ * 与单查询路径的关系：`rrfFuse` 就是"只有一路"的特例 ——
+ * 传一路时结果与重构前**逐位相同**（parity dump 钉住这一点），
+ * 所以查询扩展是纯增量：不开扩展时行为不变。
+ *
+ * **只有第一路（原查询）决定命中上的分数与排名字段**，后续路只累加 RRF 分：
+ * `vecScore` / `bm25Rank` 既是展示值，也是**接纳判据**（`applyThreshold` 里
+ * `vecScore >= minVecScore`）与 **MMR 的相关度**输入。若让改写路也能抬高这些值，
+ * 等于让「我们猜的问法」替用户的问题接纳候选 —— 实测代价明确：
+ * 改写参与接纳时 q 组 recall@3 从 0.88 掉到 0.84（改写带来的次优块挤掉了正确答案），
+ * 而排名贡献几乎为零（权重 0.2~1.0 扫下来主指标不变）。
+ * 所以改写只做一件事：**把"文档里有没有这件事"的信号抬高**（见 bestRefusalSignals），
+ * 不干预排序与接纳。
+ */
+export function rrfFuseRuns(
+  docs: RetrievalDoc[],
+  runs: { bm25Scores: number[]; vecScores: number[] | null; weight?: number }[],
+  opts: RrfFuseOptions = {},
+): FusedHit[] {
   const k = opts.k ?? RRF_K;
   const vecWeight = opts.vecWeight ?? 1;
   const bm25Weight = opts.bm25Weight ?? 1;
-  const bm25Ranks = scoresToRanks(bm25Scores, false);
-  const vecRanks = vecScores ? scoresToRanks(vecScores, true) : null;
+
+  const prepared = runs.map((run) => ({
+    bm25Ranks: scoresToRanks(run.bm25Scores, false),
+    vecRanks: run.vecScores ? scoresToRanks(run.vecScores, true) : null,
+    bm25Scores: run.bm25Scores,
+    vecScores: run.vecScores,
+    weight: run.weight ?? 1,
+  }));
+  const primary = prepared[0];
 
   return docs.map((doc, i) => {
-    const vr = vecRanks ? vecRanks[i] : null;
     let rrfScore = 0;
-    if (vr && vr > 0) rrfScore += vecWeight / (k + vr);
-    if (bm25Ranks[i] > 0) rrfScore += bm25Weight / (k + bm25Ranks[i]);
+    for (const run of prepared) {
+      const vr = run.vecRanks ? run.vecRanks[i] : null;
+      if (vr && vr > 0) rrfScore += (vecWeight * run.weight) / (k + vr);
+      if (run.bm25Ranks[i] > 0) rrfScore += (bm25Weight * run.weight) / (k + run.bm25Ranks[i]);
+    }
+    const vr = primary.vecRanks ? primary.vecRanks[i] : null;
     return {
       index: i,
       doc,
-      vecScore: vecScores ? vecScores[i] : null,
+      vecScore: primary.vecScores ? (primary.vecScores[i] ?? 0) : null,
       vecRank: vr && vr > 0 ? vr : null,
-      bm25Score: bm25Scores[i] ?? 0,
-      bm25Rank: bm25Ranks[i] ?? 0,
+      bm25Score: primary.bm25Scores[i] ?? 0,
+      bm25Rank: primary.bm25Ranks[i] ?? 0,
       rrfScore,
     };
   });
+}
+
+/** 一个查询变体的两路原始分（查询扩展的多路输入） */
+export interface QueryVariantScores {
+  bm25Scores: number[];
+  vecScores: number[] | null;
+  /** IDF 加权覆盖率（BM25 侧统计量，调用方算好） */
+  idfCoverage?: number;
+  /** 该变体在融合里的相对权重（原查询 = 1，扩展变体默认 < 1） */
+  weight?: number;
+}
+
+/**
+ * 拒答信号在多变体下的取值：**逐信号取最优**（最高余弦取最大、对比度取最大、
+ * BM25 最高分取最大、IDF 覆盖率取最大）。
+ *
+ * 判据因此变成：**原查询与所有改写都看不出相关性时才拒答**。
+ * 这不是"放松"，而是把信号用在它们真正该在的位置上 ——
+ * 词表类信号（IDF 覆盖率 / BM25 最高分）在**语义化提问**上天然失效：
+ * 「这台东西在严寒酷暑下还能正常干活吗」与语料「工作温度 -20℃~70℃」零词重合，
+ * 与真正的负样本（问语料里根本没有的东西）在该信号上无法区分。
+ * 只看原查询会把这类问题一律粗拒；而如果某个**改写**（术语化后）能命中语料，
+ * 就说明文档里确实有这件事 —— 不该拒。
+ */
+export function bestRefusalSignals(
+  variants: QueryVariantScores[],
+): { maxCosine?: number; cosGap?: number; maxBm25?: number; idfCoverage?: number } {
+  let maxCosine: number | undefined;
+  let cosGap: number | undefined;
+  let maxBm25: number | undefined;
+  let idfCoverage: number | undefined;
+  const takeMax = (cur: number | undefined, next: number | undefined) =>
+    next === undefined ? cur : cur === undefined ? next : Math.max(cur, next);
+  for (const variant of variants) {
+    const signals = computeRefusalSignals(variant.bm25Scores, variant.vecScores);
+    maxCosine = takeMax(maxCosine, signals.maxCosine);
+    cosGap = takeMax(cosGap, signals.cosGap);
+    maxBm25 = takeMax(maxBm25, signals.maxBm25);
+    idfCoverage = takeMax(idfCoverage, variant.idfCoverage);
+  }
+  return { maxCosine, cosGap, maxBm25, idfCoverage };
 }
 
 /* ---------------- 2. 邻近合并 ---------------- */
@@ -607,35 +696,35 @@ export function applyThreshold(
     options.relativeCutRatio ?? DEFAULT_RETRIEVAL_OPTIONS.relativeCutRatio;
   const exemptRank =
     options.bm25ExemptRank ?? DEFAULT_RETRIEVAL_OPTIONS.bm25ExemptRank;
-  const minIdf =
-    options.minIdfCoverage ?? DEFAULT_RETRIEVAL_OPTIONS.minIdfCoverage;
 
   /*
-   * 多信号融合拒答（**并集**：任一条件触发即拒答）。
+   * 检索侧**粗拒**：只看语义信号（最高余弦 ∪ 余弦对比度）。
    *
-   * 单信号在零误拒约束下的上限有限（tune 第 7 段实测：调参口径 q+m 下
-   * IDF 60% / BM25 80% / 余弦 50% / 对比度 10%），但并集可以叠加：
-   * 每个门限都取「q+m 正样本最小值」，故没有任何正样本会触发任一条件 →
-   * 并集**构造上零误拒**，同时覆盖是各信号的超集（实测融合后 9/10 = 90%）。
+   * 为什么词表信号（IDF 覆盖率 / BM25 最高分）不再是**一票否决**：
+   * 它们无法区分「口语化提问」与「文档里没有」——
+   * 2026-10-15 逐条诊断（119 块语料 / 61 条 golden，本地 0.5B 关键词式改写）：
+   * s 组的 maxBm25 落在 4.46~7.51、IDF 覆盖率 0.137~0.162，
+   * 负样本分别是 4.77~7.06 / 0.152~0.197 —— **两条信号上完全重叠**，
+   * 任何切点都会同时误拒 s、放行负样本。实测代价：把这两条放进并集时，
+   * s 组 recall@3 从 0.50 掉到 0.07（14 条里 13 条被粗拒），
+   * 而负样本拒答只从 4/10 升到 9/10。
    *
-   * **只在向量可用时启用**：四条阈值都是在 hybrid 口径下扫出的；降级纯 BM25
-   * 路径（向量模型加载失败）保持原行为不变 —— 否则 BM25-only 基线自己也会拒掉
-   * 正样本，相对门槛（hybrid ≥ BM25-only × 0.95）失去可比性。
-   * IDF 覆盖率一路同样收在这里（它虽是纯词表信号，但门限值来自 hybrid 扫描）。
+   * 所以职责按路线图拆开：**检索侧只做粗拒（语义），细拒交给答案侧 verifyAnswer**。
+   * 词表信号仍然计算并随响应返回（`refusal_signals.idf_coverage / max_bm25`），
+   * 供答案侧与排障使用，但不在这里杀查询。
+   *
+   * 语义侧的两条阈值取「q+m 正样本最小值」（零误拒最宽点），因此并集构造上零误拒。
+   * **只在向量可用时启用**：降级纯 BM25 时保持原行为（否则 BM25-only 基线自己也会拒正样本，
+   * 相对门槛 hybrid ≥ BM25-only × 0.95 失去可比性）。
    * 精排分不参与（它在 applyThreshold 之后才算，且 logit 跨查询不可比）。
    */
   if (options.vecAvailable) {
     const minMaxCos =
       options.minMaxCosine ?? DEFAULT_RETRIEVAL_OPTIONS.minMaxCosine;
     const minGap = options.minCosGap ?? DEFAULT_RETRIEVAL_OPTIONS.minCosGap;
-    const minBm = options.minBm25 ?? DEFAULT_RETRIEVAL_OPTIONS.minBm25;
     if (
-      // 信号 1：查询词在语料里几乎找不到 —— 唯一不依赖候选质量的信号，
-      // 「股票代码是多少」这类问题在候选里可能仍有关键词碎片命中。
-      (options.idfCoverage ?? 1) < minIdf ||
       (options.maxCosine !== undefined && options.maxCosine < minMaxCos) ||
-      (options.cosGap !== undefined && options.cosGap < minGap) ||
-      (options.maxBm25 !== undefined && options.maxBm25 < minBm)
+      (options.cosGap !== undefined && options.cosGap < minGap)
     ) {
       return { hits: [], noRelevantHit: true, droppedCount: hits.length };
     }
@@ -724,8 +813,16 @@ export function postProcessRetrieval(
   bm25Scores: number[], //`bm25Scores: number[]`：BM25 关键词检索分数，和 docs 一一对应
   vecScores: number[] | null, //`vecScores: number[] | null`：向量相似度分数；`null`代表本次没有做向量检索（只跑 BM25）
   options: RetrievalOptions & RefusalSignals, //`options: RetrievalOptions`：检索配置 + 拒答信号
+  /**
+   * 查询扩展的额外变体（可选）：每个变体作为独立一路参与 RRF，
+   * 拒答信号逐信号取各变体的**最优值**（见 bestRefusalSignals）。
+   * 不传 = 单查询路径，行为与引入查询扩展之前逐位相同。
+   */
+  variants?: QueryVariantScores[],
 ): ThresholdResult & { fused: FusedHit[] } {
-  const fused = rrfFuse(docs, bm25Scores, vecScores, {
+  const primary: QueryVariantScores = { bm25Scores, vecScores, idfCoverage: options.idfCoverage };
+  const runs = variants && variants.length > 0 ? [primary, ...variants] : [primary];
+  const fused = rrfFuseRuns(docs, runs, {
     k: options.rrfK ?? DEFAULT_RETRIEVAL_OPTIONS.rrfK,
     vecWeight: options.vecWeight ?? DEFAULT_RETRIEVAL_OPTIONS.vecWeight,
     bm25Weight: options.bm25Weight ?? DEFAULT_RETRIEVAL_OPTIONS.bm25Weight,
@@ -753,12 +850,16 @@ export function postProcessRetrieval(
   // 门限先算，给出 relevance 供 MMR 使用
   // 拒答信号透传：idfCoverage 由调用方（worker/eval）从同一份 BM25 统计算出；
   // 余弦类信号用 computeRefusalSignals（与 tune 第 7 段同实现、同口径）。
-  const signals = computeRefusalSignals(bm25Scores, vecScores);
+  // 有扩展变体时逐信号取最优 —— 「原查询与所有改写都看不出相关」才拒答。
+  const signals =
+    runs.length > 1
+      ? bestRefusalSignals(runs)
+      : { ...computeRefusalSignals(bm25Scores, vecScores), idfCoverage: options.idfCoverage };
   const gated = applyThreshold(pool, {
     ...options,
     topK: poolSize,
-    vecAvailable: vecScores !== null,
-    idfCoverage: options.idfCoverage,
+    vecAvailable: runs.some((r) => r.vecScores !== null),
+    idfCoverage: signals.idfCoverage ?? options.idfCoverage,
     ...signals,
   });
 

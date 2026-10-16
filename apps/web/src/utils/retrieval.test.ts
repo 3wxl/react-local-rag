@@ -17,6 +17,8 @@ import {
   type RetrievalDoc,
   type SearchHit,
   type SearchHitWithVector,
+  rrfFuseRuns,
+  bestRefusalSignals,
 } from "./retrieval";
 import type { TextChunk } from "../types/doc";
 
@@ -338,50 +340,31 @@ describe("applyThreshold 检索侧拒答信号", () => {
     return h;
   }
 
-  it("信号 1：IDF 覆盖率低于门限 → 拒答（哪怕候选分数很高）", () => {
-    // 注意：DEFAULT_RETRIEVAL_OPTIONS.minIdfCoverage 默认 0（关闭），
-    // 所以这里必须显式传非零门限，否则信号 1 永远不会触发
+  it("词表信号**不再**一票否决：IDF 覆盖率极低但语义信号正常 → 不拒答", () => {
+    // 2026-10-15 起检索侧只做语义粗拒：IDF 覆盖率 / BM25 最高分降为提示信号。
+    // 依据：这两条在口语化提问与负样本上分布完全重叠，放进并集会把 s 组整体拒掉
+    // （实测 s recall@3 0.50 → 0.07）。
     const result = applyThreshold([goodHit()], {
       topK: 3,
       vecAvailable: true,
-      minIdfCoverage: 0.14,
-      idfCoverage: 0.05, // 「股票代码」这类库里没有的主题
+      minIdfCoverage: 0.14, // 门限仍在，但不参与判定
+      idfCoverage: 0.05,
+      maxBm25: 0.5,
+      maxCosine: 0.9,
+      cosGap: 0.3,
     });
-    expect(result.hits).toHaveLength(0);
-    expect(result.noRelevantHit).toBe(true);
-  });
-
-  it("信号 1：覆盖率达标 → 正常返回", () => {
-    const result = applyThreshold([goodHit()], {
-      topK: 3,
-      vecAvailable: true,
-      minIdfCoverage: 0.14,
-      idfCoverage: 0.5,
-    });
+    expect(result.noRelevantHit).toBe(false);
     expect(result.hits).toHaveLength(1);
-    expect(result.noRelevantHit).toBe(false);
   });
 
-  it("信号 1：门限显式为 0（关闭）时不拒答", () => {
-    // 默认 minIdfCoverage 已改为非零（见 DEFAULT_RETRIEVAL_OPTIONS，融合拒答的一路），
-    // 这里显式传 0 验证「门限为 0 = 该路关闭」：idfCoverage=0 也不拒
+  it("语义粗拒（并集）默认生效：最高余弦或对比度极低 → 拒答", () => {
     const result = applyThreshold([goodHit()], {
       topK: 3,
       vecAvailable: true,
-      minIdfCoverage: 0,
-      idfCoverage: 0,
-    });
-    expect(result.noRelevantHit).toBe(false);
-  });
-
-  it("融合拒答（并集）默认生效：BM25 最高分/余弦对比度都极低 → 拒答", () => {
-    const result = applyThreshold([goodHit()], {
-      topK: 3,
-      vecAvailable: true,
-      idfCoverage: 1, // 该路不触发
-      maxBm25: 0.5, // < 默认 8.2246
-      maxCosine: 0.1, // < 默认 0.5426
-      cosGap: 0.001, // < 默认 0.0776
+      idfCoverage: 1,
+      maxBm25: 99, // 词表信号再高也不救
+      maxCosine: 0.1, // < 默认 0.53
+      cosGap: 0.3,
     });
     expect(result.noRelevantHit).toBe(true);
   });
@@ -397,13 +380,13 @@ describe("applyThreshold 检索侧拒答信号", () => {
     expect(result.noRelevantHit).toBe(false);
   });
 
-  it("信号 1 优先于候选质量：先判覆盖率再看分数", () => {
-    // 即使 BM25 排第一、语义分 0.9，库里根本没这个词也应当拒答
+  it("语义粗拒优先于候选质量：查询级余弦极低时，候选本身分再高也拒答", () => {
+    // 「文档里有没有这件事」是**查询级**判断，不能被单条候选的高分推翻
     const result = applyThreshold([goodHit()], {
       topK: 3,
       vecAvailable: true,
-      minIdfCoverage: 0.14,
-      idfCoverage: 0,
+      maxCosine: 0.2, // 全语料最高余弦都只有 0.2 → 与语料无关
+      cosGap: 0.3,
     });
     expect(result.noRelevantHit).toBe(true);
   });
@@ -633,5 +616,99 @@ describe("postProcessRetrieval", () => {
     expect(hit.headingPath).toEqual(["第一章", "1.1 背景"]);
     expect(hit.pageStart).toBe(12);
     expect(hit.pageEnd).toBe(13);
+  });
+});
+
+/* ---------------- 查询扩展：多路 RRF 与信号取优 ---------------- */
+
+describe("rrfFuseRuns（查询扩展的多路融合）", () => {
+  it("只有一路时与 rrfFuse 逐字段相同（不开扩展 = 行为不变）", () => {
+    const docs = [
+      makeDoc("c1", "d1", 0, "网关支持的温度范围是负20到70摄氏度"),
+      makeDoc("c2", "d1", 1, "网关最多可以接32个传感器"),
+      makeDoc("c3", "d2", 0, "年假需要提前三个工作日申请"),
+    ];
+    const bm25 = [3.2, 1.1, 0];
+    const vec = [0.8, 0.4, 0.6];
+    const single = rrfFuse(docs, bm25, vec, { k: 60 });
+    const multi = rrfFuseRuns(docs, [{ bm25Scores: bm25, vecScores: vec }], { k: 60 });
+    expect(multi).toEqual(single);
+  });
+
+  it("第二个变体能救回 BM25/向量都排不上的块（多路 RRF 的意义）", () => {
+    const docs = [
+      makeDoc("c1", "d1", 0, "无关内容"),
+      makeDoc("c2", "d1", 1, "工作温度范围"),
+    ];
+    // 原查询："这东西耐寒吗" —— 两路都不命中 c2；
+    // 改写："工作温度范围" —— BM25 命中 c2
+    const fused = rrfFuseRuns(
+      docs,
+      [
+        { bm25Scores: [1.0, 0], vecScores: [0.6, 0.2] },
+        { bm25Scores: [0, 5.0], vecScores: [0.5, 0.7], weight: 1 },
+      ],
+      { k: 60 },
+    );
+    const c2 = fused.find((h) => h.doc.chunkId === "c2")!;
+    // 多路下 c2 拿到第二路的排名分；但**分数字段仍来自原查询**（改写给分不改接纳）
+    expect(c2.rrfScore).toBeGreaterThan(0);
+    expect(c2.vecScore).toBe(0.2);
+    expect(c2.bm25Score).toBe(0);
+  });
+
+  it("权重影响排序（扩展变体默认权重更低）", () => {
+    const docs = [makeDoc("c1", "d1", 0, "甲"), makeDoc("c2", "d1", 1, "乙")];
+    const runs = [
+      { bm25Scores: [0, 3], vecScores: null, weight: 1 }, // 原查询：c2 第一
+      { bm25Scores: [3, 0], vecScores: null, weight: 1 }, // 改写：c1 第一
+    ];
+    const fused = rrfFuseRuns(docs, runs, { k: 60 });
+    expect(fused[0].rrfScore).toBeCloseTo(fused[1].rrfScore, 12); // 等权时打平
+    const weighted = rrfFuseRuns(docs, [{ ...runs[0], weight: 2 }, runs[1]], { k: 60 });
+    expect(weighted[1].rrfScore).toBeGreaterThan(weighted[0].rrfScore);
+  });
+});
+
+describe("bestRefusalSignals（逐信号取各变体最优）", () => {
+  it("四个信号都取最大值", () => {
+    const signals = bestRefusalSignals([
+      { bm25Scores: [1, 2], vecScores: [0.3, 0.4], idfCoverage: 0.1 },
+      { bm25Scores: [9, 0], vecScores: [0.5, 0.2], idfCoverage: 0.6 },
+    ]);
+    expect(signals.maxBm25).toBe(9);
+    expect(signals.maxCosine).toBe(0.5);
+    expect(signals.idfCoverage).toBe(0.6);
+    expect(signals.cosGap).toBeCloseTo(0.5 - 0.35, 12);
+  });
+
+  it("术语化改写把「语料里其实有这件事」的信号抬起来：原查询被判无关，加改写后放行", () => {
+    const docs = [
+      makeDoc("c1", "d1", 0, "设备工作温度为负20摄氏度至70摄氏度。"),
+      makeDoc("c2", "d2", 0, "员工年假需提前三个工作日申请。"),
+    ];
+    // 原查询（口语化，与语料零词重合且语义余弦偏低）→ 单独看会被语义粗拒
+    // 改写（术语化）→ 命中语料，把查询级信号抬到门限之上
+    const originalBm25 = [0, 0];
+    // 0.51：高于逐命中接纳门限（0.5，候选仍会被接纳），低于查询级粗拒门限（0.53）
+    const vec = [0.51, 0.3];
+    const variants = [
+      { bm25Scores: [9.5, 0], vecScores: [0.66, 0.3], idfCoverage: 0.6 },
+    ];
+    const result = postProcessRetrieval(
+      docs,
+      originalBm25,
+      vec,
+      { ...DEFAULT_RETRIEVAL_OPTIONS, topK: 1, idfCoverage: 0 },
+      variants,
+    );
+    expect(result.noRelevantHit).toBe(false);
+    // 对照：不给改写就按原查询判 —— 最高余弦 0.51 < 0.53，粗拒
+    const refused = postProcessRetrieval(docs, originalBm25, vec, {
+      ...DEFAULT_RETRIEVAL_OPTIONS,
+      topK: 1,
+      idfCoverage: 0,
+    });
+    expect(refused.noRelevantHit).toBe(true);
   });
 });

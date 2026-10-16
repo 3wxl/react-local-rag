@@ -13,8 +13,10 @@ from fastapi import APIRouter, Depends
 
 from ...generation.base import ModelUnavailableError
 from ...parity.retrieval import DEFAULT_RETRIEVAL_OPTIONS
+from ...services.reindex_service import select_index_version
 from ...store import Filters
 from ..deps import AppContext, get_ctx
+from ..identity import Identity, get_identity
 from ..errors import ApiError
 from ..schemas import AnswerRequest
 from ..serializers import context_to_dict, verification_to_dict
@@ -23,21 +25,29 @@ router = APIRouter()
 
 
 @router.post("/answer")
-async def answer(body: AnswerRequest, ctx: AppContext = Depends(get_ctx)) -> dict:
+async def answer(
+    body: AnswerRequest,
+    ctx: AppContext = Depends(get_ctx),
+    identity: Identity = Depends(get_identity),
+) -> dict:
     if body.stream:
         # 契约里 stream 是 M3 的能力：现在就明确报不支持，避免前端以为拿到了流
         raise ApiError(
             "invalid_request", "stream=true 尚未实现（M3 提供 SSE 流式）"
         )
 
-    active = await ctx.store.get_active_version()
+    # 灰度版本选择：按 question 哈希确定性分桶（同一问题永远走同一版本）
+    active = select_index_version(await ctx.store.list_ready_versions(), body.question)
     if active is None:
         raise ApiError("index_not_ready", "知识库索引尚未就绪（还没有摄取任何文档）")
 
-    filters = (
-        Filters(doc_ids=body.filters.doc_ids, tags=body.filters.tags)
-        if body.filters is not None
-        else None
+    # ACL 同样在召回层生效（与 /v1/retrieve 完全一致的口径）
+    filters = Filters(
+        doc_ids=body.filters.doc_ids if body.filters is not None else (),
+        tags=body.filters.tags if body.filters is not None else (),
+        tenant_id=identity.tenant_id,
+        departments=(identity.department,) if identity.department else (),
+        max_classification=identity.clearance,
     )
     try:
         outcome = await ctx.answer.answer(
