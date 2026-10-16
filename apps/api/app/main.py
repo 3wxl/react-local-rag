@@ -25,6 +25,8 @@ from .core.config import settings
 from .embedding.bge import get_embedder
 from .generation.factory import build_provider
 from .graphs import open_checkpointer
+from .graphs.qa_graph import build_qa_graph
+from .graphs.qa_nodes import QaDeps
 from .services.answer_service import AnswerService
 from .services.ingest_service import IngestService
 from .services.reindex_service import ReindexService
@@ -53,13 +55,24 @@ async def lifespan(app: FastAPI):
     )
     # 检查点必须在这里打开（而不是模块导入时）：AsyncSqliteSaver 绑定当前事件循环
     async with open_checkpointer(settings) as checkpointer:
+        # 三张图在进程内编译一次，依赖用闭包注入（State 只放 JSON 原生类型，见 app/graphs/state.py）
+        qa_graph = build_qa_graph(
+            QaDeps(
+                store=store,
+                retrieval=retrieval,
+                embedder=embedder,
+                provider=provider,
+                settings=settings,
+            ),
+            checkpointer,
+        )
         ctx = AppContext(
             settings=settings,
             store=store,
             embedder=embedder,
             provider=provider,
             retrieval=retrieval,
-            answer=AnswerService(store, retrieval, embedder, provider),
+            answer=AnswerService(qa_graph, settings=settings),
             ingest=ingest,
             reindex=ReindexService(store, ingest),
             checkpointer=checkpointer,

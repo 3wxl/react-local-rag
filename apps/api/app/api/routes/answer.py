@@ -19,7 +19,7 @@ from ..deps import AppContext, get_ctx
 from ..identity import Identity, get_identity
 from ..errors import ApiError
 from ..schemas import AnswerRequest
-from ..serializers import context_to_dict, verification_to_dict
+from ..serializers import context_to_dict
 
 router = APIRouter()
 
@@ -67,7 +67,8 @@ async def answer(
         "verdict": outcome.verdict,
         "citations": [context_to_dict(c) for c in outcome.citations],
         "refusal": outcome.refusal,
-        "verification": verification_to_dict(outcome.verification),
+        # M3 起由 QA 图的 verify 节点序列化（同一 serializer 的产物，线上字节不变）
+        "verification": outcome.verification,
         "evidence_snapshot": outcome.evidence_snapshot,
         "cost": outcome.cost,
     }
