@@ -10,8 +10,13 @@ CREATE TABLE IF NOT EXISTS index_version (
   embedding_model TEXT NOT NULL,
   prefix_scheme TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  activated_at TIMESTAMPTZ
+  activated_at TIMESTAMPTZ,
+  -- 灰度流量比 0~1（1 = 全量）：新版本先给小比例，指标不退化再放量；0 = 事实上回滚。
+  -- 选择必须确定性（按 query_id 哈希分桶），否则同一请求两次检索可能走不同版本。
+  traffic_ratio REAL NOT NULL DEFAULT 1.0
 );
+-- 已有库的补列（CREATE TABLE IF NOT EXISTS 管不了"已有表加列"）
+ALTER TABLE index_version ADD COLUMN IF NOT EXISTS traffic_ratio REAL NOT NULL DEFAULT 1.0;
 
 CREATE TABLE IF NOT EXISTS documents (
   doc_id TEXT PRIMARY KEY,
@@ -23,8 +28,16 @@ CREATE TABLE IF NOT EXISTS documents (
   size_bytes INTEGER NOT NULL DEFAULT 0,
   page_count INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at TIMESTAMPTZ
+  deleted_at TIMESTAMPTZ,
+  -- ACL 三元组：召回层过滤（不是取回后再筛）
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  department TEXT NOT NULL DEFAULT '',
+  classification INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS documents_acl ON documents (tenant_id, classification);
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS department TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS classification INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS chunks (
   chunk_id TEXT PRIMARY KEY,
@@ -57,6 +70,19 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
 -- HNSW 供"只取 topN"的规模路径用；评测与对齐口径走精确扫描（见 pg_store.cosine_all）
 CREATE INDEX IF NOT EXISTS chunk_vectors_hnsw
   ON chunk_vectors USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+-- 向量缓存（增量重建）：相同文本 + 同模型同前缀 ⇒ 向量逐位相同，可跨文档/版本复用。
+-- 向量以 float32 小端 BLOB 存（与 SQLite 版同布局）：pgvector 的文本输出会丢精度。
+-- 不按块 id 建外键：缓存的生命周期与块无关（块删了缓存仍然有用）。
+CREATE TABLE IF NOT EXISTS chunk_vector_cache (
+  content_hash TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  prefix_scheme TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vec BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (content_hash, embedding_model, prefix_scheme)
+);
 
 CREATE TABLE IF NOT EXISTS answers (
   answer_id TEXT PRIMARY KEY,

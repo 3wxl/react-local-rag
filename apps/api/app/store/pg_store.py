@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -83,8 +83,8 @@ class PgStore:
     async def upsert_version(self, record: IndexVersionRecord) -> None:
         await self._pool.execute(
             """INSERT INTO index_version (version, state, chunk_params, embedding_model,
-                   prefix_scheme, created_at, activated_at)
-               VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7)
+                   prefix_scheme, created_at, activated_at, traffic_ratio)
+               VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
                ON CONFLICT (version) DO UPDATE SET
                    state=EXCLUDED.state, chunk_params=EXCLUDED.chunk_params,
                    embedding_model=EXCLUDED.embedding_model,
@@ -97,6 +97,7 @@ class PgStore:
             record.prefix_scheme,
             _parse_ts(record.created_at) or datetime.now(timezone.utc),
             _parse_ts(record.activated_at),
+            float(record.traffic_ratio),
         )
 
     async def activate_version(self, version: str) -> None:
@@ -108,23 +109,65 @@ class PgStore:
                     version,
                 )
                 await conn.execute(
-                    "UPDATE index_version SET state='ready', activated_at=now() "
-                    "WHERE version=$1",
+                    "UPDATE index_version SET state='ready', activated_at=now(), "
+                    "traffic_ratio=1.0 WHERE version=$1",
                     version,
                 )
+
+    async def list_ready_versions(self) -> list[IndexVersionRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM index_version WHERE state='ready' "
+            "ORDER BY activated_at DESC NULLS LAST, created_at DESC"
+        )
+        return [_version_of(r) for r in rows]
+
+    async def set_traffic_ratio(self, version: str, ratio: float) -> None:
+        """灰度放量/回滚。ratio=0 等于事实上回滚（不再接流量，数据仍在）。"""
+        await self._pool.execute(
+            "UPDATE index_version SET traffic_ratio=$2 WHERE version=$1",
+            version,
+            max(0.0, min(1.0, float(ratio))),
+        )
+
+    async def gc_version(self, version: str) -> int:
+        """清理非 ready 版本的块与向量（ready 版本还在服务，删了就是事故）。"""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                state = await conn.fetchval(
+                    "SELECT state FROM index_version WHERE version=$1", version
+                )
+                if state is None:
+                    return 0
+                if state == "ready":
+                    raise ValueError(f"版本 {version} 仍在服务（state=ready），拒绝 GC")
+                await conn.execute(
+                    "DELETE FROM chunk_vectors WHERE chunk_id IN "
+                    "(SELECT chunk_id FROM chunks WHERE index_version=$1)",
+                    version,
+                )
+                deleted = await conn.execute(
+                    "DELETE FROM chunks WHERE index_version=$1", version
+                )
+                await conn.execute(
+                    "DELETE FROM index_version WHERE version=$1", version
+                )
+                return int(str(deleted).split()[-1]) if deleted else 0
 
     # ---------------- 文档与块 ----------------
 
     async def upsert_document(self, record: DocumentRecord) -> None:
         await self._pool.execute(
             """INSERT INTO documents (doc_id, doc_name, content_hash, index_version, tags,
-                   raw_path, size_bytes, page_count, created_at, deleted_at)
-               VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10)
+                   raw_path, size_bytes, page_count, created_at, deleted_at,
+                   tenant_id, department, classification)
+               VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT (doc_id) DO UPDATE SET
                    doc_name=EXCLUDED.doc_name, content_hash=EXCLUDED.content_hash,
                    index_version=EXCLUDED.index_version, tags=EXCLUDED.tags,
                    raw_path=EXCLUDED.raw_path, size_bytes=EXCLUDED.size_bytes,
-                   page_count=EXCLUDED.page_count, deleted_at=EXCLUDED.deleted_at""",
+                   page_count=EXCLUDED.page_count, deleted_at=EXCLUDED.deleted_at,
+                   tenant_id=EXCLUDED.tenant_id, department=EXCLUDED.department,
+                   classification=EXCLUDED.classification""",
             record.doc_id,
             record.doc_name,
             record.content_hash,
@@ -135,17 +178,28 @@ class PgStore:
             record.page_count,
             _parse_ts(record.created_at) or datetime.now(timezone.utc),
             _parse_ts(record.deleted_at),
+            record.tenant_id,
+            record.department,
+            int(record.classification),
         )
 
-    async def replace_doc_chunks(self, doc_id: str, chunks: list[ChunkRecord]) -> None:
+    async def replace_doc_chunks(
+        self, doc_id: str, version: str, chunks: list[ChunkRecord]
+    ) -> None:
+        # 只替换该文档在**该版本**下的块：灰度重建期间旧版本仍在服务
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     "DELETE FROM chunk_vectors WHERE chunk_id IN "
-                    "(SELECT chunk_id FROM chunks WHERE doc_id=$1)",
+                    "(SELECT chunk_id FROM chunks WHERE doc_id=$1 AND index_version=$2)",
                     doc_id,
+                    version,
                 )
-                await conn.execute("DELETE FROM chunks WHERE doc_id=$1", doc_id)
+                await conn.execute(
+                    "DELETE FROM chunks WHERE doc_id=$1 AND index_version=$2",
+                    doc_id,
+                    version,
+                )
                 if chunks:
                     await conn.executemany(
                         """INSERT INTO chunks (chunk_id, doc_id, index_version, ord, content,
@@ -194,6 +248,25 @@ class PgStore:
         sql += " ORDER BY created_at"
         return [_document_of(r) for r in await self._pool.fetch(sql)]
 
+    async def get_document(self, doc_id: str) -> DocumentRecord | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM documents WHERE doc_id=$1", doc_id
+        )
+        return _document_of(row) if row else None
+
+    async def rename_document(self, old_doc_id: str, new_doc_id: str) -> None:
+        """把文档与其块迁到新 doc_id（历史 doc_id 口径迁移用）。"""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE chunks SET doc_id=$2 WHERE doc_id=$1", old_doc_id, new_doc_id
+                )
+                await conn.execute(
+                    "UPDATE documents SET doc_id=$2 WHERE doc_id=$1",
+                    old_doc_id,
+                    new_doc_id,
+                )
+
     async def load_chunks(
         self, version: str, *, filters: Filters | None = None
     ) -> list[ChunkRecord]:
@@ -206,6 +279,10 @@ class PgStore:
         if filters and filters.doc_ids:
             sql += " AND c.doc_id = ANY($2::text[])"
             params.append(list(filters.doc_ids))
+        clauses, acl_params = _acl_clauses(filters)
+        for clause in clauses:
+            sql += f" AND {clause}"
+        params.extend(acl_params)
         sql += " ORDER BY c.doc_id, c.ord"
         return [_chunk_of(r) for r in await self._pool.fetch(sql, *params)]
 
@@ -260,6 +337,10 @@ class PgStore:
         if filters and filters.doc_ids:
             sql += " AND c.doc_id = ANY($2::text[])"
             params.append(list(filters.doc_ids))
+        clauses, acl_params = _acl_clauses(filters)
+        for clause in clauses:
+            sql += f" AND {clause}"
+        params.extend(acl_params)
         sql += " ORDER BY c.doc_id, c.ord"
         rows = await self._pool.fetch(sql, *params)
         return {
@@ -271,6 +352,57 @@ class PgStore:
             "SELECT embedding FROM chunk_vectors WHERE chunk_id=$1", chunk_id
         )
         return np.asarray(row["embedding"], dtype=np.float32) if row else None
+
+    # ---------------- 向量缓存（增量重建） ----------------
+
+    async def load_cached_vectors(
+        self,
+        content_hashes: Sequence[str],
+        *,
+        embedding_model: str,
+        prefix_scheme: str,
+    ) -> dict[str, np.ndarray]:
+        hashes = list(content_hashes)
+        if not hashes:
+            return {}
+        rows = await self._pool.fetch(
+            "SELECT content_hash, vec FROM chunk_vector_cache "
+            "WHERE embedding_model=$1 AND prefix_scheme=$2 AND content_hash = ANY($3::text[])",
+            embedding_model,
+            prefix_scheme,
+            hashes,
+        )
+        return {
+            r["content_hash"]: np.frombuffer(bytes(r["vec"]), dtype="<f4").copy()
+            for r in rows
+        }
+
+    async def put_cached_vectors(
+        self,
+        rows: Sequence[tuple[str, np.ndarray]],
+        *,
+        embedding_model: str,
+        prefix_scheme: str,
+    ) -> None:
+        if not rows:
+            return
+        await self._pool.executemany(
+            """INSERT INTO chunk_vector_cache
+                   (content_hash, embedding_model, prefix_scheme, dim, vec, created_at)
+               VALUES ($1,$2,$3,$4,$5,now())
+               ON CONFLICT (content_hash, embedding_model, prefix_scheme) DO UPDATE SET
+                   dim=EXCLUDED.dim, vec=EXCLUDED.vec""",
+            [
+                (
+                    content_hash,
+                    embedding_model,
+                    prefix_scheme,
+                    int(np.asarray(vec).shape[0]),
+                    np.asarray(vec, dtype="<f4").tobytes(),
+                )
+                for content_hash, vec in rows
+            ],
+        )
 
     # ---------------- 答案与轨迹 ----------------
 
@@ -493,6 +625,34 @@ def _parse_ts(value: str | None):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _acl_clauses(filters: Filters | None, start: int = 2) -> tuple[list[str], list[Any]]:
+    """身份派生过滤条件（与 sqlite_store._acl_clauses 同语义）。
+
+    过滤与打分在同一条 SQL 里完成：隐藏文档不参与 BM25 的 df/IDF，
+    也不存在"先取回再筛"的中间态（那会留下条数与耗时旁路）。
+    """
+    import numpy as np
+    _ = np  # 保持导入一致性（本函数不需要 numpy，但同文件其它地方依赖）
+    if filters is None:
+        return [], []
+    clauses: list[str] = []
+    params: list[Any] = []
+    idx = start
+    if filters.tenant_id is not None:
+        clauses.append(f"d.tenant_id = ${idx}")
+        params.append(filters.tenant_id)
+        idx += 1
+    if filters.max_classification is not None:
+        clauses.append(f"d.classification <= ${idx}")
+        params.append(int(filters.max_classification))
+        idx += 1
+    if filters.departments:
+        clauses.append(f"(d.department = '' OR d.department = ANY(${idx}::text[]))")
+        params.append(list(filters.departments))
+        idx += 1
+    return clauses, params
+
+
 def _version_of(row) -> IndexVersionRecord:
     return IndexVersionRecord(
         version=row["version"],
@@ -502,6 +662,7 @@ def _version_of(row) -> IndexVersionRecord:
         prefix_scheme=row["prefix_scheme"],
         created_at=_iso(row["created_at"]),
         activated_at=_iso(row["activated_at"]),
+        traffic_ratio=float(row["traffic_ratio"]) if row["traffic_ratio"] is not None else 1.0,
     )
 
 
@@ -517,6 +678,9 @@ def _document_of(row) -> DocumentRecord:
         page_count=row["page_count"],
         created_at=_iso(row["created_at"]),
         deleted_at=_iso(row["deleted_at"]),
+        tenant_id=row["tenant_id"] if "tenant_id" in row.keys() else "default",
+        department=row["department"] if "department" in row.keys() else "",
+        classification=int(row["classification"]) if "classification" in row.keys() else 0,
     )
 
 

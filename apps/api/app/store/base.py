@@ -53,6 +53,13 @@ class DocumentRecord:
     page_count: int = 1
     created_at: str = ""
     deleted_at: str | None = None
+    # ---------------- ACL 三元组（M2） ----------------
+    #: 租户（单租户阶段固定 'default'）
+    tenant_id: str = "default"
+    #: 部门；空串 = 全员可见（公司级制度这类不该按部门卡）
+    department: str = ""
+    #: 密级：0 公开 / 1 内部 / 2 机密（数值越大越敏感，取 **上限** 比较）
+    classification: int = 0
 
 
 @dataclass
@@ -64,6 +71,10 @@ class IndexVersionRecord:
     prefix_scheme: str
     created_at: str = ""
     activated_at: str | None = None
+    #: 灰度流量比 0~1（1 = 全量）。新版本先给 0.1，指标不退化再放量；0 = 事实上回滚。
+    #: 选择规则必须**确定性**（按 query_id 哈希分桶），否则同一请求两次检索可能走不同版本，
+    #: 引用与答案对不上。
+    traffic_ratio: float = 1.0
 
 
 @dataclass
@@ -124,10 +135,22 @@ class TaskRecord:
 
 @dataclass
 class Filters:
-    """检索过滤条件（M1 单租户为空实现，M2 的 ACL 从这里进 SQL）。"""
+    """检索过滤条件（**必须在召回层生效**，不能取回后再筛）。
+
+    两类来源，语义不同：
+    - 客户端传的（doc_ids / tags）：只能**收紧**，不能放宽 —— 服务端会与身份求交
+    - 身份派生的（tenant_id / departments / max_classification）：由 auth 层注入，
+      客户端无法覆盖（`routes/*` 里客户端 filters 只与身份求交，不替换）
+    """
 
     doc_ids: Sequence[str] = ()
     tags: Sequence[str] = ()
+    #: 租户隔离：只看得见本租户的文档（M1 单租户硬编码，见 api/identity.py）
+    tenant_id: str | None = None
+    #: 部门可见范围：空 = 不限；非空 = department 为空串（全员可见）或命中列表
+    departments: Sequence[str] = ()
+    #: 密级上限：classification <= max_classification 才可见
+    max_classification: int | None = None
 
 
 class Store(Protocol):
@@ -140,13 +163,22 @@ class Store(Protocol):
 
     # ---------------- 索引版本 ----------------
     async def get_active_version(self) -> IndexVersionRecord | None: ...
+    async def list_ready_versions(self) -> list[IndexVersionRecord]: ...
     async def upsert_version(self, record: IndexVersionRecord) -> None: ...
     async def activate_version(self, version: str) -> None: ...
+    async def set_traffic_ratio(self, version: str, ratio: float) -> None: ...
+    async def gc_version(self, version: str) -> int: ...
 
     # ---------------- 文档与块 ----------------
     async def upsert_document(self, record: DocumentRecord) -> None: ...
-    async def replace_doc_chunks(self, doc_id: str, chunks: list[ChunkRecord]) -> None: ...
+    async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
+    # 只替换**该文档在该索引版本下**的块：灰度重建期间旧版本仍在服务，
+    # 按 doc_id 一把删会把在服务的块也删掉（引用卡片直接 404）。
+    async def replace_doc_chunks(
+        self, doc_id: str, version: str, chunks: list[ChunkRecord]
+    ) -> None: ...
     async def soft_delete_doc(self, doc_id: str) -> None: ...
+    async def rename_document(self, old_doc_id: str, new_doc_id: str) -> None: ...
     async def list_documents(self, *, include_deleted: bool = False) -> list[DocumentRecord]: ...
     async def load_chunks(
         self, version: str, *, filters: Filters | None = None
@@ -163,6 +195,20 @@ class Store(Protocol):
         self, version: str, *, filters: Filters | None = None
     ) -> dict[str, np.ndarray]: ...
     async def get_vector(self, chunk_id: str) -> np.ndarray | None: ...
+
+    # ---------------- 向量缓存（增量重建的关键） ----------------
+    # 相同文本 + 同模型同前缀 ⇒ 向量逐位相同，与块边界、文档、索引版本都无关。
+    # 因此哈希可以跨版本复用：改一段文字只重算那几块，换分块参数也不重算未变文本。
+    async def load_cached_vectors(
+        self, content_hashes: Sequence[str], *, embedding_model: str, prefix_scheme: str
+    ) -> dict[str, np.ndarray]: ...
+    async def put_cached_vectors(
+        self,
+        rows: Sequence[tuple[str, np.ndarray]],
+        *,
+        embedding_model: str,
+        prefix_scheme: str,
+    ) -> None: ...
 
     # ---------------- 答案 / 轨迹 / 评测 / 任务 ----------------
     async def save_answer(self, record: AnswerRecord) -> None: ...

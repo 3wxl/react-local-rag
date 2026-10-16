@@ -16,6 +16,7 @@ import sqlite3
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -42,7 +43,20 @@ CREATE TABLE IF NOT EXISTS index_version (
   embedding_model TEXT NOT NULL,
   prefix_scheme TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  activated_at TEXT
+  activated_at TEXT,
+  traffic_ratio REAL NOT NULL DEFAULT 1.0
+);
+
+-- 向量缓存（增量重建的关键）：相同文本 + 同模型同前缀 ⇒ 向量逐位相同，
+-- 与块边界、文档、索引版本都无关 → 改一段文字只重算那几块。
+CREATE TABLE IF NOT EXISTS chunk_vector_cache (
+  content_hash TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  prefix_scheme TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (content_hash, embedding_model, prefix_scheme)
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -55,8 +69,13 @@ CREATE TABLE IF NOT EXISTS documents (
   size_bytes INTEGER NOT NULL DEFAULT 0,
   page_count INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
-  deleted_at TEXT
+  deleted_at TEXT,
+  -- ACL 三元组：召回层过滤用（不是取回后再筛）
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  department TEXT NOT NULL DEFAULT '',
+  classification INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS documents_acl ON documents (tenant_id, classification);
 
 CREATE TABLE IF NOT EXISTS chunks (
   chunk_id TEXT PRIMARY KEY,
@@ -146,6 +165,29 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量迁移：`CREATE TABLE IF NOT EXISTS` 管不了**已有表加列**。
+
+    SQLite 没有 `ADD COLUMN IF NOT EXISTS`，用 PRAGMA 查一遍再决定 ——
+    幂等（可重复执行）是硬要求：每次进程启动都会走到这里。
+    这里刻意不引迁移框架（路线图：砍框架，留机制）。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(index_version)")}
+    if "traffic_ratio" not in cols:
+        conn.execute(
+            "ALTER TABLE index_version ADD COLUMN traffic_ratio REAL NOT NULL DEFAULT 1.0"
+        )
+
+    doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    for column, ddl in (
+        ("tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+        ("department", "TEXT NOT NULL DEFAULT ''"),
+        ("classification", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in doc_cols:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {column} {ddl}")
+
+
 def _to_blob(vec: np.ndarray) -> bytes:
     """float32 小端二进制（与 TS Float32Array 同布局）。"""
     return np.asarray(vec, dtype="<f4").tobytes()
@@ -153,6 +195,31 @@ def _to_blob(vec: np.ndarray) -> bytes:
 
 def _from_blob(blob: bytes, dim: int) -> np.ndarray:
     return np.frombuffer(blob, dtype="<f4", count=dim).copy()
+
+
+def _acl_clauses(filters: Filters | None) -> tuple[list[str], list[object]]:
+    """身份派生过滤条件的 SQL 片段（**与打分同一条 SQL**，见各查询方法）。
+
+    关键点：过滤与打分在**同一次查询**里完成，因此
+    - 隐藏文档不会参与 BM25 的 df/IDF 统计（否则能从"某个词让分数变了"反推它存在）
+    - 不存在"先取回再筛"的中间态（那种实现会留下条数/耗时旁路）
+    """
+    if filters is None:
+        return [], []
+    clauses: list[str] = []
+    params: list[object] = []
+    if filters.tenant_id is not None:
+        clauses.append("d.tenant_id = ?")
+        params.append(filters.tenant_id)
+    if filters.max_classification is not None:
+        clauses.append("d.classification <= ?")
+        params.append(int(filters.max_classification))
+    if filters.departments:
+        holders = ",".join("?" * len(filters.departments))
+        # 空部门 = 全员可见（公司级制度不该被部门卡住）
+        clauses.append(f"(d.department = '' OR d.department IN ({holders}))")
+        params.extend(filters.departments)
+    return clauses, params
 
 
 class SqliteStore:
@@ -171,6 +238,7 @@ class SqliteStore:
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        _migrate(self._conn)
         self._conn.commit()
 
     async def close(self) -> None:
@@ -202,8 +270,8 @@ class SqliteStore:
             conn = self._db()
             conn.execute(
                 """INSERT INTO index_version (version, state, chunk_params, embedding_model,
-                       prefix_scheme, created_at, activated_at)
-                   VALUES (?,?,?,?,?,?,?)
+                       prefix_scheme, created_at, activated_at, traffic_ratio)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(version) DO UPDATE SET
                        state=excluded.state, chunk_params=excluded.chunk_params,
                        embedding_model=excluded.embedding_model,
@@ -217,6 +285,7 @@ class SqliteStore:
                     record.prefix_scheme,
                     record.created_at or _now(),
                     record.activated_at,
+                    float(record.traffic_ratio),
                 ),
             )
             conn.commit()
@@ -232,8 +301,92 @@ class SqliteStore:
                 (version,),
             )
             conn.execute(
-                "UPDATE index_version SET state='ready', activated_at=? WHERE version=?",
+                "UPDATE index_version SET state='ready', activated_at=?, traffic_ratio=1.0 "
+                "WHERE version=?",
                 (_now(), version),
+            )
+            conn.commit()
+
+        await self._run(write)
+
+    async def list_ready_versions(self) -> list[IndexVersionRecord]:
+        def query() -> list[IndexVersionRecord]:
+            rows = self._db().execute(
+                "SELECT * FROM index_version WHERE state = 'ready' "
+                "ORDER BY activated_at DESC, created_at DESC"
+            ).fetchall()
+            return [_version_of(r) for r in rows]
+
+        return await self._run(query)
+
+    async def set_traffic_ratio(self, version: str, ratio: float) -> None:
+        """灰度放量/回滚。ratio=0 等于事实上回滚（该版本不再接流量，但数据仍在）。"""
+
+        def write() -> None:
+            conn = self._db()
+            conn.execute(
+                "UPDATE index_version SET traffic_ratio=? WHERE version=?",
+                (max(0.0, min(1.0, float(ratio))), version),
+            )
+            conn.commit()
+
+        await self._run(write)
+
+    async def gc_version(self, version: str) -> int:
+        """清理某个**非 ready** 版本的块与向量（返回删除的块数）。
+
+        只删 stale/failed：ready 版本还在服务流量，删了就是事故。
+        旧版本的向量不进 chunk_vector_cache —— 缓存以内容哈希为键，
+        文本没变时重建会直接命中，不需要"从旧版本捞向量"这种脆弱路径。
+        """
+
+        def write() -> int:
+            conn = self._db()
+            row = conn.execute(
+                "SELECT state FROM index_version WHERE version=?", (version,)
+            ).fetchone()
+            if row is None:
+                return 0
+            if row["state"] == "ready":
+                raise ValueError(f"版本 {version} 仍在服务（state=ready），拒绝 GC")
+            ids = [
+                r["chunk_id"]
+                for r in conn.execute(
+                    "SELECT chunk_id FROM chunks WHERE index_version=?", (version,)
+                ).fetchall()
+            ]
+            for chunk_id in ids:
+                conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (chunk_id,))
+            conn.execute("DELETE FROM chunks WHERE index_version=?", (version,))
+            conn.execute("DELETE FROM index_version WHERE version=?", (version,))
+            conn.commit()
+            return len(ids)
+
+        return await self._run(write)
+
+    async def get_document(self, doc_id: str) -> DocumentRecord | None:
+        def query() -> DocumentRecord | None:
+            row = self._db().execute(
+                "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
+            ).fetchone()
+            return _document_of(row) if row else None
+
+        return await self._run(query)
+
+    async def rename_document(self, old_doc_id: str, new_doc_id: str) -> None:
+        """把文档与其块迁到新 doc_id（历史 doc_id 口径迁移用）。
+
+        doc_id 曾经把 content_hash 并进主键（`uuid5(name:hash)`），导致改一次内容
+        就派生一个新文档、永远走不到"替换"分支。迁移按名字归并到一个稳定 id。
+        """
+
+        def write() -> None:
+            conn = self._db()
+            conn.execute(
+                "UPDATE chunks SET doc_id=? WHERE doc_id=?", (new_doc_id, old_doc_id)
+            )
+            conn.execute(
+                "UPDATE documents SET doc_id=? WHERE doc_id=?", (new_doc_id, old_doc_id)
             )
             conn.commit()
 
@@ -246,13 +399,16 @@ class SqliteStore:
             conn = self._db()
             conn.execute(
                 """INSERT INTO documents (doc_id, doc_name, content_hash, index_version, tags,
-                       raw_path, size_bytes, page_count, created_at, deleted_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                       raw_path, size_bytes, page_count, created_at, deleted_at,
+                       tenant_id, department, classification)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(doc_id) DO UPDATE SET
                        doc_name=excluded.doc_name, content_hash=excluded.content_hash,
                        index_version=excluded.index_version, tags=excluded.tags,
                        raw_path=excluded.raw_path, size_bytes=excluded.size_bytes,
-                       page_count=excluded.page_count, deleted_at=excluded.deleted_at""",
+                       page_count=excluded.page_count, deleted_at=excluded.deleted_at,
+                       tenant_id=excluded.tenant_id, department=excluded.department,
+                       classification=excluded.classification""",
                 (
                     record.doc_id,
                     record.doc_name,
@@ -264,22 +420,31 @@ class SqliteStore:
                     record.page_count,
                     record.created_at or _now(),
                     record.deleted_at,
+                    record.tenant_id,
+                    record.department,
+                    int(record.classification),
                 ),
             )
             conn.commit()
 
         await self._run(write)
 
-    async def replace_doc_chunks(self, doc_id: str, chunks: list[ChunkRecord]) -> None:
+    async def replace_doc_chunks(
+        self, doc_id: str, version: str, chunks: list[ChunkRecord]
+    ) -> None:
         def write() -> None:
             conn = self._db()
             old_ids = [
                 r["chunk_id"]
                 for r in conn.execute(
-                    "SELECT chunk_id FROM chunks WHERE doc_id=?", (doc_id,)
+                    "SELECT chunk_id FROM chunks WHERE doc_id=? AND index_version=?",
+                    (doc_id, version),
                 ).fetchall()
             ]
-            conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+            conn.execute(
+                "DELETE FROM chunks WHERE doc_id=? AND index_version=?",
+                (doc_id, version),
+            )
             for chunk_id in old_ids:
                 conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (chunk_id,))
             conn.executemany(
@@ -348,6 +513,10 @@ class SqliteStore:
             if filters and filters.doc_ids:
                 sql += f" AND c.doc_id IN ({','.join('?' * len(filters.doc_ids))})"
                 params.extend(filters.doc_ids)
+            clauses, acl_params = _acl_clauses(filters)
+            for clause in clauses:
+                sql += f" AND {clause}"
+            params.extend(acl_params)
             sql += " ORDER BY c.doc_id, c.ord"
             return [_chunk_of(r) for r in self._db().execute(sql, params).fetchall()]
 
@@ -389,6 +558,10 @@ class SqliteStore:
             if filters and filters.doc_ids:
                 sql += f" AND c.doc_id IN ({','.join('?' * len(filters.doc_ids))})"
                 params.extend(filters.doc_ids)
+            clauses, acl_params = _acl_clauses(filters)
+            for clause in clauses:
+                sql += f" AND {clause}"
+            params.extend(acl_params)
             sql += " ORDER BY c.doc_id, c.ord"
             rows = self._db().execute(sql, params).fetchall()
             if not rows:
@@ -421,6 +594,10 @@ class SqliteStore:
             if filters and filters.doc_ids:
                 sql += f" AND c.doc_id IN ({','.join('?' * len(filters.doc_ids))})"
                 params.extend(filters.doc_ids)
+            clauses, acl_params = _acl_clauses(filters)
+            for clause in clauses:
+                sql += f" AND {clause}"
+            params.extend(acl_params)
             sql += " ORDER BY c.doc_id, c.ord"
             out: dict[str, np.ndarray] = {}
             for row in self._db().execute(sql, params).fetchall():
@@ -437,6 +614,75 @@ class SqliteStore:
             return _from_blob(row["vec"], row["dim"]) if row else None
 
         return await self._run(query)
+
+    # ---------------- 向量缓存 ----------------
+
+    async def load_cached_vectors(
+        self,
+        content_hashes: Sequence[str],
+        *,
+        embedding_model: str,
+        prefix_scheme: str,
+    ) -> dict[str, np.ndarray]:
+        """按内容哈希取回可复用的向量（键 = content_hash）。"""
+
+        def query() -> dict[str, np.ndarray]:
+            hashes = list(content_hashes)
+            if not hashes:
+                return {}
+            out: dict[str, np.ndarray] = {}
+            conn = self._db()
+            # 分批查：SQLite 变量上限 999，语料一大就会超
+            for i in range(0, len(hashes), 500):
+                batch = hashes[i : i + 500]
+                sql = (
+                    "SELECT content_hash, dim, vec FROM chunk_vector_cache "
+                    f"WHERE embedding_model=? AND prefix_scheme=? "
+                    f"AND content_hash IN ({','.join('?' * len(batch))})"
+                )
+                for row in conn.execute(
+                    sql, [embedding_model, prefix_scheme, *batch]
+                ).fetchall():
+                    out[row["content_hash"]] = _from_blob(row["vec"], row["dim"])
+            return out
+
+        return await self._run(query)
+
+    async def put_cached_vectors(
+        self,
+        rows: Sequence[tuple[str, np.ndarray]],
+        *,
+        embedding_model: str,
+        prefix_scheme: str,
+    ) -> None:
+        def write() -> None:
+            if not rows:
+                return
+            conn = self._db()
+            payload = []
+            for content_hash, vec in rows:
+                arr = np.asarray(vec, dtype="<f4")
+                payload.append(
+                    (
+                        content_hash,
+                        embedding_model,
+                        prefix_scheme,
+                        int(arr.shape[0]),
+                        arr.tobytes(),
+                        _now(),
+                    )
+                )
+            conn.executemany(
+                """INSERT INTO chunk_vector_cache
+                       (content_hash, embedding_model, prefix_scheme, dim, vec, created_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(content_hash, embedding_model, prefix_scheme) DO UPDATE SET
+                       dim=excluded.dim, vec=excluded.vec""",
+                payload,
+            )
+            conn.commit()
+
+        await self._run(write)
 
     # ---------------- 答案与轨迹 ----------------
 
@@ -711,6 +957,9 @@ def _version_of(row: sqlite3.Row) -> IndexVersionRecord:
         prefix_scheme=row["prefix_scheme"],
         created_at=row["created_at"],
         activated_at=row["activated_at"],
+        traffic_ratio=(
+            float(row["traffic_ratio"]) if "traffic_ratio" in row.keys() else 1.0
+        ),
     )
 
 
@@ -726,6 +975,9 @@ def _document_of(row: sqlite3.Row) -> DocumentRecord:
         page_count=row["page_count"],
         created_at=row["created_at"],
         deleted_at=row["deleted_at"],
+        tenant_id=row["tenant_id"] if "tenant_id" in row.keys() else "default",
+        department=row["department"] if "department" in row.keys() else "",
+        classification=int(row["classification"]) if "classification" in row.keys() else 0,
     )
 
 
