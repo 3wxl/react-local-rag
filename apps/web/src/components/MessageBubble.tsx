@@ -30,6 +30,62 @@ interface MessageBubbleProps {
   /** 模型加载进度，仅最后一条助手消息需要 */
   loadProgress: number;
   busy: boolean;
+  /** HITL 审批（服务端 Agent）：批准 / 驳回挂起的工具调用 */
+  onHitlDecision?: (messageId: string, approved: boolean) => void;
+  /** 轨迹回放：按 traceId 拉取服务端完整节点轨迹 */
+  onLoadTrace?: (messageId: string) => void;
+}
+
+/**
+ * 人工审批卡片（HITL，M3）：服务端 Agent 在执行需审批工具前挂起，
+ * 这里把"要执行什么、参数是什么、为什么"如实展示出来，由人决定放行还是驳回。
+ * 默认拒绝的语义也体现在 UI 上：不点批准就不会执行。
+ */
+function HitlApprovalCard({
+  hitl,
+  busy,
+  onDecision,
+  messageId,
+}: {
+  hitl: NonNullable<ChatMessage["hitl"]>;
+  busy: boolean;
+  onDecision?: (messageId: string, approved: boolean) => void;
+  messageId: string;
+}) {
+  return (
+    <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
+      <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-medium">
+        <WarningIcon className="w-4 h-4" />
+        等待人工审批：工具 {hitl.tool}
+      </div>
+      {hitl.argsPreview && (
+        <pre className="mt-2 whitespace-pre-wrap break-all text-xs text-ink-muted bg-bg rounded p-2">
+          {hitl.argsPreview}
+        </pre>
+      )}
+      {hitl.reason && (
+        <div className="mt-1 text-xs text-ink-muted">模型理由：{hitl.reason}</div>
+      )}
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onDecision?.(messageId, true)}
+          className="px-3 py-1 rounded text-xs font-medium bg-accent text-white disabled:opacity-50"
+        >
+          批准并继续
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onDecision?.(messageId, false)}
+          className="px-3 py-1 rounded text-xs font-medium border border-border text-ink-muted disabled:opacity-50"
+        >
+          驳回
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -456,6 +512,8 @@ export function MessageBubble({
   message,
   loadProgress,
   busy,
+  onHitlDecision,
+  onLoadTrace,
 }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const isStreaming =
@@ -597,6 +655,27 @@ export function MessageBubble({
           message.status === "generating" && (
             <span className="inline-block w-1.5 h-4 bg-purple-500 ml-0.5 align-middle animate-pulse rounded-sm" />
           )}
+
+        {/* 人工审批卡片（HITL）：挂起期间展示，批准/驳回后续跑同一 run */}
+        {message.hitl && (
+          <HitlApprovalCard
+            hitl={message.hitl}
+            busy={busy}
+            onDecision={onHitlDecision}
+            messageId={message.id}
+          />
+        )}
+
+        {/* 轨迹回放（服务端模式）：懒加载完整节点轨迹，复用步骤面板渲染 */}
+        {message.status === "done" && message.traceId && !message.traceLoaded && (
+          <button
+            type="button"
+            onClick={() => onLoadTrace?.(message.id)}
+            className="mt-2 text-xs text-accent hover:underline"
+          >
+            查看轨迹
+          </button>
+        )}
 
         {/* 错误提示 */}
         {message.status === "error" && (

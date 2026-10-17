@@ -10,6 +10,7 @@
  * 所以这里不校验多余字段、也不因为缺可选字段就报错。
  */
 
+import type { AgentStep, AgentStepType } from "../agent/types";
 import type { ContextRef } from "../utils/citation";
 import type {
   VerificationResult,
@@ -260,6 +261,442 @@ export async function askServer(
   });
   if (!res.ok) throw await readError(res);
   return mapAnswer((await res.json()) as RawAnswerResponse);
+}
+
+/* ---------------- 流式（M3：SSE） ---------------- */
+
+/** 轨迹行（与 traces 表的 nodes[] 同形；M3 起是 LangGraph 节点轨迹） */
+export interface TraceNode {
+  seq: number;
+  name: string;
+  status: string;
+  duration_ms: number;
+  input_summary?: string;
+  output_summary?: string;
+  error?: string | null;
+}
+
+export interface ServerTrace {
+  id: string;
+  traceId: string;
+  question: string;
+  nodes: TraceNode[];
+  finalVerdict: VerifyVerdict;
+  cost: unknown;
+  evidenceSnapshot: Record<string, unknown>;
+}
+
+export interface ServerStreamHandlers {
+  /** 每个图节点完成（前端据此实时画步骤链） */
+  onNode?: (node: TraceNode) => void;
+  /** 增量文本（provider 支持流式时才有；以 final.answer 为准） */
+  onToken?: (delta: string) => void;
+  /** 查询改写开关（默认 false：与 Lite 模式同口径） */
+  rewrite?: boolean;
+}
+
+/**
+ * 读 SSE 帧（event: 行 + 单行 data: 行，`[DONE]` 结束）。
+ * 与 apps/api/app/api/sse.py 的帧格式成对；解析口径照抄 cloudPlanner 的既有实现，
+ * 避免仓库里出现第二套 SSE 解析。
+ */
+async function* readSse(
+  res: Response,
+): AsyncGenerator<{ event: string; data: unknown }> {
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new ServerError(
+      "stream_unsupported",
+      "当前环境不支持流式读取（ReadableStream 不可用）",
+      0,
+    );
+  }
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let event = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let index: number;
+    while ((index = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+        continue;
+      }
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") return;
+      let data: unknown;
+      try {
+        data = JSON.parse(payload);
+      } catch {
+        continue; // 坏帧跳过：流式里宁可丢一帧，也不要整条流崩掉
+      }
+      yield { event: event || "message", data };
+      event = "";
+    }
+  }
+}
+
+function errorFromEvent(data: unknown): ServerError {
+  const body = (data ?? {}) as {
+    error?: { code?: string; message?: string; detail?: unknown };
+  };
+  return new ServerError(
+    body.error?.code ?? "stream_error",
+    body.error?.message ?? "流式请求失败",
+    200,
+    body.error?.detail,
+  );
+}
+
+/** 流式问答（M3）：事件驱动 + 最终返回与非流式同一形状的答案。 */
+export async function askServerStream(
+  baseUrl: string,
+  question: string,
+  topK: number,
+  handlers: ServerStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<ServerAnswer> {
+  const res = await fetch(apiUrl(baseUrl, "/v1/answer"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question,
+      top_k: topK,
+      stream: true,
+      rewrite: handlers.rewrite ?? false,
+    }),
+    signal,
+  });
+  if (!res.ok) throw await readError(res);
+
+  let final: ServerAnswer | null = null;
+  for await (const { event, data } of readSse(res)) {
+    if (event === "node") handlers.onNode?.(data as TraceNode);
+    else if (event === "token") {
+      const delta = (data as { delta?: string }).delta;
+      if (delta) handlers.onToken?.(delta);
+    } else if (event === "final") final = mapAnswer(data as RawAnswerResponse);
+    else if (event === "error") throw errorFromEvent(data);
+  }
+  if (!final) {
+    throw new ServerError("stream_incomplete", "流式响应缺少 final 事件", 200);
+  }
+  return final;
+}
+
+/* ---------------- Agent（M3：/v1/agent/*） ---------------- */
+
+export interface AgentPendingApproval {
+  kind: string;
+  call_id: string;
+  tool: string;
+  args_preview: string;
+  reason?: string;
+  /** 仅 SSE 的 interrupt 事件带（非流式响应里 run_id 在顶层） */
+  run_id?: string;
+}
+
+export interface AgentToolCall {
+  tool: string;
+  ok: boolean;
+  denied?: boolean;
+  source?: string;
+  latency_ms?: number;
+  args_preview?: string;
+}
+
+export interface AgentRunResult {
+  runId: string;
+  traceId: string;
+  status: "succeeded" | "interrupted";
+  question?: string | null;
+  answer: string;
+  verdict: VerifyVerdict;
+  contexts: ContextRef[];
+  verification: VerificationResult | null;
+  refusalMessage: string | null;
+  cost: RawAnswerResponse["cost"] | null;
+  toolCalls: AgentToolCall[];
+  noProgress: { reason?: string } | null;
+  steps: number;
+  pendingApproval: AgentPendingApproval | null;
+  traceNodes: TraceNode[];
+}
+
+interface RawAgentResponse {
+  run_id: string;
+  trace_id: string;
+  status: "succeeded" | "interrupted";
+  question?: string | null;
+  answer?: string;
+  verdict?: VerifyVerdict;
+  citations?: RawCitation[];
+  refusal?: { reason: string; message: string } | null;
+  verification?: RawVerification;
+  cost?: RawAnswerResponse["cost"];
+  tool_calls?: AgentToolCall[];
+  no_progress?: { reason?: string } | null;
+  steps?: number;
+  pending_approval?: AgentPendingApproval | null;
+  trace_nodes?: TraceNode[];
+}
+
+export function mapAgentRun(raw: RawAgentResponse): AgentRunResult {
+  return {
+    runId: raw.run_id,
+    traceId: raw.trace_id,
+    status: raw.status,
+    question: raw.question ?? null,
+    answer: raw.answer ?? "",
+    verdict: raw.verdict ?? "supported",
+    contexts: (raw.citations ?? []).map(mapCitation),
+    verification: raw.verification ? mapVerification(raw.verification) : null,
+    refusalMessage: raw.refusal?.message ?? null,
+    cost: raw.cost ?? null,
+    toolCalls: raw.tool_calls ?? [],
+    noProgress: raw.no_progress ?? null,
+    steps: raw.steps ?? 0,
+    pendingApproval: raw.pending_approval ?? null,
+    traceNodes: raw.trace_nodes ?? [],
+  };
+}
+
+export interface AgentStreamHandlers extends ServerStreamHandlers {
+  onInterrupt?: (pending: AgentPendingApproval) => void;
+}
+
+async function consumeAgentStream(
+  res: Response,
+  handlers: AgentStreamHandlers,
+): Promise<AgentRunResult> {
+  let final: AgentRunResult | null = null;
+  for await (const { event, data } of readSse(res)) {
+    if (event === "node") handlers.onNode?.(data as TraceNode);
+    else if (event === "token") {
+      const delta = (data as { delta?: string }).delta;
+      if (delta) handlers.onToken?.(delta);
+    } else if (event === "interrupt") {
+      handlers.onInterrupt?.(data as AgentPendingApproval);
+    } else if (event === "final") {
+      final = mapAgentRun({
+        ...(data as object),
+        status: "succeeded",
+      } as RawAgentResponse);
+    } else if (event === "error") throw errorFromEvent(data);
+  }
+  if (!final) {
+    throw new ServerError("stream_incomplete", "Agent 流式响应缺少 final 事件", 200);
+  }
+  return final;
+}
+
+async function agentRequest(
+  baseUrl: string,
+  path: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<RawAgentResponse> {
+  const res = await fetch(apiUrl(baseUrl, path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) throw await readError(res);
+  return (await res.json()) as RawAgentResponse;
+}
+
+/** 启动一次 Agent run（非流式；可能返回 interrupted + 待审批动作）。 */
+export async function runAgent(
+  baseUrl: string,
+  question: string,
+  topK: number,
+  signal?: AbortSignal,
+): Promise<AgentRunResult> {
+  return mapAgentRun(
+    await agentRequest(baseUrl, "/v1/agent/run", { question, top_k: topK }, signal),
+  );
+}
+
+/** 流式启动一次 Agent run（node/token/interrupt/final/error 事件）。 */
+export async function runAgentStream(
+  baseUrl: string,
+  question: string,
+  topK: number,
+  handlers: AgentStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<AgentRunResult> {
+  const res = await fetch(apiUrl(baseUrl, "/v1/agent/run"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, top_k: topK, stream: true }),
+    signal,
+  });
+  if (!res.ok) throw await readError(res);
+  return consumeAgentStream(res, handlers);
+}
+
+/** 人工审批后续跑（流式）：批准/驳回都要调用，前端复用同一套事件处理。 */
+export async function resumeAgentStream(
+  baseUrl: string,
+  runId: string,
+  approved: boolean,
+  handlers: AgentStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<AgentRunResult> {
+  const res = await fetch(
+    apiUrl(baseUrl, `/v1/agent/${encodeURIComponent(runId)}/resume`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approved, stream: true }),
+      signal,
+    },
+  );
+  if (!res.ok) throw await readError(res);
+  return consumeAgentStream(res, handlers);
+}
+
+export interface AgentRunStatus {
+  runId: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "interrupted";
+  pendingApproval: AgentPendingApproval | null;
+  error: string | null;
+}
+
+export async function getAgentRun(
+  baseUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<AgentRunStatus> {
+  const res = await fetch(apiUrl(baseUrl, `/v1/agent/${encodeURIComponent(runId)}`), {
+    signal,
+  });
+  if (!res.ok) throw await readError(res);
+  const body = (await res.json()) as {
+    run_id: string;
+    status: AgentRunStatus["status"];
+    pending_approval: AgentPendingApproval | null;
+    error: string | null;
+  };
+  return {
+    runId: body.run_id,
+    status: body.status,
+    pendingApproval: body.pending_approval ?? null,
+    error: body.error ?? null,
+  };
+}
+
+/* ---------------- 轨迹（M3：LangGraph 节点轨迹） ---------------- */
+
+export async function getAnswerTrace(
+  baseUrl: string,
+  answerId: string,
+  signal?: AbortSignal,
+): Promise<ServerTrace> {
+  const res = await fetch(
+    apiUrl(baseUrl, `/v1/answer/${encodeURIComponent(answerId)}/trace`),
+    { signal },
+  );
+  if (!res.ok) throw await readError(res);
+  const body = (await res.json()) as {
+    answer_id: string;
+    trace_id: string;
+    question: string;
+    nodes: TraceNode[];
+    final_verdict: VerifyVerdict;
+    cost: unknown;
+    evidence_snapshot: Record<string, unknown>;
+  };
+  return {
+    id: body.answer_id,
+    traceId: body.trace_id,
+    question: body.question,
+    nodes: body.nodes ?? [],
+    finalVerdict: body.final_verdict,
+    cost: body.cost,
+    evidenceSnapshot: body.evidence_snapshot ?? {},
+  };
+}
+
+export async function getAgentTrace(
+  baseUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<ServerTrace> {
+  const res = await fetch(
+    apiUrl(baseUrl, `/v1/agent/${encodeURIComponent(runId)}/trace`),
+    { signal },
+  );
+  if (!res.ok) throw await readError(res);
+  const body = (await res.json()) as {
+    run_id: string;
+    trace_id: string;
+    question: string;
+    nodes: TraceNode[];
+    final_verdict: VerifyVerdict;
+    cost: unknown;
+    evidence_snapshot: Record<string, unknown>;
+  };
+  return {
+    id: body.run_id,
+    traceId: body.trace_id,
+    question: body.question,
+    nodes: body.nodes ?? [],
+    finalVerdict: body.final_verdict,
+    cost: body.cost,
+    evidenceSnapshot: body.evidence_snapshot ?? {},
+  };
+}
+
+/**
+ * 服务端轨迹行 → 前端的 AgentStep（复用既有的步骤面板）。
+ *
+ * 契约附录已声明 `trace.nodes[] ≈ AgentStep[]`：这里做的是"名字 → 类型"的确定性映射，
+ * 不做任何推理 —— 轨迹回放看到的必须与后端记录的完全一致。
+ */
+const NODE_TO_STEP_TYPE: Record<string, AgentStepType> = {
+  rewrite: "plan",
+  retrieve: "retrieve",
+  gate: "evaluate",
+  generate: "generate",
+  verify: "evaluate",
+  adjudicate: "evaluate",
+  plan: "plan",
+  act: "tool-call",
+  reflect: "evaluate",
+  synthesize: "synthesize",
+  ingest_doc: "tool-result",
+  selfcheck: "evaluate",
+};
+
+export function mapTraceNodesToAgentSteps(nodes: TraceNode[]): AgentStep[] {
+  return nodes.map((node, index) => {
+    const step: AgentStep = {
+      stepIndex: node.seq || index + 1,
+      type: NODE_TO_STEP_TYPE[node.name] ?? "evaluate",
+      origin: "server-agent",
+      thinking: [node.input_summary, node.output_summary]
+        .filter((part) => !!part)
+        .join("\n"),
+      timestamp: Date.now() + index,
+    };
+    if (node.name === "act") {
+      const input = node.input_summary ?? "";
+      step.tool = {
+        name: input.split(" args=")[0] || "tool",
+        args: input.includes(" args=") ? input.split(" args=")[1] : undefined,
+        ok: node.status === "ok",
+      };
+    }
+    return step;
+  });
 }
 
 export interface UploadResult {

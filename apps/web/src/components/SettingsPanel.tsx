@@ -82,6 +82,8 @@ export function SettingsPanel({
     cloudModel,
     allowToolChunksToCloud,
     serverBaseUrl,
+    enableServerAgent,
+    enableServerRewrite,
   } = agentSettings;
 
   const activeProvider = matchCloudProvider(cloudUpstreamUrl);
@@ -255,6 +257,43 @@ export function SettingsPanel({
                 独立部署时填完整地址，例如 http://192.168.1.10:8000。
                 服务端单进程运行：<code>uv run uvicorn app.main:app --port 8000</code>。
               </p>
+
+              {/* M3：Agent 图与查询改写开关（都默认关：更贵/更偏离 Lite 口径的选择应由用户显式做出） */}
+              <label className="flex items-start gap-2 text-xs text-ink cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={enableServerAgent}
+                  onChange={(e) =>
+                    onAgentSettingsChange({ enableServerAgent: e.target.checked })
+                  }
+                  className="mt-0.5"
+                />
+                <span>
+                  Agent 模式（/v1/agent/run）：planner 多轮调用工具（检索 / 大纲 / 读块 /
+                  计算器，可挂 MCP），需审批的工具会挂起等你批准。
+                  <span className="text-ink-faint">
+                    {" "}
+                    推理链与工具调用都会进轨迹，可点"查看轨迹"回放。
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 text-xs text-ink cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={enableServerRewrite}
+                  onChange={(e) =>
+                    onAgentSettingsChange({ enableServerRewrite: e.target.checked })
+                  }
+                  className="mt-0.5"
+                />
+                <span>
+                  查询改写（rewrite）：口语化提问先改写成术语检索词再做多查询融合。
+                  <span className="text-ink-faint">
+                    {" "}
+                    对口语化问题召回更好，代价是每题多一次模型调用；默认关闭以保持与本地模式同口径。
+                  </span>
+                </span>
+              </label>
             </div>
           )}
 

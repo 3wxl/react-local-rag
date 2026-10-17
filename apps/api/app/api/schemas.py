@@ -37,6 +37,31 @@ class AnswerRequest(StrictModel):
     filters: FiltersIn | None = None
     #: 流式（M3 支持 SSE）；拒绝而不是静默忽略，避免前端以为拿到了流
     stream: bool = False
+    #: 查询改写（M3 起 QA 图有 rewrite 节点）。**默认关**：线上默认配置 = 评测默认配置，
+    #: 且要与浏览器 Lite 模式的普通 RAG 分支同口径（那边不改写）。
+    #: 开启与否都会冻结进 evidence_snapshot.rewrite，事后可复核"这次到底改没改"。
+    rewrite: bool = False
+
+
+class AgentRunRequest(StrictModel):
+    """POST /v1/agent/run（M3）：planner + 工具循环，可能因人工审批挂起。"""
+
+    question: str = Field(min_length=1)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    filters: FiltersIn | None = None
+    stream: bool = False
+
+
+class AgentResumeRequest(StrictModel):
+    """POST /v1/agent/{run_id}/resume：人工审批（HITL）的决定。
+
+    `stream=true` 时以 SSE 继续同一条流（事件协议与 /v1/agent/run 相同）——
+    前端"点批准 → 继续看流式输出"就是这条路径。
+    """
+
+    approved: bool
+    note: str | None = None
+    stream: bool = False
 
 
 class EvalRunRequest(StrictModel):

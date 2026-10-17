@@ -34,7 +34,8 @@ export type AgentStepOrigin =
   | "cloud-plan"
   | "local-selfrag"
   | "mixed-cloud"
-  | "tool-agent";
+  | "tool-agent"
+  | "server-agent";
 
 /**
  * Agent 执行中的一步记录（用于展示思考链 / 调试 / 性能埋点）

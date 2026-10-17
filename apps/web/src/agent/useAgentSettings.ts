@@ -15,6 +15,8 @@ const KEY_CLOUD_UPSTREAM_URL = "agent:cloudUpstreamUrl";
 const KEY_CLOUD_MODEL = "agent:cloudModel";
 const KEY_ALLOW_TOOL_CHUNKS = "agent:allowToolChunksToCloud";
 const KEY_SERVER_BASE_URL = "agent:serverBaseUrl";
+const KEY_ENABLE_SERVER_AGENT = "agent:serverAgent";
+const KEY_ENABLE_SERVER_REWRITE = "agent:serverRewrite";
 
 export const DEFAULT_AGENT_MODE: AgentMode = "local-rag";
 export const DEFAULT_ENABLE_SELF_RAG = true;
@@ -40,6 +42,18 @@ export const DEFAULT_ALLOW_TOOL_CHUNKS = false;
  * dev 下由 vite 代理 `/v1` → apps/api（见 vite.config.ts），生产可填完整地址。
  */
 export const DEFAULT_SERVER_BASE_URL = "";
+/**
+ * 服务器模式的 Agent 开关（M3）：勾选后走 `/v1/agent/run`（planner + 工具循环 +
+ * 人工审批），不勾选走 `/v1/answer`（固定链路问答）。默认关闭：
+ * Agent 会更贵（多轮模型调用），应当是显式选择。
+ */
+export const DEFAULT_ENABLE_SERVER_AGENT = false;
+/**
+ * 服务端查询改写开关（M3）：默认关闭 —— 浏览器 Lite 模式的普通 RAG 分支不改写，
+ * 默认开启会让双端口径分叉。术语化改写对口语化提问有明显收益（M2 实测），
+ * 需要时在这里开（也可由服务端按请求控制）。
+ */
+export const DEFAULT_ENABLE_SERVER_REWRITE = false;
 
 /** 设置面板：厂商预设（一键填上游 + 推荐模型） */
 export const CLOUD_PROVIDER_PRESETS: {
@@ -108,6 +122,10 @@ export interface AgentSettings {
   allowToolChunksToCloud: boolean;
   /** 服务器模式：apps/api 地址（空串 = 同源，dev 走 vite 代理） */
   serverBaseUrl: string;
+  /** 服务器模式：走 Agent 图（工具循环 + HITL）而不是固定问答链 */
+  enableServerAgent: boolean;
+  /** 服务器模式：问答前先做查询改写（默认关，与 Lite 模式同口径） */
+  enableServerRewrite: boolean;
 }
 
 function readStr(key: string, fallback: string): string {
@@ -145,7 +163,8 @@ function readAgentMode(key: string, fallback: AgentMode): AgentMode {
       v === "local-rag" ||
       v === "hybrid-agent" ||
       v === "cloud-only" ||
-      v === "tool-agent"
+      v === "tool-agent" ||
+      v === "server-rag"
     )
       return v;
     return fallback;
@@ -191,6 +210,14 @@ function loadAll(): AgentSettings {
       DEFAULT_ALLOW_TOOL_CHUNKS,
     ),
     serverBaseUrl: readStr(KEY_SERVER_BASE_URL, DEFAULT_SERVER_BASE_URL),
+    enableServerAgent: readBool(
+      KEY_ENABLE_SERVER_AGENT,
+      DEFAULT_ENABLE_SERVER_AGENT,
+    ),
+    enableServerRewrite: readBool(
+      KEY_ENABLE_SERVER_REWRITE,
+      DEFAULT_ENABLE_SERVER_REWRITE,
+    ),
   };
 }
 
@@ -224,6 +251,10 @@ export function useAgentSettings(): [
         writeBool(KEY_ALLOW_TOOL_CHUNKS, next.allowToolChunksToCloud);
       if (patch.serverBaseUrl !== undefined)
         writeStr(KEY_SERVER_BASE_URL, next.serverBaseUrl);
+      if (patch.enableServerAgent !== undefined)
+        writeBool(KEY_ENABLE_SERVER_AGENT, next.enableServerAgent);
+      if (patch.enableServerRewrite !== undefined)
+        writeBool(KEY_ENABLE_SERVER_REWRITE, next.enableServerRewrite);
       return next;
     });
   }, []);

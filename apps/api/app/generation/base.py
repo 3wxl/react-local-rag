@@ -30,7 +30,13 @@ class Completion:
 
 
 class LlmProvider(Protocol):
-    """生成通道协议。"""
+    """生成通道协议。
+
+    `stream` 是**可选能力**：支持的通道实现它，不支持的就不实现（调用方用
+    `getattr(provider, "stream", None)` 探测）。为什么用可选而不是协议强制：
+    ONNX 通道的解码循环逐 token 贪心、无法给出干净的增量分片，硬塞一个"一次性
+    返回全文"的假流只会让客户端以为拿到了真的流。契约里 token 事件因此标 best-effort。
+    """
 
     name: str
     model: str
@@ -38,6 +44,12 @@ class LlmProvider(Protocol):
     def available(self) -> bool: ...
 
     def complete(self, prompt: str, *, max_new_tokens: int = 512) -> Completion: ...
+
+    # 可选成员（不写进 Protocol，避免强制实现）：
+    #   def stream(self, prompt: str, *, max_new_tokens: int = 512,
+    #              on_delta: Callable[[str], None] | None = None) -> Completion
+    # 语义：逐片回调 on_delta（原始文本，调用方负责 strip_think_tags），
+    # 返回值与 complete() 同构（含真实用量），保证"流式只是多了一条输出通道"。
 
 
 class ModelUnavailableError(RuntimeError):

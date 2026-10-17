@@ -24,6 +24,7 @@ export type MessageStatus =
   | "thinking" // 思考过程中
   | "generating" // 答案生成中
   | "verifying" // 答案生成后，JS 后处理校验文档依据中
+  | "awaiting-approval" // 服务端 Agent 等待人工审批（HITL）
   | "done" // 完成
   | "error"; // 出错
 
@@ -56,6 +57,21 @@ export interface ChatMessage {
   status: MessageStatus;
   /** 出错时的提示 */
   error?: string;
+  /** 服务端错误的错误码（如 budget_exceeded）：UI 据此给不同提示 */
+  errorCode?: string;
+  /** 服务端轨迹 id（answer_id / run_id）：轨迹回放按它取 nodes */
+  traceId?: string;
+  /** 服务端成本对象（契约 §0.4；审计/调试用） */
+  cost?: unknown;
+  /** Agent 待人工审批（HITL）：非空时展示审批卡片 */
+  hitl?: {
+    runId: string;
+    tool: string;
+    argsPreview: string;
+    reason?: string;
+  };
+  /** 轨迹是否已加载（避免重复请求"查看轨迹"） */
+  traceLoaded?: boolean;
   createdAt: number;
 }
 

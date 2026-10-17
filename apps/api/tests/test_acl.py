@@ -296,17 +296,23 @@ def test_retrieve_respects_identity_tenant(tmp_path, monkeypatch) -> None:
         # 本用例验的是**过滤**（谁能看见），不是向量质量：关掉向量路，
         # 检索走 BM25 豁免路径 —— 这样命中与否只由 ACL 与关键词决定，
         # 不受"测试环境有没有 ONNX 权重"影响。
-        client.app.state.ctx.embedder.enabled = False
+        # embedder 是**进程内单例**：这里必须 try/finally 还原，否则后续用例会被
+        # 悄悄降级成纯词法证据（表现是裁决断言随文件顺序红绿闪烁，极难定位）。
+        embedder = client.app.state.ctx.embedder
+        prev_enabled = embedder.enabled
+        embedder.enabled = False
+        try:
+            app.dependency_overrides[get_identity] = lambda: Identity(
+                tenant_id="tenant-a", department="", clearance=2
+            )
+            own = client.post("/v1/retrieve", json={"question": "智能网关标准版售价"}).json()
 
-        app.dependency_overrides[get_identity] = lambda: Identity(
-            tenant_id="tenant-a", department="", clearance=2
-        )
-        own = client.post("/v1/retrieve", json={"question": "智能网关标准版售价"}).json()
-
-        app.dependency_overrides[get_identity] = lambda: Identity(
-            tenant_id="tenant-b", department="", clearance=2
-        )
-        other = client.post("/v1/retrieve", json={"question": "智能网关标准版售价"}).json()
+            app.dependency_overrides[get_identity] = lambda: Identity(
+                tenant_id="tenant-b", department="", clearance=2
+            )
+            other = client.post("/v1/retrieve", json={"question": "智能网关标准版售价"}).json()
+        finally:
+            embedder.enabled = prev_enabled
         app.dependency_overrides.pop(get_identity, None)
 
     # 自己的租户：看得到

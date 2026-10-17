@@ -28,6 +28,28 @@ def context_to_dict(c: ContextRef) -> dict:
     }
 
 
+def context_from_dict(data: dict) -> ContextRef:
+    """契约 Citation → ContextRef（`context_to_dict` 的逆）。
+
+    图节点之间只传 dict（State 要能序列化进检查点），校验节点需要领域对象时用这个重建 ——
+    放在这里与正向映射成对，避免"同一个字段两处写法"。
+    """
+    return ContextRef(
+        index=data["index"],
+        doc_id=data["doc_id"],
+        doc_name=data["doc_name"],
+        heading_path=list(data.get("heading_path") or []),
+        page_start=data["page_start"],
+        page_end=data["page_end"],
+        score=data["score"],
+        relevance=data["relevance"],
+        chunk_ids=list(data.get("chunk_ids") or []),
+        window_chunk_ids=list(data.get("window_chunk_ids") or []),
+        matched_content=data.get("matched_content", ""),
+        content=data.get("content", ""),
+    )
+
+
 def verification_to_dict(v: VerificationResult) -> dict:
     """逐句校验 → 契约 §2 verification。"""
     return {
