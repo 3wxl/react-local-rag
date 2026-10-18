@@ -302,7 +302,11 @@ export function findUnknownNumbers(
   contextNumbers?: Set<string>,
 ): string[] {
   const nums = contextNumbers ?? new Set(extractNumbers(contextText));
-  return extractNumbers(sentence).filter(
+  // 引用角标不是数字事实：先剥掉 [1]/[1,2] 再抽取。否则角标编号会被当成
+  // 「捏造的数字」（语料里未必有孤立的 "1"），无向量环境（纯词法）下
+  // fabricatedNumber 封顶必生效 → 带引用的正确答案被误拒（CI 必现）。
+  const facts = extractNumbers(sentence.replace(CITATION_RE, ""));
+  return facts.filter(
     (n) => !nums.has(n) && !contextContainsNumber(numberCore(n), contextText),
   );
 }
