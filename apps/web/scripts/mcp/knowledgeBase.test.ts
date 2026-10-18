@@ -4,13 +4,20 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  FULL_ACCESS_IDENTITY,
+  KbAuthError,
   KbError,
+  answerKb,
   buildOutline,
   decodeVectorB64,
   listDocs,
+  loadAcl,
   loadKnowledgeBase,
   readChunks,
+  resolveToken,
   searchKb,
+  type KbAcl,
+  type KbIdentity,
 } from "./knowledgeBase";
 
 /* ---------------- 夹具：合成一份最小备份 ---------------- */
@@ -192,5 +199,166 @@ describe("buildOutline / readChunks / listDocs", () => {
       { doc: DOC_A, chunks: 2 },
       { doc: DOC_B, chunks: 1 },
     ]);
+  });
+});
+
+/* ---------------- M5：检索层 ACL ---------------- */
+
+const ACL: KbAcl = {
+  strict: true,
+  documents: {
+    [DOC_A]: { tenantId: "default", department: "", classification: 0 },
+    [DOC_B]: { tenantId: "default", department: "hr", classification: 2 },
+  },
+  tokens: {
+    "token-hr": {
+      subject: "alice",
+      tenantId: "default",
+      departments: ["hr"],
+      clearance: 2,
+    },
+    "token-eng-low": {
+      subject: "bob",
+      tenantId: "default",
+      departments: ["eng"],
+      clearance: 1,
+    },
+  },
+};
+
+function identity(overrides: Partial<KbIdentity> = {}): KbIdentity {
+  return { ...FULL_ACCESS_IDENTITY, ...overrides };
+}
+
+describe("ACL：权限在检索层生效", () => {
+  it("文档清单 / 检索 / 大纲 / 读原文都按身份过滤", () => {
+    const eng = ACL.tokens["token-eng-low"];
+    expect(listDocs(kb, ACL, eng).map((d) => d.doc)).toEqual([DOC_A]);
+    expect(searchKb(kb, "年假", { acl: ACL, identity: eng }).hits).toEqual([]);
+    expect(buildOutline(kb, undefined, ACL, eng).docs.map((d) => d.doc)).toEqual([DOC_A]);
+    // 直接按文档名读也不行 —— 与文档不存在完全同形
+    expect(() => readChunks(kb, DOC_B, 0, 0, ACL, eng)).toThrow(/未找到文档/);
+  });
+
+  it("部门 + 密级都满足时才可见", () => {
+    const hrLow = identity({ departments: ["hr"], clearance: 1 });
+    expect(listDocs(kb, ACL, hrLow).map((d) => d.doc)).toEqual([DOC_A]);
+
+    const hr = ACL.tokens["token-hr"];
+    expect(listDocs(kb, ACL, hr).map((d) => d.doc)).toEqual([DOC_A, DOC_B]);
+    expect(searchKb(kb, "年假", { acl: ACL, identity: hr }).hits[0]?.doc).toBe(DOC_B);
+  });
+
+  it("租户不匹配 = 空结果（不是 403 式泄漏）", () => {
+    const other = identity({ subject: "eve", tenantId: "tenant-2" });
+    const result = searchKb(kb, "标准版售价", { acl: ACL, identity: other });
+    expect(result.hits).toEqual([]);
+    expect(result.candidateCount).toBe(0);
+  });
+
+  it("strict=true 时未列出的文档默认拒绝；strict=false 时放行", () => {
+    const aOnly: KbAcl = { ...ACL, documents: { [DOC_A]: ACL.documents[DOC_A] } };
+    const hr = ACL.tokens["token-hr"];
+    expect(listDocs(kb, aOnly, hr).map((d) => d.doc)).toEqual([DOC_A]);
+    expect(() => searchKb(kb, "年假", { acl: aOnly, identity: hr, docName: DOC_B })).toThrow(
+      /未找到文档/,
+    );
+
+    const permissive: KbAcl = { ...aOnly, strict: false };
+    expect(listDocs(kb, permissive, hr).map((d) => d.doc)).toEqual([DOC_A, DOC_B]);
+  });
+
+  it("无权文档不会出现在错误信息的可用清单里", () => {
+    const eng = ACL.tokens["token-eng-low"];
+    try {
+      searchKb(kb, "年假", { acl: ACL, identity: eng, docName: "不存在.md" });
+      throw new Error("应当抛错");
+    } catch (err) {
+      expect(err).toBeInstanceOf(KbError);
+      expect((err as Error).message).toContain(DOC_A);
+      expect((err as Error).message).not.toContain(DOC_B);
+    }
+  });
+
+  it("无 ACL 时保持本机全量访问（向后兼容）", () => {
+    expect(listDocs(kb).map((d) => d.doc)).toEqual([DOC_A, DOC_B]);
+  });
+
+  it("响应不变性：无权文档不参与打分（有无隐藏文档时结果逐字段一致）", () => {
+    // 只含 DOC_A 的备份 vs 含 A+B 的备份；B 对 eng 身份不可见。
+    // 若过滤发生在打分之后，B 会改变 BM25 的 df/IDF，A 的分数与排序就会漂移。
+    const visibleOnly = makeBackup() as {
+      conversations: { id: string; title: string; docName?: string; chunkCount: number; updatedAt: number }[];
+      vectorIndexes: { convId: string; chunks: unknown[] }[];
+    };
+    visibleOnly.conversations = visibleOnly.conversations.filter((c) => c.docName === DOC_A);
+    visibleOnly.vectorIndexes = visibleOnly.vectorIndexes.filter((v) => v.convId === "conv-1");
+    const pathA = join(tmpdir(), `rag-kb-invariance-${process.pid}.json`);
+    writeFileSync(pathA, JSON.stringify(visibleOnly), "utf8");
+    const kbA = loadKnowledgeBase(pathA);
+
+    const eng = ACL.tokens["token-eng-low"];
+    const withHidden = searchKb(kb, "智能网关标准版售价", { acl: ACL, identity: eng });
+    const withoutHidden = searchKb(kbA, "智能网关标准版售价");
+
+    expect(withHidden.candidateCount).toBe(withoutHidden.candidateCount);
+    expect(withHidden.hits.length).toBe(withoutHidden.hits.length);
+    withHidden.hits.forEach((hit, i) => {
+      expect(hit.doc).toBe(withoutHidden.hits[i].doc);
+      expect(hit.score).toBeCloseTo(withoutHidden.hits[i].score, 10);
+      expect(hit.relevance).toBeCloseTo(withoutHidden.hits[i].relevance, 10);
+      expect(hit.text).toBe(withoutHidden.hits[i].text);
+    });
+  });
+});
+
+describe("loadAcl / resolveToken", () => {
+  it("解析 token 与文档规则；未知 token 返回 null（调用方转 401）", () => {
+    const aclPath = join(tmpdir(), `rag-kb-acl-${process.pid}.json`);
+    writeFileSync(aclPath, JSON.stringify(ACL), "utf8");
+    const loaded = loadAcl(aclPath);
+    expect(loaded.strict).toBe(true);
+    expect(resolveToken(loaded, "token-hr")?.subject).toBe("alice");
+    expect(resolveToken(loaded, "nope")).toBeNull();
+    expect(resolveToken(loaded, undefined)).toBeNull();
+  });
+
+  it("ACL 文件不存在/结构损坏抛 KbError（不静默退回全量）", () => {
+    expect(() => loadAcl(join(tmpdir(), "no-such-acl.json"))).toThrow(KbError);
+    const bad = join(tmpdir(), `rag-kb-acl-bad-${process.pid}.json`);
+    writeFileSync(bad, JSON.stringify({ tokens: { t: { clearance: "high" } } }), "utf8");
+    expect(() => loadAcl(bad)).toThrow(/clearance/);
+  });
+
+  it("KbAuthError 是可识别类型（HTTP 层据此回 401）", () => {
+    expect(new KbAuthError("x")).toBeInstanceOf(KbAuthError);
+  });
+});
+
+/* ---------------- M5：kb.answer ---------------- */
+
+describe("answerKb", () => {
+  it("返回带引用的抽取式答案", () => {
+    const result = answerKb(kb, "标准版售价");
+    expect(result.generation).toBe("extractive");
+    expect(result.no_relevant_hit).toBe(false);
+    expect(result.citations.length).toBeGreaterThan(0);
+    expect(result.citations[0].doc).toBe(DOC_A);
+    expect(result.citations[0].quote).toContain("3980");
+    expect(result.answer).toContain("3980");
+  });
+
+  it("没有依据时拒答且不给引用", () => {
+    const result = answerKb(kb, "区块链与加密货币");
+    expect(result.no_relevant_hit).toBe(true);
+    expect(result.answer).toContain("未找到");
+    expect(result.citations).toEqual([]);
+  });
+
+  it("答案的引用同样受 ACL 约束", () => {
+    const eng = ACL.tokens["token-eng-low"];
+    const result = answerKb(kb, "年假", { acl: ACL, identity: eng });
+    expect(result.no_relevant_hit).toBe(true);
+    expect(result.citations).toEqual([]);
   });
 });
