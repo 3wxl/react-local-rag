@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Sequence
+from typing import AsyncIterator, Iterator, Sequence
 
 from ..core.config import Settings
 from ..embedding.bge import BgeOnnxEmbedder
@@ -24,7 +26,9 @@ from ..graphs.budget import BudgetExceeded, new_ledger, preflight
 from ..graphs.state import filters_from_dict, filters_to_dict
 from ..graphs.tools.builtin import build_builtin_tools
 from ..graphs.tools.registry import ToolOutcome, ToolRegistry, ToolSpec
+from ..mcp.audit import audit_context
 from ..mcp.client import McpStdioClient, tool_schema_to_parameters
+from ..skills import SkillRegistry
 from ..store import Filters, Store
 from .retrieval_service import RetrievalService
 
@@ -63,6 +67,14 @@ class AgentService:
         self.checkpointer = checkpointer
         #: 启动时挂载的外部工具（MCP）；每次 run 复制进新注册表
         self.mounted_tools = list(mounted_tools)
+        #: Skills 注册表（manifest 加载期完成；调用时才起沙箱子进程）
+        self.skills = (
+            SkillRegistry.discover(settings.skill_dirs)
+            if settings.skills_enabled
+            else SkillRegistry([])
+        )
+        #: 外部技能目录里加载失败的条目（`GET /v1/skills` 原样返回，便于排查）
+        self.skill_errors = list(self.skills.errors)
 
     # ---------------- 工具注册表 ----------------
 
@@ -79,7 +91,12 @@ class AgentService:
             registry.register(spec)
         for spec in self.mounted_tools:
             registry.register(spec)
+        for spec in self.skills.tool_specs():
+            registry.register(spec)
         return registry
+
+    def skill_manifests(self) -> list[dict]:
+        return self.skills.public_manifests()
 
     def _build_graph(self, registry: ToolRegistry):
         return build_agent_graph(
@@ -134,6 +151,9 @@ class AgentService:
             "evidence": [],
             "citations": [],
             "approved": [],
+            # 工具输出的不可信数据标签用随机 nonce：数据里无法预知标签，无法提前闭合
+            "untrusted_nonce": secrets.token_hex(8),
+            "injection_findings": [],
             "budget": new_ledger(),
             "trace_nodes": [],
             "breakdown": {},
@@ -150,16 +170,17 @@ class AgentService:
     ) -> RunOutcome:
         self.preflight(question, top_k=top_k)
         graph = self._build_graph(self.build_registry(version=version, filters=filters))
-        result = await graph.ainvoke(
-            self._seed(
-                run_id=run_id,
-                question=question,
-                version=version,
-                top_k=top_k,
-                filters=filters,
-            ),
-            config=self._config(run_id),
-        )
+        with _audit_run(run_id):
+            result = await graph.ainvoke(
+                self._seed(
+                    run_id=run_id,
+                    question=question,
+                    version=version,
+                    top_k=top_k,
+                    filters=filters,
+                ),
+                config=self._config(run_id),
+            )
         return _outcome_of(result)
 
     async def run_stream(
@@ -177,10 +198,11 @@ class AgentService:
             run_id=run_id, question=question, version=version, top_k=top_k, filters=filters
         )
         try:
-            async for payload in graph.astream(
-                seed, config=self._config(run_id), stream_mode="custom"
-            ):
-                yield payload
+            with _audit_run(run_id):
+                async for payload in graph.astream(
+                    seed, config=self._config(run_id), stream_mode="custom"
+                ):
+                    yield payload
             # 中断不会产生 custom 事件：流结束后回读检查点，把"待审批"补发出去
             pending = await self.pending_approval(run_id)
             if pending is not None:
@@ -242,10 +264,11 @@ class AgentService:
             filters=filters_from_dict(values.get("filters_dict") or {}),
         )
         graph = self._build_graph(registry)
-        result = await graph.ainvoke(
-            Command(resume={"approved": approved, "note": note or ""}),
-            config=self._config(run_id),
-        )
+        with _audit_run(run_id):
+            result = await graph.ainvoke(
+                Command(resume={"approved": approved, "note": note or ""}),
+                config=self._config(run_id),
+            )
         return _outcome_of(result)
 
     async def resume_stream(
@@ -263,12 +286,13 @@ class AgentService:
         )
         graph = self._build_graph(registry)
         try:
-            async for payload in graph.astream(
-                Command(resume={"approved": approved, "note": note or ""}),
-                config=self._config(run_id),
-                stream_mode="custom",
-            ):
-                yield payload
+            with _audit_run(run_id):
+                async for payload in graph.astream(
+                    Command(resume={"approved": approved, "note": note or ""}),
+                    config=self._config(run_id),
+                    stream_mode="custom",
+                ):
+                    yield payload
             pending = await self.pending_approval(run_id)
             if pending is not None:
                 from ..graphs.events import EVENT_INTERRUPT
@@ -344,6 +368,16 @@ def _error_event(code: str, message: str, detail: dict | None = None) -> dict:
         "event": "error",
         "data": {"error": {"code": code, "message": message, "detail": detail or {}}},
     }
+
+
+@contextmanager
+def _audit_run(run_id: str) -> Iterator[None]:
+    """把 run_id 注入审计上下文：MCP 客户端在深层工具 handler 里仍能记到归属。"""
+    token = audit_context.set({"run_id": run_id})
+    try:
+        yield
+    finally:
+        audit_context.reset(token)
 
 
 def _now() -> str:

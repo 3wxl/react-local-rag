@@ -129,6 +129,10 @@ class AgentState(TypedDict, total=False):
     evidence: list[dict]
     citations: list[dict]
     approved: list[str]
+    #: 每次 run 的随机 nonce：planner 观察的不可信数据标签用它，工具内容无法预知/伪造
+    untrusted_nonce: str
+    #: 间接提示注入命中记录（工具 / 类别 / 风险 / 处置），进证据快照与轨迹
+    injection_findings: list[dict]
 
     answer: str
     completion_meta: dict
