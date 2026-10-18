@@ -65,8 +65,36 @@ curl -s localhost:8000/v1/agent/<run_id>/trace    # 轨迹回放（每个节点 
 | `CHECKPOINT_BACKEND` | sqlite | 检查点后端（`DATA_DIR/graph_checkpoints.sqlite3`）；测试用 `memory` |
 | `AGENT_NO_PROGRESS_LIMIT` | 2 | 无进展判据阈值（重复调用 / 观察重复 / 连续失败） |
 | `MCP_SERVER_COMMAND` / `MCP_ALLOWLIST` / `MCP_TIMEOUT_S` | 空 / 空 / 20 | 挂 MCP stdio 服务（空 = 禁用）。挂载仓库自带的 TS server：`node --import tsx apps/web/scripts/mcp/server.ts --backup <file>` |
+| `MCP_AUDIT_ENABLED` / `MCP_AUDIT_PATH` | true / 空 | 每次 MCP 调用写 JSONL 审计；路径空 = `DATA_DIR/mcp_audit.jsonl` |
+| `SKILLS_ENABLED` / `EXTRA_SKILLS_DIRS` | true / 空 | Skills 注册表；额外技能目录（JSON 数组）追加到内置目录 |
 
 > 节点改名会作废挂起的 HITL 中断（LangGraph 按节点名恢复）：部署含改名的版本前先清掉挂起的 run。
+
+## M5：对外能力面（MCP / Skills / 注入防护 / 离线包）
+
+| 能力 | 落点 | 关键约束 |
+| --- | --- | --- |
+| **MCP Server** | `apps/web/scripts/mcp/server.ts` | stdio + Streamable HTTP；`kb.list_docs/search/get_chunk/answer`；ACL 在检索层过滤 |
+| **MCP Client** | `app/mcp/client.py` | allowlist 默认拒绝；每次 list/call/拒绝/超时写 JSONL 审计（参数脱敏、结果只记指纹） |
+| **Skills** | `app/skills/` | `SKILL.md` frontmatter manifest（参数 schema / 权限 / 超时 / 成本）+ 子进程最小沙箱 |
+| **注入防护** | `app/security/injection.py` | 工具输出先识别/脱敏，再用每次 run 随机 nonce 标签包裹后交给 planner；命中进证据快照 |
+| **离线部署** | `infra/airgap/` | 镜像 + 模型 + 评测资产离线包；`internal` 网络无公网出口；一键 compose |
+
+```bash
+# Skills 清单（参数 schema / 权限 / 超时 / 成本预估）
+curl -s localhost:8000/v1/skills | python -m json.tool
+
+# MCP 客户端审计（挂载 MCP_SERVER_COMMAND 后每次调用都会追加）
+tail -n 5 .data/mcp_audit.jsonl
+```
+
+Agent 响应新增（可选读）字段：`evidence_snapshot.injection_findings`、
+`tool_calls[].injection_risk` / `injection_count`。工具输出原文只用于用户可见引用与审计，
+送进 planner / 生成模型的是脱敏副本。
+
+**安全边界（如实说明）**：Skills 沙箱能拦常见越界（网络/子进程/越界文件），但不是容器级
+安全边界；`-S` 表示技能只能用标准库（第三方依赖需改为独立服务）。MCP 工具默认需要人工审批；
+注入防护降低"数据被当成指令"的概率，不替代 HITL。
 
 ## 依赖与降级
 
@@ -96,7 +124,9 @@ app/
 ├── store/           # SQLite（默认）与 Postgres+pgvector（生产），同一套契约测试约束
 ├── graphs/          # LangGraph 三张图（M3）：qa / ingest / agent + 预算守卫 + 事件流
 │   └── tools/       #   工具注册表与内置工具（search_docs/doc_outline/read_chunks/calculator）
-├── mcp/             # MCP stdio 客户端（initialize / tools/list / tools/call）
+├── mcp/             # MCP stdio 客户端 + JSONL 调用审计（allowlist / 超时 / 脱敏预览）
+├── skills/          # Skills manifest（SKILL.md）+ 最小沙箱子进程 + 内置示例
+├── security/        # 间接提示注入：识别 / 脱敏 / nonce 隔离
 ├── services/        # 摄取 / 检索 / 问答与 Agent 运行服务
 ├── harness/         # 评测指标与门槛（与 npm run eval 同口径，逐数值可比）
 └── api/             # 契约路由（/v1/*）+ 错误体 + 序列化

@@ -88,4 +88,4 @@ uv run uvicorn app.main:app --port 8000                            # 单进程
 
 ## 路线图
 
-见 [docs/ROADMAP-FULLSTACK.md](docs/ROADMAP-FULLSTACK.md)。已完成：M0（契约与骨架）→ M1（最小可用全栈）→ M2（可靠性与弱模型工程）→ M3（LangGraph Agent 化：三张图 + 轨迹/检查点 + 流式 + 预算 + HITL）。下一步：M4（Harness 强化）→ M5（MCP + Skills + 离线部署）。
+见 [docs/ROADMAP-FULLSTACK.md](docs/ROADMAP-FULLSTACK.md)。已完成：M0（契约与骨架）→ M1（最小可用全栈）→ M2（可靠性与弱模型工程）→ M3（LangGraph Agent 化：三张图 + 轨迹/检查点 + 流式 + 预算 + HITL）→ M5（对外能力面：MCP Server/Client + Skills 沙箱 + 注入防护 + air-gapped 部署包）。M4（Harness 强化）待做。

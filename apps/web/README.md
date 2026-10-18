@@ -43,7 +43,7 @@
 - **云端 RAG 用户知情同意**：cloud-only 主动打破「chunk 不上传云端」红线，但只上传本地检索命中的 Top-K 分片（非全量文档），切换模式时弹窗明示；UI 用紫色虚线块呈现云端回答并固定 ⚠️「本地检索的相关分片已发送云端，云端基于分片作答（不做本地幻觉校验）」警示
 - **工具智能体双轨红线**：默认元数据模式下，工具结果只含 JSON 摘要（命中数 / 文档名 / 章节 / 页码 / 相关度），单测断言发往云端的消息不含片段原文；同意模式需用户在设置面板显式确认后才上传片段。代理侧 `/v1/agent/step` 还有第二道闸门（见下）
 - **云端代理（proxy.mjs）**：浏览器同源策略拦死 `api.openai.com` 等域名，本仓库附带的 Node 代理转发 `POST /v1/chat/completions`，从 `X-User-Api-Key` 头读 key 用完即丢，不持久化不解析；工具智能体新增 `POST /v1/agent/step`，解析请求体做工具白名单 + 轮次上限 + 元数据模式 JSON 摘要校验
-- **MCP Server（scripts/mcp/）**：独立 stdio 服务，只读应用导出的备份 JSON，把知识库检索暴露给任意 MCP 客户端（Claude Code / Claude Desktop）；复用线上检索管线，有本地模型走 hybrid、缺模型自动退 BM25，零网络零写盘
+- **MCP Server（scripts/mcp/）**：独立 stdio + Streamable HTTP 服务，只读应用导出的备份 JSON，把知识库检索暴露给任意 MCP 客户端（Claude Desktop / Cursor / Claude Code）；提供 `kb.list_docs` / `kb.search` / `kb.get_chunk` / `kb.answer`，ACL 在检索层生效；复用线上检索管线，有本地模型走 hybrid、缺模型自动退 BM25，零网络零写盘
 - **API Key 安全**：用户在设置面板填入的云端 API Key 存储在 `sessionStorage`，关闭标签页/浏览器即清空，不进 localStorage、不进网络日志
 - **完整异常捕获体系**：全局 ErrorBoundary + Worker 崩溃兜底 + 内存预判 + 请求超时 + 分类错误提示
 - **模型手动卸载**：LLM / Embedding 模型空闲时自动释放权重；侧边栏支持手动一键释放
@@ -557,7 +557,7 @@ react-local-rag
 ├── proxy.mjs                                     # 云端 OpenAI 兼容接口代理（CORS + key 用完即丢 + /v1/agent/step 闸门）
 ├── proxy.test.mjs                                # 12 个测试：工具白名单 / 轮次上限 / 元数据模式 JSON 摘要校验
 ├── scripts/
-│   └── mcp/                                      # 独立 stdio MCP Server（只读备份 JSON，不侵入主应用）
+│   └── mcp/                                      # 独立 MCP Server（stdio + HTTP，只读备份 JSON，不侵入主应用）
 │       ├── server.ts                             # 入口（npm run mcp）：search_docs / doc_outline / read_chunks
 │       ├── knowledgeBase.ts                      # 备份解析 + 混合检索/大纲/按段读原文（纯逻辑，可单测）
 │       ├── knowledgeBase.test.ts                 # 12 个测试：加载 / 降级 / 检索 / 大纲 / 读取边界
@@ -779,29 +779,39 @@ $env:TARGET_BASE_URL="https://api.openai.com/v1"; $env:PORT=8787; node proxy.mjs
 
 ## MCP Server：把知识库接给外部 AI 工具
 
-`scripts/mcp/` 是一个**独立的 stdio MCP Server**：读应用导出的备份 JSON，对外暴露知识库能力。
-不侵入主应用 —— 只读文件，不连 IndexedDB、不写盘、不发网络请求（向量模型也从 `public/models` 本地加载）。
+`scripts/mcp/` 是一个**独立的 MCP Server**（stdio + Streamable HTTP）：读应用导出的备份 JSON，
+对外暴露知识库能力。不侵入主应用 —— 只读文件，不连 IndexedDB、不写盘、不发网络请求
+（向量模型也从 `public/models` 本地加载）。
 
 **用法**：
 
 ```bash
 # 1. 在应用里「侧边栏 → 导出备份」得到 rag-backup-YYYY-MM-DD.json
-# 2. 直接跑（默认读 ./rag-backup.json）：
+# 2. stdio（默认读 ./rag-backup.json）：
 npm run mcp
 npm run mcp -- --backup D:\backups\rag-backup-2026-10-03.json
 RAG_BACKUP_PATH=/path/to/backup.json npm run mcp   # 或环境变量
 
-# 3. 接入 Claude Code（绝对路径示例）：
+# 3. HTTP（Streamable HTTP，默认 127.0.0.1:7331）：
+npm run mcp:http
+
+# 4. 接入 Claude Desktop / Claude Code（绝对路径示例）：
 claude mcp add rag-kb -- npx tsx D:\js\.vscode\react-local-rag\scripts\mcp\server.ts --backup D:\backups\rag-backup-2026-10-03.json
 ```
 
-**工具**（3 个，输出 JSON 文本）：
+**工具**（输出 JSON 文本；旧名保留为兼容别名）：
 
-| 工具 | 作用 |
-| --- | --- |
-| `search_docs(query, top_k?, doc_name?)` | 混合检索；返回可引用原文、文档名、章节、页码、相关度 |
-| `doc_outline(doc_name?)` | 文档结构大纲（标题 / 页码 / 块数），无参列出全部文档 |
-| `read_chunks(doc_name, from_ord, to_ord)` | 按分块序号读原文（≤8 块 / 6000 字符），检索命中后展开细读 |
+| 工具 | 兼容别名 | 作用 |
+| --- | --- | --- |
+| `kb.list_docs(doc_name?)` | `doc_outline` | 当前身份可见的文档结构大纲（标题 / 页码 / 块数） |
+| `kb.search(query, top_k?, doc_name?)` | `search_docs` | 混合检索；返回可引用原文、文档名、章节、页码、相关度 |
+| `kb.get_chunk(doc_name, from_ord, to_ord)` | `read_chunks` | 按分块序号读原文（≤8 块 / 6000 字符） |
+| `kb.answer(question, top_k?, doc_name?)` | — | 抽取式回答 + citations；找不到依据时拒答而不是编造 |
+
+**权限（M5）**：`--acl acl.json` 提供 `tokens`（token → 身份）与 `documents`（文档 → 租户 /
+部门 / 密级）。过滤在 `searchKb` 打分**之前**完成，无权文档不会影响 IDF、候选数或错误信息；
+`strict=true` 时未列出的文档默认不可见。stdio 用 `--token`（或 `RAG_MCP_TOKEN`），HTTP 用
+`Authorization: Bearer <token>`；配置 ACL 后未知 token 一律 401，不会退回全量身份。
 
 **检索口径与降级**：走的**与线上同一条后处理管线**（`src/utils/retrieval` 的 RRF 融合 /
 邻近合并 / 门限）。备份里的向量是 base64 的 Float32（512 维、已归一，cosine = 点积），
@@ -810,5 +820,5 @@ claude mcp add rag-kb -- npx tsx D:\js\.vscode\react-local-rag\scripts\mcp\serve
 「请先导出备份」的可读错误；重新导出后下一次工具调用自动重载（按 mtime 判断）。
 
 **隐私说明**：服务本身零联网、只读本地文件；但工具返回的文档片段会进入你所配置的
-MCP 客户端（如 Claude Code）的上下文，是否上云由该客户端决定 —— 介意的话请搭配纯本地
-客户端使用。
+MCP 客户端（如 Claude Desktop / Cursor）的上下文，是否上云由该客户端决定 —— 介意的话请搭配
+纯本地客户端使用。完整离线交付见 [infra/airgap/](../../infra/airgap/README.md)。

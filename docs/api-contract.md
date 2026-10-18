@@ -70,7 +70,16 @@
   },
   "verify_thresholds": { "supported": 0.55, "weak": 0.38, "sem_weight": 0.75, "lex_weight": 0.25 },
   "index_version": "sha256:a1b2c3…",   // 索引版本（对应 Lite 模式 indexVersion 机制）
-  "created_at": "2026-10-12T08:00:00Z"
+  "created_at": "2026-10-12T08:00:00Z",
+  // Agent 路径专有（M5）：工具返回内容里的间接提示注入命中与处置
+  "injection_findings": [
+    {
+      "tool": "mcp:search_docs", "source": "mcp", "step": 2, "risk": "high",
+      "categories": ["instruction_override", "tool_invocation"],
+      "findings": [ { "category": "instruction_override", "excerpt": "…", "start": 42, "end": 88 } ],
+      "action": "redacted_before_model"
+    }
+  ]
 }
 ```
 
@@ -411,8 +420,9 @@ Agent 入口：planner + 工具循环（内置工具 + 可挂 MCP 工具）+ 无
   "verification": { … },
   "evidence_snapshot": {            // Agent 的证据面：检索片段 + 工具调用审计 + 无进展判定
     "passages": [ { "index": 1, "label": "…", "text": "…" } ],
-    "tool_calls": [ { "tool": "search_docs", "ok": true, "latency_ms": 12, "args_preview": "…", "source": "builtin", "digest": "…" } ],
-    "no_progress": { "reason": "重复调用同一个工具（参数相同）", "step": 3 }
+    "tool_calls": [ { "tool": "search_docs", "ok": true, "latency_ms": 12, "args_preview": "…", "source": "builtin", "digest": "…", "injection_risk": "none", "injection_count": 0 } ],
+    "no_progress": { "reason": "重复调用同一个工具（参数相同）", "step": 3 },
+    "injection_findings": []       // M5：工具输出里的间接提示注入命中（已脱敏后再给模型）
   },
   "tool_calls": [ … ],              // 与 evidence_snapshot.tool_calls 同源
   "no_progress": { … },
@@ -450,6 +460,63 @@ Agent 入口：planner + 工具循环（内置工具 + 可挂 MCP 工具）+ 无
 > **进程重启后仍可续跑**。
 
 ---
+
+## 8. GET /v1/skills（M5 增补）
+
+列出已加载的 Skills manifest。不会执行技能代码，也不返回服务器绝对路径；
+某个技能目录加载失败时放在 `errors[]`，不会静默消失。
+
+```jsonc
+{
+  "skills": [
+    {
+      "name": "text_stats",
+      "tool": "skill:text_stats",          // 在 Agent 工具清单里的名字
+      "description": "统计一段文本的字符数、非空行数与词数",
+      "version": "1.0.0",
+      "parameters": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
+      "permissions": [],                   // 支持 net / fs / process；默认全无
+      "timeout_s": 5,
+      "cost_estimate_usd": 0,
+      "requires_approval": false,
+      "directory": "text_stats",
+      "license": ""
+    }
+  ],
+  "errors": [ { "directory": "broken_skill", "error": "…" } ],
+  "sandbox": {
+    "isolation": "subprocess",
+    "python_flags": ["-I", "-S"],
+    "default_permissions": [],
+    "supported_permissions": ["net", "fs", "process"],
+    "note": "最小沙箱：超时/输出上限/导入拦截/临时工作目录；不是容器级安全边界"
+  }
+}
+```
+
+Skills 与内置/MCP 工具共用同一个 `ToolRegistry`：`source="skill"`、`requires_approval`
+与超时语义完全一致，工具输出同样经过间接提示注入防护。
+
+---
+
+## 9. MCP Server（M5，独立进程）
+
+不是 FastAPI 路由；`apps/web/scripts/mcp/server.ts` 通过 stdio 或 Streamable HTTP 暴露：
+
+| 工具 | 等价旧名 | 说明 |
+| --- | --- | --- |
+| `kb.list_docs` | `doc_outline` | 当前身份可见的文档与章节大纲 |
+| `kb.search` | `search_docs` | 检索片段（ACL 在召回层生效；有模型走 hybrid，否则 BM25） |
+| `kb.get_chunk` | `read_chunks` | 按 ord 区间读原文 |
+| `kb.answer` | — | 抽取式回答 + citations（`generation="extractive"`，不跑生成模型） |
+
+- stdio：`npm run mcp -- --backup <备份 JSON> --acl <ACL JSON> --token <token>`
+- HTTP：`npm run mcp:http` → `POST http://127.0.0.1:7331/mcp`，
+  `Authorization: Bearer <token>`；未配置 ACL 时为本机全量访问，配置后未知 token 一律 401。
+- ACL 文件格式见 `apps/web/scripts/mcp/knowledgeBase.ts` 的 `loadAcl` 注释；
+  过滤发生在 BM25/向量打分之前，无权文档不会影响分数、候选数或错误信息。
+- Python 客户端（`app/mcp/client.py`）每次 `tools/list` / `tools/call` / 拒绝 / 超时
+  都写一行 JSONL 审计（`DATA_DIR/mcp_audit.jsonl`），参数脱敏、结果只记指纹。
 
 ---
 

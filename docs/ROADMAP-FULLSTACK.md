@@ -306,15 +306,25 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 
 ## M5 · 对外能力面（约 3 周）[对外]
 
-- [ ] **MCP Server**（复用已有 `apps/web/scripts/mcp/`）：`kb.list_docs` / `kb.search` / `kb.get_chunk` / `kb.answer`，
+- [x] **MCP Server**（复用已有 `apps/web/scripts/mcp/`）：`kb.list_docs` / `kb.search` / `kb.get_chunk` / `kb.answer`，
       stdio + HTTP；**权限在检索层生效**
-- [ ] **MCP Client**：挂载外部工具，allowlist + 每个调用进审计日志
-- [ ] **Skills 注册表**：manifest（参数 schema / 权限 / 超时 / 成本预估）+ 最小沙箱
+- [x] **MCP Client**：挂载外部工具，allowlist + 每个调用进审计日志
+- [x] **Skills 注册表**：manifest（参数 schema / 权限 / 超时 / 成本预估）+ 最小沙箱
       —— 可借鉴 Agent 生态的 `SKILL.md` frontmatter 规范，迁移成本低
-- [ ] **工具调用安全**：间接提示注入防护（工具返回内容里的指令不得当作用户意图）← AI 特有难点，替代 v1 的"提权/越权测试"
-- [ ] air-gapped 部署包：本地模型 + 镜像离线包 + 一键 compose
+- [x] **工具调用安全**：间接提示注入防护（工具返回内容里的指令不得当作用户意图）← AI 特有难点，替代 v1 的"提权/越权测试"
+- [x] air-gapped 部署包：本地模型 + 镜像离线包 + 一键 compose
 
 **验收**：Claude Desktop/Cursor 能通过 MCP 查到知识库并拿到引用；离线环境可完整部署；注入用例全部被拦。
+
+**M5 落地记录（2026-10-17）**：
+
+| 项 | 实现 | 证据 |
+| --- | --- | --- |
+| MCP Server | stdio + Streamable HTTP；`kb.*` 规范名 + 旧名兼容；ACL 旁路文件（token → 身份 / 文档 → 租户·部门·密级），在 BM25/向量打分前过滤 | `apps/web/scripts/mcp/server.http.test.ts`（401/403、session、ACL 检索）、`knowledgeBase.test.ts`（隐藏文档与不存在同形） |
+| MCP Client | 手写 stdio JSON-RPC；allowlist 默认拒绝；JSONL 审计（参数脱敏、结果只记指纹、run_id 上下文） | `apps/api/tests/test_mcp_client.py`（含挂真实 TS server 的互操作用例） |
+| Skills | `SKILL.md` frontmatter（JSON Schema / 权限 / 超时 / 成本 / 审批）+ `-I -S` 子进程沙箱（网络/子进程/越界文件拦截、超时强杀、输出上限） | `apps/api/tests/test_skills.py`、`GET /v1/skills` |
+| 注入防护 | 中英文指令覆盖/角色劫持/工具诱导/外泄/分隔符伪造/编码载荷识别；脱敏后再进模型；planner 观察用 run 级 nonce 标签包裹；命中进 `injection_findings` | `apps/api/tests/test_injection.py`（原始指令不出现在 planner prompt） |
+| 离线包 | api/web/mcp/postgres 镜像 + 模型 + 评测资产；`internal` 网络；构建/安装/自检脚本 | `infra/airgap/`（本机无 Docker，脚本与 compose 只做静态校验） |
 
 ---
 
