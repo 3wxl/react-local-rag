@@ -29,7 +29,7 @@ from .graphs.ingest_graph import build_ingest_graph
 from .graphs.ingest_nodes import IngestDeps
 from .graphs.qa_graph import build_qa_graph
 from .graphs.qa_nodes import QaDeps
-from .mcp import McpStdioClient
+from .mcp import McpAuditLogger, McpStdioClient
 from .services.agent_service import AgentService, mount_mcp_tools
 from .services.answer_service import AnswerService
 from .services.ingest_service import IngestService
@@ -84,6 +84,10 @@ async def lifespan(app: FastAPI):
                 settings.mcp_server_command,
                 allowlist=settings.mcp_allowlist,
                 timeout_s=settings.mcp_timeout_s,
+                audit=McpAuditLogger(
+                    settings.mcp_audit_log_path,
+                    enabled=settings.mcp_audit_enabled,
+                ),
             )
             try:
                 await mcp_client.start()

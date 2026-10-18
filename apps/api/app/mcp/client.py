@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from .audit import McpAuditLogger, args_digest, args_preview
+
 #: 我们实现的协议版本（与 MCP 规范一致；服务端回什么以它为准）
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -52,11 +54,13 @@ class McpStdioClient:
         allowlist: Sequence[str] = (),
         timeout_s: float = 20.0,
         cwd: str | None = None,
+        audit: McpAuditLogger | None = None,
     ) -> None:
         self.command = command
         self.allowlist = tuple(allowlist)
         self.timeout_s = timeout_s
         self.cwd = cwd
+        self.audit = audit
         self._proc: asyncio.subprocess.Process | None = None
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -80,18 +84,32 @@ class McpStdioClient:
                 cwd=self.cwd,
             )
         except OSError as err:
+            if self.audit is not None:
+                await self.audit.record("mcp.start", ok=False, error=str(err))
             raise McpClientError(f"MCP 服务启动失败：{err}") from err
         self._reader_task = asyncio.create_task(self._read_loop())
 
-        result = await self._request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "react-local-rag-api", "version": "0.1.0"},
-            },
-        )
+        try:
+            result = await self._request(
+                "initialize",
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "react-local-rag-api", "version": "0.1.0"},
+                },
+            )
+        except Exception as err:
+            if self.audit is not None:
+                await self.audit.record("mcp.start", ok=False, error=str(err))
+            raise
         self.server_info = result.get("serverInfo", {}) or {}
+        if self.audit is not None:
+            self.audit.server_name = str(self.server_info.get("name") or self.audit.server_name)
+            await self.audit.record(
+                "mcp.start",
+                ok=True,
+                server_info=self.server_info,
+            )
         # 按规范回一条 initialized 通知（通知没有 id，不期待应答）
         self._notify("notifications/initialized", {})
 
@@ -127,33 +145,96 @@ class McpStdioClient:
         """列出工具（按 allowlist 过滤；空 allowlist = 全部允许）。"""
         result = await self._request("tools/list", {})
         tools = list(result.get("tools", []) or [])
-        if not self.allowlist:
-            return tools
-        return [t for t in tools if t.get("name") in self.allowlist]
+        visible = tools if not self.allowlist else [
+            t for t in tools if t.get("name") in self.allowlist
+        ]
+        if self.audit is not None:
+            await self.audit.record(
+                "mcp.tools/list",
+                ok=True,
+                discovered=[t.get("name") for t in tools],
+                allowlisted=[t.get("name") for t in visible],
+            )
+        return visible
 
     async def call_tool(self, name: str, arguments: dict | None = None) -> McpToolResult:
+        args = arguments or {}
+        digest = args_digest(name, args)
+        preview = args_preview(args)
         if self.allowlist and name not in self.allowlist:
+            if self.audit is not None:
+                await self.audit.record(
+                    "mcp.tools/call",
+                    tool=name,
+                    decision="deny",
+                    ok=False,
+                    args_digest=digest,
+                    args_preview=preview,
+                    error="not_in_allowlist",
+                )
             raise McpToolDenied(f"工具不在 allowlist 中，已拒绝：{name}")
         started = time.perf_counter()
         try:
             result = await self._request(
                 "tools/call",
-                {"name": name, "arguments": arguments or {}},
+                {"name": name, "arguments": args},
                 timeout=self.timeout_s,
             )
         except asyncio.TimeoutError:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if self.audit is not None:
+                await self.audit.record(
+                    "mcp.tools/call",
+                    tool=name,
+                    decision="allow",
+                    ok=False,
+                    latency_ms=latency_ms,
+                    args_digest=digest,
+                    args_preview=preview,
+                    error=f"timeout>{self.timeout_s}s",
+                )
             return McpToolResult(
                 ok=False,
                 text="",
-                latency_ms=int((time.perf_counter() - started) * 1000),
+                latency_ms=latency_ms,
                 error=f"MCP 工具调用超时（>{self.timeout_s}s）：{name}",
             )
+        except Exception as err:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if self.audit is not None:
+                await self.audit.record(
+                    "mcp.tools/call",
+                    tool=name,
+                    decision="allow",
+                    ok=False,
+                    latency_ms=latency_ms,
+                    args_digest=digest,
+                    args_preview=preview,
+                    error=f"{type(err).__name__}: {err}",
+                )
+            raise
         latency_ms = int((time.perf_counter() - started) * 1000)
+        text = _content_text(result)
+        ok = not bool(result.get("isError"))
+        if self.audit is not None:
+            # 只记结果的指纹与长度：正文可能含文档原文，不进审计日志
+            await self.audit.record(
+                "mcp.tools/call",
+                tool=name,
+                decision="allow",
+                ok=ok,
+                latency_ms=latency_ms,
+                args_digest=digest,
+                args_preview=preview,
+                result_chars=len(text),
+                result_digest=args_digest("result", {"text": text}) if text else None,
+                error=text[:200] if not ok else None,
+            )
         return McpToolResult(
-            ok=not bool(result.get("isError")),
-            text=_content_text(result),
+            ok=ok,
+            text=text,
             latency_ms=latency_ms,
-            error=_content_text(result) if result.get("isError") else None,
+            error=text if not ok else None,
             raw=result,
         )
 

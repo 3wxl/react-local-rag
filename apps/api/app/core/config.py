@@ -65,11 +65,32 @@ class Settings(BaseSettings):
     #: MCP 工具 allowlist（空 = 全部放行的前提是显式配置了服务；见 app/mcp/client.py）
     mcp_allowlist: list[str] = []
     mcp_timeout_s: float = 20.0
+    #: 每次 MCP 调用写审计日志（JSONL）：默认开；路径空 = DATA_DIR/mcp_audit.jsonl
+    mcp_audit_enabled: bool = True
+    mcp_audit_path: str = ""
+
+    # ---------------- Skills（M5） ----------------
+    #: 是否启用 Skills 注册表（内置技能在 app/skills/builtin，可追加外部目录）
+    skills_enabled: bool = True
+    #: 额外技能目录（每个子目录一个 SKILL.md）；内置目录总是被扫描
+    extra_skills_dirs: list[Path] = []
 
     @property
     def checkpoint_db_path(self) -> Path:
         """检查点库：与业务库分离的 SQLite 文件（单副本部署，见 docs/ROADMAP-FULLSTACK.md §5）。"""
         return Path(self.data_dir) / "graph_checkpoints.sqlite3"
+
+    @property
+    def mcp_audit_log_path(self) -> Path:
+        return Path(self.mcp_audit_path) if self.mcp_audit_path else Path(self.data_dir) / "mcp_audit.jsonl"
+
+    @property
+    def builtin_skills_dir(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "skills" / "builtin"
+
+    @property
+    def skill_dirs(self) -> list[Path]:
+        return [self.builtin_skills_dir, *self.extra_skills_dirs]
 
     @property
     def bge_model_dir(self) -> Path:
