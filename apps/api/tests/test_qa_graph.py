@@ -1,0 +1,348 @@
+"""QA 图（M3）：把直线流程换成图之后，轨迹与契约不变量必须原样成立。
+
+断言的重点不是"图能跑"，而是：
+1. **默认路径的轨迹与 M2 逐行一致**（retrieve → gate → generate → verify）；
+2. 拒答是两条一等分支（检索侧粗拒 / 答案侧细拒），不是异常路径；
+3. 四条契约不变量的图路径验证；
+4. State 保持 JSON 原生（检查点前提）且同题两次确定性一致。
+
+**为什么要自建 store 环境**：整条测试链共享一个 DATA_DIR，别的用例会软删文档、
+灌入合成语料，检索统计（IDF / 拒答门限）随之漂移 —— 依赖共享语料断言"这题不该拒答"
+会随文件顺序红绿闪烁（本文件第一版就踩了这个坑）。所以图行为用独立 tmp 目录 + 真实摄取，
+HTTP 只留"路由确实接到了图上"这类与语料状态无关的断言。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+from .parity_utils import EVAL_CORPUS_DIR
+
+CITATION_RE = re.compile(r"\[(\d+(?:\s*[,，]\s*\d+)*)\]")
+
+POSITIVE_Q = "智能网关标准版的售价是多少？"
+NEGATIVE_Q = "公司的股票代码是多少？"
+CORPUS_DOCS = ["产品手册.md", "员工手册.md", "会议纪要.md"]
+
+
+# 自建环境（独立数据目录 + 真实摄取）在 conftest.py 的 `qa_env` fixture 里，
+# 与 test_budget.py 共用。
+
+
+async def _answer(env, question: str, *, provider=None, rewrite: bool = False):
+    import dataclasses
+
+    from app.graphs.qa_graph import build_qa_graph
+    from app.services.answer_service import AnswerService
+    from app.store import Filters
+
+    deps = env.deps
+    if provider is not None:
+        deps = dataclasses.replace(deps, provider=provider)
+    graph = env.graph if provider is None else build_qa_graph(deps, None)
+    service = AnswerService(graph, settings=env.settings)
+    return await service.answer(
+        question,
+        version=env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=rewrite,
+    )
+
+
+async def test_success_path_trace_is_the_legacy_flow(qa_env) -> None:
+    """成功路径：轨迹仍是 retrieve → gate → generate → verify（无 rewrite 行）。"""
+    outcome = await _answer(qa_env, POSITIVE_Q)
+
+    assert outcome.verdict != "refused", outcome.refusal
+    assert [node["name"] for node in outcome.trace_nodes] == [
+        "retrieve",
+        "gate",
+        "generate",
+        "verify",
+    ]
+    assert [node["seq"] for node in outcome.trace_nodes] == [1, 2, 3, 4]
+    for node in outcome.trace_nodes:
+        assert set(node) == {
+            "seq",
+            "name",
+            "status",
+            "duration_ms",
+            "input_summary",
+            "output_summary",
+        }
+        assert node["status"] == "ok"
+
+    # 阶段耗时表来自图节点的自测耗时（键与 M2 相同）
+    assert set(outcome.cost["latency_breakdown_ms"]) == {"retrieve", "generate", "verify"}
+
+    # 不变量 1 / 3 在图路径下同样成立
+    indexes = {c.index for c in outcome.citations}
+    for match in CITATION_RE.finditer(outcome.answer):
+        for part in re.split(r"[,，]", match.group(1)):
+            assert int(part) in indexes
+    assert [p["index"] for p in outcome.evidence_snapshot["passages"]] == [
+        c.index for c in outcome.citations
+    ]
+
+
+async def test_retrieval_refusal_branch_skips_generation(qa_env) -> None:
+    """检索侧粗拒：gate 之后直接终止（没有 generate/verify 行）。"""
+    outcome = await _answer(qa_env, NEGATIVE_Q)
+
+    assert outcome.verdict == "refused"
+    assert outcome.citations == []
+    assert outcome.refusal is not None
+    assert outcome.refusal["reason"] == "no_relevant_hit"
+    assert [node["name"] for node in outcome.trace_nodes] == ["retrieve", "gate"]
+    assert "拒答" in outcome.trace_nodes[-1]["output_summary"]
+    assert outcome.cost["tokens"] == {"prompt": 0, "completion": 0, "total": 0}
+
+
+async def test_answer_side_refusal_is_first_class_branch(qa_env) -> None:
+    """答案侧细拒：检索有命中，但模型自己拒答 → adjudicate 行 + 可复盘 detail。"""
+    from app.generation.base import Completion
+
+    class _RefusingProvider:
+        name = "stub"
+        model = "stub-refusal"
+
+        def available(self) -> bool:
+            return True
+
+        def complete(self, prompt: str, *, max_new_tokens: int = 512) -> Completion:
+            return Completion(
+                text="文档中没有找到相关内容。",
+                prompt_tokens=12,
+                completion_tokens=9,
+                model=self.model,
+                provider=self.name,
+                sampling={"deterministic": True},
+            )
+
+    outcome = await _answer(qa_env, POSITIVE_Q, provider=_RefusingProvider())
+
+    assert outcome.verdict == "refused"
+    assert outcome.citations == []
+    assert outcome.refusal is not None
+    assert outcome.refusal["reason"] == "answer_unsupported"
+    # 拒答要能复盘到逐句证据（verdict 来自 verify 节点，不是"因为所以"）
+    assert outcome.refusal["verify_source"] in ("semantic", "lexical")
+    assert "uncited_claims" in outcome.refusal
+    assert [node["name"] for node in outcome.trace_nodes] == [
+        "retrieve",
+        "gate",
+        "generate",
+        "verify",
+        "adjudicate",
+    ]
+    assert [node["seq"] for node in outcome.trace_nodes] == [1, 2, 3, 4, 5]
+    # 拒答返回的校验结果是"拒答形态"（逐句明细在 refusal.detail）
+    assert outcome.verification["source"] == "lexical"
+
+
+async def test_rewrite_is_off_by_default(qa_env) -> None:
+    """默认不开改写：轨迹里没有 rewrite 行，快照里没有 rewrite 字段（逐字节保真）。"""
+    outcome = await _answer(qa_env, POSITIVE_Q)
+
+    assert "rewrite" not in [n["name"] for n in outcome.trace_nodes]
+    assert "rewrite" not in outcome.evidence_snapshot
+    assert "rewrite" not in outcome.cost["latency_breakdown_ms"]
+
+
+async def test_rewrite_enabled_adds_node_and_freezes_snapshot(qa_env) -> None:
+    """rewrite=true：图从 rewrite 节点进，快照冻结实际生效的改写词。"""
+    from app.generation.base import Completion
+    from app.generation.fake import FakeProvider
+    from app.store import Filters
+    from app.services.answer_service import AnswerService
+    from app.graphs.qa_graph import build_qa_graph
+    import dataclasses
+
+    fake = FakeProvider()
+
+    class _ExpandingProvider:
+        name = "stub"
+        model = "stub-expand"
+
+        def available(self) -> bool:
+            return True
+
+        def complete(self, prompt: str, *, max_new_tokens: int = 512) -> Completion:
+            # 改写 Prompt 没有【文档内容】段；问答 Prompt 有（桩模型按此分流）
+            if "【文档内容】" in prompt:
+                return fake.complete(prompt, max_new_tokens=max_new_tokens)
+            return Completion(
+                text="智能网关 标准版 售价\n网关 价格 参数",
+                prompt_tokens=40,
+                completion_tokens=12,
+                model=self.model,
+                provider=self.name,
+                sampling={"deterministic": True},
+            )
+
+    deps = dataclasses.replace(qa_env.deps, provider=_ExpandingProvider())
+    service = AnswerService(build_qa_graph(deps, None), settings=qa_env.settings)
+    outcome = await service.answer(
+        POSITIVE_Q,
+        version=qa_env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=True,
+    )
+
+    names = [n["name"] for n in outcome.trace_nodes]
+    assert names[0] == "rewrite", names
+    assert outcome.trace_nodes[0]["status"] == "ok"
+    assert set(outcome.cost["latency_breakdown_ms"]) == {
+        "rewrite",
+        "retrieve",
+        "generate",
+        "verify",
+    }
+    # 快照冻结"实际生效"的改写（而不是"请求了改写"）
+    rewrite_info = outcome.evidence_snapshot["rewrite"]
+    assert rewrite_info["enabled"] is True
+    assert rewrite_info["applied"] is True
+    assert rewrite_info["expansions"], rewrite_info
+
+
+async def test_rewrite_with_unavailable_model_marks_skipped(qa_env) -> None:
+    """模型不可用时改写降级：节点记 skipped，问答照常走原查询（增强项不挡主路径）。"""
+    import dataclasses
+
+    from app.generation.base import ModelUnavailableError
+    from app.generation.fake import FakeProvider
+    from app.graphs.qa_graph import build_qa_graph
+    from app.services.answer_service import AnswerService
+    from app.store import Filters
+
+    fake = FakeProvider()
+
+    class _NoModelProvider:
+        name = "stub"
+        model = "stub-no-model"
+
+        def available(self) -> bool:
+            return False
+
+        def complete(self, prompt: str, *, max_new_tokens: int = 512):
+            if "【文档内容】" in prompt:
+                return fake.complete(prompt, max_new_tokens=max_new_tokens)
+            raise ModelUnavailableError("模型未就绪（测试桩）")
+
+    deps = dataclasses.replace(qa_env.deps, provider=_NoModelProvider())
+    service = AnswerService(build_qa_graph(deps, None), settings=qa_env.settings)
+    outcome = await service.answer(
+        POSITIVE_Q,
+        version=qa_env.version,
+        top_k=3,
+        filters=Filters(tenant_id="default"),
+        rewrite=True,
+    )
+
+    row = outcome.trace_nodes[0]
+    assert row["name"] == "rewrite"
+    assert row["status"] == "skipped"
+    assert "模型不可用" in row["output_summary"]
+    assert outcome.evidence_snapshot["rewrite"] == {
+        "enabled": True,
+        "applied": False,
+        "expansions": [],
+    }
+    # 主路径不受影响：检索/生成照常
+    assert [n["name"] for n in outcome.trace_nodes][1:] == [
+        "retrieve",
+        "gate",
+        "generate",
+        "verify",
+    ]
+
+
+async def test_state_is_json_native_and_deterministic(qa_env) -> None:
+    """State 必须能被 JSON 序列化（检查点前提），且同题两次的裁决一致。"""
+    first = await _answer(qa_env, POSITIVE_Q)
+    second = await _answer(qa_env, POSITIVE_Q)
+
+    assert [n["name"] for n in first.trace_nodes] == [n["name"] for n in second.trace_nodes]
+    assert first.verdict == second.verdict
+    assert [s["level"] for s in first.verification["sentences"]] == [
+        s["level"] for s in second.verification["sentences"]
+    ]
+    assert first.answer_id != second.answer_id
+
+    # 用带检查点的图再跑一次：检查点里的 State 必须能原样 JSON dump（能 dump 就能落库/读回）
+    from app.graphs.qa_graph import build_qa_graph
+    from app.services.answer_service import AnswerService
+    from app.store import Filters
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    checkpointer = InMemorySaver()
+    service = AnswerService(
+        build_qa_graph(qa_env.deps, checkpointer), settings=qa_env.settings
+    )
+    outcome = await service.answer(
+        POSITIVE_Q, version=qa_env.version, top_k=3, filters=Filters(tenant_id="default")
+    )
+    snapshot = await service.graph.aget_state(
+        {"configurable": {"thread_id": outcome.trace_id}}
+    )
+    json.dumps(snapshot.values)  # 不抛异常即为通过
+    assert snapshot.values["verdict"] == outcome.verdict
+    assert snapshot.values["outcome"]["answer_id"] == outcome.answer_id
+
+
+# ---------------- HTTP 层：路由确实接到了图上 ----------------
+
+
+def _ingest(client: TestClient, names: list[str]) -> None:
+    """走 HTTP 摄取并等到终态（202 + 轮询，与前端同一套流程）。"""
+    for name in names:
+        with (EVAL_CORPUS_DIR / name).open("rb") as fh:
+            response = client.post(
+                "/v1/documents", files={"file": (name, fh, "text/markdown")}
+            )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["task_id"]
+        for _ in range(200):
+            task = client.get(f"/v1/tasks/{task_id}").json()
+            if task["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.2)
+        assert task["status"] == "succeeded", task
+
+
+@pytest.fixture(scope="module")
+def client() -> TestClient:
+    from app.main import app
+
+    with TestClient(app) as test_client:
+        _ingest(test_client, CORPUS_DOCS)
+        yield test_client
+
+
+def test_http_answer_serves_graph_trace(client: TestClient) -> None:
+    """HTTP 层拿到的 nodes[] 来自图：前两步固定为 retrieve/gate，seq 连续。
+
+    这里刻意不断言"这题该不该拒答"：共享 DATA_DIR 下语料会被其它用例增删，
+    拒答与否随语料漂移（图行为本身由上面自建环境的用例钉住）。
+    """
+    body = client.post("/v1/answer", json={"question": POSITIVE_Q}).json()
+    trace = client.get(f"/v1/answer/{body['answer_id']}/trace").json()
+
+    names = [node["name"] for node in trace["nodes"]]
+    assert names[:2] == ["retrieve", "gate"]
+    assert set(names) <= {"retrieve", "gate", "generate", "verify", "adjudicate"}
+    assert [node["seq"] for node in trace["nodes"]] == list(range(1, len(names) + 1))
+    assert trace["final_verdict"] == body["verdict"]
+    # 拒答 ⟺ 空引用 + refusal 非空（不变量 2 的 HTTP 断言）
+    if body["verdict"] == "refused":
+        assert body["citations"] == [] and body["refusal"] is not None
+    else:
+        assert body["citations"] and body["refusal"] is None

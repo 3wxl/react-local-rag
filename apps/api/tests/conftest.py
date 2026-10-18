@@ -16,10 +16,66 @@ import tempfile
 # 必须在 import app.* 之前：测试只允许写临时目录，且默认用假生成模型（不下载权重）
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="rag-api-test-"))
 os.environ.setdefault("LLM_PROVIDER", "fake")
+# 检查点默认走内存：大多数测试不关心落盘；持久化本身由 test_checkpoint.py 用临时 SQLite 单独证明
+os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 
 import pytest
 
-from .parity_utils import CHUNKER_SPEC_DIR, EVAL_DIR, load_json
+from .parity_utils import CHUNKER_SPEC_DIR, EVAL_CORPUS_DIR, EVAL_DIR, load_json
+
+
+@pytest.fixture
+async def qa_env(tmp_path):
+    """自建的 QA 图运行环境（独立数据目录 + 真实摄取 + 假生成模型）。
+
+    为什么不用共享的 DATA_DIR：那条链上别的用例会软删文档、灌合成语料，
+    检索统计（IDF / 拒答门限）随之漂移 —— 依赖共享语料的裁决断言会随文件顺序红绿闪烁。
+    另外 embedder 用**新实例**而不是 get_embedder 单例：单例会被别的用例改 `enabled`。
+    """
+    from app.core.config import Settings
+    from app.embedding.bge import BgeOnnxEmbedder
+    from app.generation.fake import FakeProvider
+    from app.graphs.qa_graph import build_qa_graph
+    from app.graphs.qa_nodes import QaDeps
+    from app.services.ingest_service import IngestService
+    from app.services.retrieval_service import RetrievalService
+    from app.store import make_store
+
+    settings = Settings(data_dir=tmp_path)
+    store = make_store("", tmp_path)
+    await store.init()
+    # 权重缺失时 available=False，检索自动退化为 BM25-only（CI 环境就是这样）
+    embedder = BgeOnnxEmbedder(settings.bge_model_dir)
+    provider = FakeProvider()
+    retrieval = RetrievalService(store, embedder)
+    ingest = IngestService(
+        store,
+        embedder,
+        data_dir=tmp_path,
+        on_index_changed=lambda version=None: retrieval.invalidate(version),
+    )
+    for name in ("产品手册.md", "员工手册.md", "会议纪要.md"):
+        await ingest.ingest_path(EVAL_CORPUS_DIR / name, doc_name=name)
+
+    deps = QaDeps(
+        store=store,
+        retrieval=retrieval,
+        embedder=embedder,
+        provider=provider,
+        settings=settings,
+    )
+    from types import SimpleNamespace
+
+    try:
+        yield SimpleNamespace(
+            settings=settings,
+            store=store,
+            deps=deps,
+            graph=build_qa_graph(deps, None),
+            version=(await store.list_ready_versions())[0].version,
+        )
+    finally:
+        await store.close()
 
 
 @pytest.fixture(scope="session")

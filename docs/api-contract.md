@@ -3,7 +3,7 @@
 > M0 交付物。定义 `apps/api` 对外的四个核心接口。实现（M1+）必须以此为据；
 > 契约变更走 PR，并在本文档头部记录版本与日期。
 
-- **版本**：v1（草案，2026-10-12）
+- **版本**：v1（草案，2026-10-12；2026-10-16 M3 增补：`rewrite`、SSE 流式、`budget_exceeded` 明细、`/v1/agent/*`）
 - **Base URL**：`/v1`
 - **命名约定**：JSON 字段一律 snake_case（Python 端原生；前端 TS 在边界层做 camelCase 映射）
 - **语义对齐**：所有字段的语义与浏览器 Lite 模式的既有实现一致——
@@ -70,7 +70,16 @@
   },
   "verify_thresholds": { "supported": 0.55, "weak": 0.38, "sem_weight": 0.75, "lex_weight": 0.25 },
   "index_version": "sha256:a1b2c3…",   // 索引版本（对应 Lite 模式 indexVersion 机制）
-  "created_at": "2026-10-12T08:00:00Z"
+  "created_at": "2026-10-12T08:00:00Z",
+  // Agent 路径专有（M5）：工具返回内容里的间接提示注入命中与处置
+  "injection_findings": [
+    {
+      "tool": "mcp:search_docs", "source": "mcp", "step": 2, "risk": "high",
+      "categories": ["instruction_override", "tool_invocation"],
+      "findings": [ { "category": "instruction_override", "excerpt": "…", "start": 42, "end": 88 } ],
+      "action": "redacted_before_model"
+    }
+  ]
 }
 ```
 
@@ -88,6 +97,10 @@
 }
 ```
 
+> M3 起 `estimated_cost_usd` 由**服务端价目**计算（`COST_PER_1K_PROMPT_USD / COST_PER_1K_COMPLETION_USD`，
+> 默认 0 → 本地通道恒为 0.0，与 M2 逐字段一致）；`latency_breakdown_ms` 的键来自图节点自测耗时
+> （改写开启时多一个 `rewrite`，Agent 路径为 `plan / act / synthesize / verify`）。
+
 ### 0.5 错误体
 
 非 2xx 一律返回：
@@ -102,9 +115,26 @@
 | 401 | `unauthorized` | 无 token / 过期 |
 | 403 | `forbidden` | RBAC/ACL 拒绝（注意：检索层过滤导致的"查不到"返回正常空结果，不是 403） |
 | 404 | `not_found` | 资源不存在（如 trace_id） |
-| 422 | `budget_exceeded` | 超出 token/成本预算被拒（M3） |
+| 422 | `budget_exceeded` | 超出 token/成本预算被拒（M3，形如下） |
 | 429 | `rate_limited` | 配额限流（M2） |
 | 503 | `index_not_ready` / `model_unavailable` | 依赖未就绪 |
+
+`budget_exceeded` 的 `detail`（说明超的是哪一道上限、是估算还是真实用量）：
+
+```jsonc
+{ "error": { "code": "budget_exceeded",
+  "message": "超出单请求 token 预算：预计 tokens=6200 > 上限 4096（可调低 top_k，或调大 REQUEST_TOKEN_BUDGET）",
+  "detail": { "budget": {
+    "limit": { "tokens": 4096, "steps": 12, "cost_usd": 0.5 },
+    "used":  { "tokens": 6200, "steps": 0, "cost_usd": 0.0 },
+    "exceeded": "tokens",          // tokens | steps | cost_usd
+    "estimated": true,             // true = 预检估算；false = 真实记账
+    "stage": "preflight"           // preflight | rewrite | generate | plan | synthesize
+  } } } }
+```
+
+> 预检发生在**进图之前**（连一次模型都不调）；运行中记账发生在每次模型调用之后。
+> `stream=true` 时：预检失败仍是真 HTTP 422；流已开始后的超预算走**带内** `error` 事件（见 §2）。
 
 ---
 
@@ -162,9 +192,27 @@
   "conversation_id": "conv_…",              // 可选，多轮改写用
   "top_k": 5,                               // 可选
   "filters": { "doc_ids": [], "tags": [] }, // 可选
-  "stream": false                           // M3 支持 SSE 流式；契约字段不变
+  "stream": false,                          // true = SSE 流式（见下）
+  "rewrite": false                          // true = 先做查询改写（口语化提问 → 术语检索词）
 }
 ```
+
+**流式（`stream=true`，M3）**：`Content-Type: text/event-stream`，事件如下（`[DONE]` 收尾）：
+
+| event | data | 说明 |
+|---|---|---|
+| `node` | 与 §3 的 trace 行同形（`seq/name/status/duration_ms/input_summary/output_summary`） | 每个图节点完成时发一条 |
+| `token` | `{"delta": "…"}` | 仅当生成通道支持流式（Ollama / fake；ONNX 通道不发）。**原始文本**：客户端以 `final.answer` 为准 |
+| `final` | 与 `stream=false` 的 200 响应体**逐字段相同** | 结束前发一条 |
+| `error` | `{"error": {code, message, detail}}` | 流开始后的错误（含 `budget_exceeded`）；随后 `[DONE]`。HTTP 仍是 200 |
+
+> 帧格式与前端既有解析器（`streamCloudAnswer`）同构：`event:` + 单行 `data:` + `data: [DONE]`。
+> **错误语义分层**：校验失败 / 索引未就绪 / 预检预算超限 → 真 HTTP 状态码（流还没开始）；
+> 流开始之后的任何失败 → 带内 `error` 事件（HTTP 头已经发出去了）。
+
+> `rewrite=true` 时 trace 以 `rewrite` 节点开头（模型不可用/没产出可用改写时该行 `status:"skipped"`），
+> `evidence_snapshot.rewrite` 冻结实际生效情况（`{"enabled","applied","expansions"}`）。
+> 默认 `false`：线上默认配置 = 评测默认配置，且与浏览器 Lite 模式的普通 RAG 分支同口径。
 
 **响应 200**
 
@@ -221,7 +269,7 @@ M4 轨迹回放 CLI、M6 trace_id 成本归因。
   "nodes": [                            // 按执行顺序；M3 起即 LangGraph 节点轨迹
     {
       "seq": 1,
-      "name": "rewrite",                // rewrite / retrieve / rerank / gate / generate / verify
+      "name": "rewrite",                // 图节点名（见下表）
       "status": "ok",                   // ok / skipped / failed
       "started_at": "…", "duration_ms": 120,
       "input_summary": "停机保养前需要做什么",
@@ -244,6 +292,14 @@ M4 轨迹回放 CLI、M6 trace_id 成本归因。
 
 > 设计原则：**不调模型即可复现决策路径**（M4-H4 的验收前提）。
 > nodes 里只放摘要，重证据统一落在 `evidence_snapshot`，避免 trace 体积失控。
+
+M3 起的图节点名（默认路径与 M2 的直线流程逐行一致，改写节点只在 `rewrite=true` 时出现）：
+
+| 图 | 节点名 |
+|---|---|
+| QA（`/v1/answer`） | `rewrite`（可选）→ `retrieve` → `gate` → `generate` → `verify` → `adjudicate`（仅答案侧拒答时出现） |
+| Ingestion（`/v1/documents`、`/v1/index/rebuild`） | `ingest_doc`（每篇文档一行，摘要含 chunks/reused/embedded/deduped）→ `selfcheck` |
+| Agentic（`/v1/agent/run`） | `plan` → `act` → `reflect`（循环）→ `synthesize` → `verify` |
 
 ---
 
@@ -333,6 +389,137 @@ M4 轨迹回放 CLI、M6 trace_id 成本归因。
 
 ---
 
+## 7. Agent 接口（M3 增补）
+
+Agent 入口：planner + 工具循环（内置工具 + 可挂 MCP 工具）+ 无进展检测 + HITL 审批。
+状态复用 `tasks` 表（`kind="agent"`）：`queued → running → interrupted → running → succeeded|failed`。
+
+**请求**
+
+```jsonc
+{
+  "question": "把三条产线的停机时间汇总一下",
+  "top_k": 5,                       // 可选
+  "filters": { "doc_ids": [], "tags": [] },  // 可选（ACL 与 /v1/answer 同一条召回路径）
+  "stream": false                   // true = SSE（事件表见 §2，另有 interrupt 事件）
+}
+```
+
+**响应 200（完成）**
+
+```jsonc
+{
+  "run_id": "run_4f2b…",            // 同时是 trace_id（GET …/trace 用它回放）
+  "trace_id": "run_4f2b…",
+  "status": "succeeded",
+  "question": "…",
+  "answer": "…",                    // 与 /v1/answer 同口径（逐句角标 + 引用卡片）
+  "verdict": "supported",
+  "citations": [ Citation, … ],
+  "refusal": null,                  // 无证据时：{"reason":"no_evidence", …}
+  "verification": { … },
+  "evidence_snapshot": {            // Agent 的证据面：检索片段 + 工具调用审计 + 无进展判定
+    "passages": [ { "index": 1, "label": "…", "text": "…" } ],
+    "tool_calls": [ { "tool": "search_docs", "ok": true, "latency_ms": 12, "args_preview": "…", "source": "builtin", "digest": "…", "injection_risk": "none", "injection_count": 0 } ],
+    "no_progress": { "reason": "重复调用同一个工具（参数相同）", "step": 3 },
+    "injection_findings": []       // M5：工具输出里的间接提示注入命中（已脱敏后再给模型）
+  },
+  "tool_calls": [ … ],              // 与 evidence_snapshot.tool_calls 同源
+  "no_progress": { … },
+  "steps": 3,
+  "cost": { … },                    // 0.4（plan/act/synthesize/verify 阶段耗时）
+  "trace_nodes": [ … ]              // 与 GET …/trace 的 nodes 相同（前端直接画步骤链）
+}
+```
+
+**响应 200（挂起等人工审批）**
+
+```jsonc
+{
+  "run_id": "run_4f2b…",
+  "status": "interrupted",
+  "pending_approval": {
+    "kind": "tool_approval",
+    "call_id": "9f2a1c…",           // 调用指纹（工具名 + 规范化参数）
+    "tool": "mcp:write_note",
+    "args_preview": "{\"text\":\"记一下\"}",
+    "reason": "写外部系统"
+  },
+  "steps": 1, "tool_calls": [ … ], "trace_nodes": [ … ]
+}
+```
+
+- `GET /v1/agent/{run_id}` → `{run_id, status, progress, pending_approval, error, updated_at}`
+- `POST /v1/agent/{run_id}/resume`（body `{approved: bool, note?: str, stream?: bool}`）→ 202；
+  `stream=true` 时以 SSE 继续同一条流（事件协议与 `/v1/agent/run` 相同）。
+  非 `interrupted` 状态的 run 调用它 → 400 `invalid_request`。
+- `GET /v1/agent/{run_id}/trace` → 与 §3 同形（`nodes / final_verdict / cost / evidence_snapshot`，自包含回放）
+
+> HITL 的语义：需要审批的工具（MCP 工具默认需要）在**执行前**挂起；批准才执行，驳回则把
+> "被人工驳回"作为观察反馈给 planner，让它换路。挂起状态在检查点库里（`CHECKPOINT_BACKEND=sqlite`），
+> **进程重启后仍可续跑**。
+
+---
+
+## 8. GET /v1/skills（M5 增补）
+
+列出已加载的 Skills manifest。不会执行技能代码，也不返回服务器绝对路径；
+某个技能目录加载失败时放在 `errors[]`，不会静默消失。
+
+```jsonc
+{
+  "skills": [
+    {
+      "name": "text_stats",
+      "tool": "skill:text_stats",          // 在 Agent 工具清单里的名字
+      "description": "统计一段文本的字符数、非空行数与词数",
+      "version": "1.0.0",
+      "parameters": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
+      "permissions": [],                   // 支持 net / fs / process；默认全无
+      "timeout_s": 5,
+      "cost_estimate_usd": 0,
+      "requires_approval": false,
+      "directory": "text_stats",
+      "license": ""
+    }
+  ],
+  "errors": [ { "directory": "broken_skill", "error": "…" } ],
+  "sandbox": {
+    "isolation": "subprocess",
+    "python_flags": ["-I", "-S"],
+    "default_permissions": [],
+    "supported_permissions": ["net", "fs", "process"],
+    "note": "最小沙箱：超时/输出上限/导入拦截/临时工作目录；不是容器级安全边界"
+  }
+}
+```
+
+Skills 与内置/MCP 工具共用同一个 `ToolRegistry`：`source="skill"`、`requires_approval`
+与超时语义完全一致，工具输出同样经过间接提示注入防护。
+
+---
+
+## 9. MCP Server（M5，独立进程）
+
+不是 FastAPI 路由；`apps/web/scripts/mcp/server.ts` 通过 stdio 或 Streamable HTTP 暴露：
+
+| 工具 | 等价旧名 | 说明 |
+| --- | --- | --- |
+| `kb.list_docs` | `doc_outline` | 当前身份可见的文档与章节大纲 |
+| `kb.search` | `search_docs` | 检索片段（ACL 在召回层生效；有模型走 hybrid，否则 BM25） |
+| `kb.get_chunk` | `read_chunks` | 按 ord 区间读原文 |
+| `kb.answer` | — | 抽取式回答 + citations（`generation="extractive"`，不跑生成模型） |
+
+- stdio：`npm run mcp -- --backup <备份 JSON> --acl <ACL JSON> --token <token>`
+- HTTP：`npm run mcp:http` → `POST http://127.0.0.1:7331/mcp`，
+  `Authorization: Bearer <token>`；未配置 ACL 时为本机全量访问，配置后未知 token 一律 401。
+- ACL 文件格式见 `apps/web/scripts/mcp/knowledgeBase.ts` 的 `loadAcl` 注释；
+  过滤发生在 BM25/向量打分之前，无权文档不会影响分数、候选数或错误信息。
+- Python 客户端（`app/mcp/client.py`）每次 `tools/list` / `tools/call` / 拒绝 / 超时
+  都写一行 JSONL 审计（`DATA_DIR/mcp_audit.jsonl`），参数脱敏、结果只记指纹。
+
+---
+
 ## 附：Lite 模式 ↔ API 字段映射速查
 
 | API（snake_case） | Lite 模式（TS） | 来源文件 |
@@ -345,4 +532,6 @@ M4 轨迹回放 CLI、M6 trace_id 成本归因。
 | `no_relevant_hit` | `ThresholdResult.noRelevantHit` | 同上 |
 | `refusal_signals` | `RefusalSignals` | 同上 |
 | `trace.nodes[]` | `AgentStep[]`（近似） | `src/agent/types.ts` |
+| `tool_calls[]` | `ToolAgentResult.steps`（近似） | 同上 |
+| `pending_approval` | 无对应（Lite 模式没有 HITL） | — |
 | `metrics.recall_at_3` 等 | `latest.json.metrics.*` | `scripts/eval.ts` |

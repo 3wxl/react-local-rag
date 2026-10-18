@@ -1,0 +1,14 @@
+# 构建上下文瘦身：模型权重与依赖目录不进镜像层（运行时以只读卷挂载）
+.git
+.github
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/dist
+**/coverage
+**/*.log
+apps/web/public/models
+apps/api/.data
+apps/api/.tmp_server.log
+infra/airgap/dist

@@ -1,0 +1,116 @@
+# Air-gapped 一键部署（api + web + postgres[pgvector]，可选 mcp）
+#
+# 前置：docker load -i images.tar；模型权重解压到 ./models；评测资产解压到 ./eval。
+# 启动：docker compose -f compose.yaml up -d
+#
+# 内网约束：所有服务只挂在一个 internal 网络上 —— 容器没有默认网关，
+# 无法访问公网（验证脚本会尝试 DNS，预期失败）。宿主机通过 127.0.0.1 发布端口访问。
+name: rag-airgap
+
+services:
+  postgres:
+    image: ${RAG_POSTGRES_IMAGE:-pgvector/pgvector:pg16}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+    volumes:
+      - ${PGDATA_DIR:-./pgdata}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [airgap]
+
+  api:
+    image: ${RAG_API_IMAGE:-rag-api}:${RAG_TAG:-airgap}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-rag}@postgres:5432/${POSTGRES_DB:-rag}
+      DATA_DIR: /data
+      MODELS_DIR: /models
+      EVAL_DIR: /eval
+      LLM_PROVIDER: onnx
+      CHECKPOINT_BACKEND: sqlite
+      REQUEST_TOKEN_BUDGET: "4096"
+      REQUEST_COST_LIMIT_USD: "0.5"
+      GRAPH_MAX_STEPS: "12"
+      SKILLS_ENABLED: "true"
+      # 外部 MCP 工具（stdio）需要一个可执行命令；离线镜像里没有 Node，
+      # 故 API 侧默认不挂载。MCP 的 server 面由下面的 mcp 服务提供。
+      MCP_SERVER_COMMAND: ""
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+      - ${EVAL_DIR:-./eval}:/eval:ro
+      - ${DATA_DIR:-./data}:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [airgap]
+
+  web:
+    image: ${RAG_WEB_IMAGE:-rag-web}:${RAG_TAG:-airgap}
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RAG_PORT:-8080}:80"
+    volumes:
+      # 模型权重运行时挂载（构建时不进镜像）
+      - ${MODELS_DIR:-./models}:/usr/share/nginx/html/models:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [airgap]
+
+  # MCP Server（可选）：`docker compose --profile mcp up -d`
+  # 只读 /data/rag-backup.json，ACL 由 /data/mcp-acl.json 提供（token → 身份）。
+  mcp:
+    profiles: ["mcp"]
+    image: ${RAG_MCP_IMAGE:-rag-mcp}:${RAG_TAG:-airgap}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      RAG_BACKUP_PATH: /data/rag-backup.json
+      RAG_MCP_ACL_PATH: /data/mcp-acl.json
+      RAG_MCP_HTTP_PORT: "7331"
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${MODELS_DIR:-./models}:/app/public/models:ro
+    ports:
+      - "127.0.0.1:${RAG_MCP_PORT:-7331}:7331"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7331/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [airgap]
+
+networks:
+  airgap:
+    internal: true

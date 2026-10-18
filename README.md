@@ -2,7 +2,8 @@
 
 浏览器端**离线** RAG 知识库问答系统，以及围绕它演进的平台化路线。
 
-> 定位：面向「数据不能出域、答案必须可追溯」的场景。已落地**浏览器本地模式**（零安装、数据不出浏览器、完全离线可用）与**服务器模式**（自托管服务端，多人共享索引、可审计）；两端跑**同一套评测口径**，差异有实测数字（见 [docs/dual-mode-comparison.md](docs/dual-mode-comparison.md)）。多租户 / Agent 编排仍在路线图中。
+> 定位：面向「数据不能出域、答案必须可追溯」的场景。已落地**浏览器本地模式**（零安装、数据不出浏览器、完全离线可用）与**服务器模式**（自托管服务端，多人共享索引、可审计）；两端跑**同一套评测口径**，差异有实测数字（见 [docs/dual-mode-comparison.md](docs/dual-mode-comparison.md)）。**服务端 M3 起为图编排**（LangGraph 三张图：问答 / 摄取 / Agent），支持 SSE 流式、轨迹回放、
+HITL 人工审批与单请求成本预算（`docs/api-contract.md` §2/§7）。多租户仍在路线图中。
 
 ## 主场景与边界
 
@@ -87,4 +88,4 @@ uv run uvicorn app.main:app --port 8000                            # 单进程
 
 ## 路线图
 
-见 [docs/ROADMAP-FULLSTACK.md](docs/ROADMAP-FULLSTACK.md)。最小可讲路线：M0（契约与骨架）→ M1（最小可用全栈）→ M4 部分（Harness 强化）→ M3（LangGraph Agent 化）→ M5（MCP + Skills + 离线部署）。
+见 [docs/ROADMAP-FULLSTACK.md](docs/ROADMAP-FULLSTACK.md)。已完成：M0（契约与骨架）→ M1（最小可用全栈）→ M2（可靠性与弱模型工程）→ M3（LangGraph Agent 化：三张图 + 轨迹/检查点 + 流式 + 预算 + HITL）→ M5（对外能力面：MCP Server/Client + Skills 沙箱 + 注入防护 + air-gapped 部署包）。M4（Harness 强化）待做。

@@ -7,6 +7,10 @@ interface MessageListProps {
   busy: boolean;
   loadProgress: number;
   onDropFile: (file: File) => void;
+  /** HITL 审批（M3）：批准/驳回服务端 Agent 挂起的工具调用 */
+  onHitlDecision?: (messageId: string, approved: boolean) => void;
+  /** 轨迹回放（M3）：拉取服务端完整节点轨迹并渲染步骤链 */
+  onLoadTrace?: (messageId: string) => void;
 }
 
 /** 距底部多少像素内视为「在底部」，低于此阈值才自动滚 */
@@ -18,6 +22,8 @@ export function MessageList({
   busy,
   loadProgress,
   onDropFile,
+  onHitlDecision,
+  onLoadTrace,
 }: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -74,6 +80,8 @@ export function MessageList({
             message={m}
             busy={busy}
             loadProgress={m.id === lastId ? loadProgress : 0}
+            onHitlDecision={onHitlDecision}
+            onLoadTrace={onLoadTrace}
           />
         ))}
         <div ref={endRef} />

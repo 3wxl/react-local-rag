@@ -234,11 +234,17 @@ def find_unknown_numbers(
     context_text: str,
     context_numbers: set[str] | None = None,
 ) -> list[str]:
-    """找出句子中「原文里查无出处」的数字（数字捏造信号）。"""
+    """找出句子中「原文里查无出处」的数字（数字捏造信号）。
+
+    引用角标不是数字事实：先剥掉 [1]/[1,2] 再抽取。否则角标编号会被当成
+    「捏造的数字」（语料里未必有孤立的"1"），无向量环境（纯词法）下
+    fabricated_number 封顶必生效 → 带引用的正确答案被误拒（CI 必现）。
+    """
     nums = context_numbers if context_numbers is not None else set(extract_numbers(context_text))
+    facts = extract_numbers(_CITATION_RE.sub("", sentence))
     return [
         n
-        for n in extract_numbers(sentence)
+        for n in facts
         if n not in nums and not context_contains_number(number_core(n), context_text)
     ]
 

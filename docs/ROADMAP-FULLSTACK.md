@@ -124,7 +124,7 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 | M0 | 冻结与契约 | 1 周 | monorepo + API 契约 + 评测资产迁移 | 可验 |
 | M1 | 双端同口径最小闭环 | 3 周 | 跨语言一致性 + **双端对比报告** | 可验 / 对外 |
 | M2 | 可靠性与弱模型工程 | 3 周 | 拒答 ≥0.6、口语化 ≥0.5、ACL 召回过滤 | **可靠** |
-| M3 | Agent 化（LangGraph） | 3 周 | 三张图 + 轨迹落库 + 成本预算 | 可靠 / 约束 |
+| M3 | Agent 化（LangGraph）（2026-10-16 完成） | 3 周 | 三张图 + 轨迹落库 + 成本预算 | 可靠 / 约束 |
 | M4 | Harness 强化 | 3 周 | 轨迹回放 + 故障注入 + 影子评测 + 标注台 | **可验** |
 | M5 | 对外能力面 | 3 周 | MCP Server/Client + Skills + 离线包 + 注入防护 | 对外 |
 | M6 | 可观测（精简） | 1 周 | OTel trace + 成本/延迟归因 | 可验 |
@@ -229,15 +229,64 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 
 ---
 
-## M3 · Agent 化与 LangGraph（约 3 周）[可靠 / 约束]
+## M3 · Agent 化与 LangGraph（约 3 周）[可靠 / 约束]（2026-10-16 落地）
 
-- [ ] **Ingestion Graph**：断点续跑、单文档失败隔离（用图编排替代队列框架）
-- [ ] **QA Graph**：改写 → 检索 → 相关性判级 → 生成 → 引用校验 → 拒答
-- [ ] **Agentic Graph**：planner + 工具调用（含 MCP 工具）+ 无进展检测 + HITL `interrupt`
-- [ ] checkpoint 持久化 + 轨迹落库 + 流式输出到前端
-- [ ] 成本控制：步数上限、token 预算、单请求成本上限（超限拒绝并给出原因）
+- [x] **Ingestion Graph**（2026-10-16）：`app/graphs/ingest_graph.py` —
+      链：scan → process_doc（逐文档循环）→ activate → selfcheck。
+      断点续跑 = `tasks.checkpoint["done"]` 播种 + 图自己的检查点（`thread_id = task_id`）；
+      失败隔离是节点级语义：单文档异常只进 `failed[]`，整批继续，任务仍 succeeded。
+      刻意**不用 Send 扇出**：现状顺序处理且瓶颈在 CPU 向量化，`done` 必须保持确定性顺序
+      才能与 M2 的 checkpoint 格式继续兼容（扇出留作后续演进）。
+- [x] **QA Graph**（2026-10-16）：`app/graphs/qa_graph.py` — 条件入口（rewrite）→ retrieve → gate
+      →（粗拒分支）→ generate → verify →（细拒分支：adjudicate）→ finalize。
+      判级与拒答升级为一等分支（不再藏在直线流程的 if 里）；节点只调用既有 parity/services 实现。
+      **默认响应体与轨迹逐字段不变**（`tests/test_api_contract.py` 未改动即全绿）——
+      这是"重构成图而不是换一套口径"的证明。
+- [x] **Agentic Graph**（2026-10-16）：`app/graphs/agent_graph.py` — plan ⇄（act → reflect）
+      → synthesize → verify → finalize。内置工具 search_docs/doc_outline/read_chunks/calculator
+      + MCP stdio 客户端（手写 JSON-RPC，零新依赖，可挂仓库自带的 TS MCP server）。
+      **无进展检测**三条判据：重复调用（调用指纹相同）/ 观察重复 / 连续两次工具失败 →
+      提前收敛并把原因写进轨迹（喂 M4 的"无进展率"指标）。
+      **HITL `interrupt`**：需审批的工具（MCP 默认需要）执行前挂起，`POST /v1/agent/{id}/resume`
+      批准/驳回后从检查点续跑；驳回会把"被人工拒绝"回灌给 planner 换路。
+- [x] checkpoint 持久化 + 轨迹落库 + 流式输出（2026-10-16）：官方 `AsyncSqliteSaver`
+      （`DATA_DIR/graph_checkpoints.sqlite3`，Postgres 后端共用同一文件；测试用 memory 后端）。
+      轨迹：QA/Agent 落 `traces` 表（`nodes[]` = 图节点行），`GET …/trace` 自包含回放；
+      摄取的任务进度沿用 `tasks.progress`（前端轮询口径不变）。
+      流式：`/v1/answer` 与 `/v1/agent/run` 支持 SSE（node / token / final / error / interrupt），
+      **`final` 事件与非流式响应体逐字段相同**；帧格式与前端既有解析器同构。
+      前端：步骤链实时渲染、轨迹回放、预算提示、HITL 审批卡片。
+- [x] 成本控制（2026-10-16）：`app/graphs/budget.py` 两层执法 —— 进图前预检（估算超标连模型都不调）
+      + 每次模型调用后真实记账；步数 / token / 单请求成本三道上限，超限 422 `budget_exceeded`，
+      `detail.budget.exceeded` 指明超的是哪一道（流式场景为带内 error 事件）。
 
-**验收**：同一问题可回放整条轨迹；超预算请求被拒绝且说明原因。
+**验收**（2026-10-16 实测）：
+
+| 验收项 | 目标 | 实测 | 出处 |
+| --- | --- | --- | --- |
+| 同一问题可回放整条轨迹 | 逐节点可复现 | `GET /v1/answer/{id}/trace` 与 `/v1/agent/{run_id}/trace` 返回图节点行（非拒答路径：retrieve→gate→generate→verify）| `tests/test_qa_graph.py`、`tests/test_agent_api.py` |
+| 中断可跨进程恢复 | 换引擎实例仍能续跑 | 同一个 SQLite 检查点文件、两个引擎实例：读到挂起的 `interrupt` 并续跑成功 | `tests/test_checkpoint.py`、`tests/test_agent_graph.py::test_hitl_interrupt_and_resume_across_engines` |
+| 超预算被拒绝且说明原因 | 拒绝 + 原因 | 预检/记账两条路径都返回 422，`detail.budget.exceeded ∈ {tokens, steps, cost_usd}` | `tests/test_budget.py` |
+| 摄取断点续跑 + 失败隔离 | 跳过已完成、坏文档不中断 | 4 篇文档：2 篇来自断点被跳过、1 篇成功、1 篇进 `failed[]`，任务 succeeded 且 0 次重复向量化 | `tests/test_ingest_graph.py` |
+| 契约不变 | 默认响应体逐字段一致 | 未改动的 `tests/test_api_contract.py` 全绿；SSE 的 `final` 键集合 == 非流式响应键集合 | `tests/test_sse_stream.py` |
+
+**M3 决策记录（取舍要能讲）**：
+
+- **检查点用官方 saver 而不是自研**：检查点语义（pending writes / checkpoint_ns / 恢复点选择）直接决定
+  `interrupt` 能不能续跑，自研的坑远多于收益；代价是 SQLite 文件与业务库分离（单副本部署可接受，
+  多副本部署时再换 Postgres saver）。
+- **改写默认关**：M2 已验证术语化改写对口语化提问有效（s 组 recall@3 0.2857 → 0.50），但
+  浏览器 Lite 模式的普通 RAG 分支不改写 —— 默认开启会让双端口径分叉。按请求 `rewrite: true` 或
+  前端设置面板开启，实际生效情况冻结进 `evidence_snapshot.rewrite`。
+- **MCP 客户端手写（stdlib JSON-RPC）而不是引官方 SDK**：需要的只有三条报文（initialize /
+  tools/list / tools/call），stdio 传输就是换行分隔的 JSON-RPC；手写的另一面是安全属性全部收口在
+  客户端一层（allowlist 默认拒绝、每次调用独立超时）。测试用 Python 假 server（CI 不依赖 Node），
+  另有一条用例挂仓库里真实的 TS MCP server。
+- **摄取不扇出**：见上（顺序 + 确定性断点）。
+
+**已知短板（如实记录）**：planner 依赖模型的指令跟随能力（严格 JSON 输出），本地 0.5B 会频繁
+解析失败并退化为"直接回答"（不报错，但拿不到工具收益）—— 与 M2 的引用角标问题是同一类
+"弱模型短板"，换成 3B+ 后可用同一套轨迹证据验证；`graph_checkpoints.sqlite3` 的清理策略未做（M6）。
 
 ---
 
@@ -257,15 +306,25 @@ State 必须包含：`question / rewritten_query / evidence[] / citations[] / ve
 
 ## M5 · 对外能力面（约 3 周）[对外]
 
-- [ ] **MCP Server**（复用已有 `apps/web/scripts/mcp/`）：`kb.list_docs` / `kb.search` / `kb.get_chunk` / `kb.answer`，
+- [x] **MCP Server**（复用已有 `apps/web/scripts/mcp/`）：`kb.list_docs` / `kb.search` / `kb.get_chunk` / `kb.answer`，
       stdio + HTTP；**权限在检索层生效**
-- [ ] **MCP Client**：挂载外部工具，allowlist + 每个调用进审计日志
-- [ ] **Skills 注册表**：manifest（参数 schema / 权限 / 超时 / 成本预估）+ 最小沙箱
+- [x] **MCP Client**：挂载外部工具，allowlist + 每个调用进审计日志
+- [x] **Skills 注册表**：manifest（参数 schema / 权限 / 超时 / 成本预估）+ 最小沙箱
       —— 可借鉴 Agent 生态的 `SKILL.md` frontmatter 规范，迁移成本低
-- [ ] **工具调用安全**：间接提示注入防护（工具返回内容里的指令不得当作用户意图）← AI 特有难点，替代 v1 的"提权/越权测试"
-- [ ] air-gapped 部署包：本地模型 + 镜像离线包 + 一键 compose
+- [x] **工具调用安全**：间接提示注入防护（工具返回内容里的指令不得当作用户意图）← AI 特有难点，替代 v1 的"提权/越权测试"
+- [x] air-gapped 部署包：本地模型 + 镜像离线包 + 一键 compose
 
 **验收**：Claude Desktop/Cursor 能通过 MCP 查到知识库并拿到引用；离线环境可完整部署；注入用例全部被拦。
+
+**M5 落地记录（2026-10-17）**：
+
+| 项 | 实现 | 证据 |
+| --- | --- | --- |
+| MCP Server | stdio + Streamable HTTP；`kb.*` 规范名 + 旧名兼容；ACL 旁路文件（token → 身份 / 文档 → 租户·部门·密级），在 BM25/向量打分前过滤 | `apps/web/scripts/mcp/server.http.test.ts`（401/403、session、ACL 检索）、`knowledgeBase.test.ts`（隐藏文档与不存在同形） |
+| MCP Client | 手写 stdio JSON-RPC；allowlist 默认拒绝；JSONL 审计（参数脱敏、结果只记指纹、run_id 上下文） | `apps/api/tests/test_mcp_client.py`（含挂真实 TS server 的互操作用例） |
+| Skills | `SKILL.md` frontmatter（JSON Schema / 权限 / 超时 / 成本 / 审批）+ `-I -S` 子进程沙箱（网络/子进程/越界文件拦截、超时强杀、输出上限） | `apps/api/tests/test_skills.py`、`GET /v1/skills` |
+| 注入防护 | 中英文指令覆盖/角色劫持/工具诱导/外泄/分隔符伪造/编码载荷识别；脱敏后再进模型；planner 观察用 run 级 nonce 标签包裹；命中进 `injection_findings` | `apps/api/tests/test_injection.py`（原始指令不出现在 planner prompt） |
+| 离线包 | api/web/mcp/postgres 镜像 + 模型 + 评测资产；`internal` 网络；构建/安装/自检脚本 | `infra/airgap/`（本机无 Docker，脚本与 compose 只做静态校验） |
 
 ---
 

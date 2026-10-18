@@ -30,7 +30,8 @@
     "gen:verdict-scores": "tsx scripts/gen-verdict-scores.ts",
     "eval:answers": "tsx scripts/eval-answers.ts",
     "eval:all": "npm run eval && npm run eval:verify -- --check && npm run eval:verdict -- --check && npm run eval:consistency -- --check && npm run eval:answers",
-    "mcp": "tsx scripts/mcp/server.ts"
+    "mcp": "tsx scripts/mcp/server.ts",
+    "mcp:http": "tsx scripts/mcp/server.ts --http-port 7331"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

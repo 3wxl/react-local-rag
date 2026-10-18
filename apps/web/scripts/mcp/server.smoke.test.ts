@@ -134,13 +134,21 @@ describe("MCP server stdio 冒烟", () => {
       const names = (
         (list.result as { tools?: { name: string }[] })?.tools ?? []
       ).map((t) => t.name);
-      expect(names.sort()).toEqual(["doc_outline", "read_chunks", "search_docs"]);
+      expect(names.sort()).toEqual([
+        "doc_outline",
+        "kb.answer",
+        "kb.get_chunk",
+        "kb.list_docs",
+        "kb.search",
+        "read_chunks",
+        "search_docs",
+      ]);
 
       send({
         jsonrpc: "2.0",
         id: 3,
         method: "tools/call",
-        params: { name: "search_docs", arguments: { query: "标准版售价" } },
+        params: { name: "kb.search", arguments: { query: "标准版售价" } },
       });
       const call = await waitFor(3);
       const content = (call.result as { content?: { text?: string }[] })?.content;

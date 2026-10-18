@@ -6,7 +6,7 @@
 
 from fastapi import APIRouter
 
-from .routes import answer, documents, eval as eval_routes, health, retrieve
+from .routes import agent, answer, documents, eval as eval_routes, health, retrieve, skills
 
 api_router = APIRouter()
 
@@ -22,4 +22,6 @@ v1_router.include_router(health.router, tags=["health"])
 v1_router.include_router(retrieve.router, tags=["retrieve"])
 v1_router.include_router(answer.router, tags=["answer"])
 v1_router.include_router(documents.router, tags=["documents"])
+v1_router.include_router(agent.router, tags=["agent"])
+v1_router.include_router(skills.router, tags=["skills"])
 v1_router.include_router(eval_routes.router, tags=["eval"])

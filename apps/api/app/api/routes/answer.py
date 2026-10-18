@@ -1,5 +1,12 @@
 """POST /v1/answer 与 GET /v1/answer/{answer_id}/trace（契约 §2、§3）。
 
+`stream=true` 走 SSE（M3）：事件表与错误语义见 docs/api-contract.md §2。
+要点是三条：
+1. **预检类错误在流开始前**（版本未就绪、预算超标）→ 仍是真 HTTP 状态码；
+   流开始之后的错误一律带内 `error` 事件（HTTP 头已经发出去了）；
+2. `final` 事件的数据与 `stream=false` 的响应体**逐字段相同**（同一个对象）；
+3. 帧格式与前端既有解析器同构（见 app/api/sse.py）。
+
 不变量（tests/test_api_contract.py 逐条断言）：
 1. 答案里的角标 [n] 必在 citations[].index 中
 2. verdict == "refused" ⟺ citations 为空且 refusal 非空
@@ -9,9 +16,13 @@
 
 from __future__ import annotations
 
+from typing import AsyncIterator
+
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 
 from ...generation.base import ModelUnavailableError
+from ...graphs.budget import BudgetExceeded
 from ...parity.retrieval import DEFAULT_RETRIEVAL_OPTIONS
 from ...services.reindex_service import select_index_version
 from ...store import Filters
@@ -19,7 +30,8 @@ from ..deps import AppContext, get_ctx
 from ..identity import Identity, get_identity
 from ..errors import ApiError
 from ..schemas import AnswerRequest
-from ..serializers import context_to_dict, verification_to_dict
+from ..serializers import context_to_dict
+from ..sse import DONE_FRAME, sse_frame
 
 router = APIRouter()
 
@@ -29,13 +41,7 @@ async def answer(
     body: AnswerRequest,
     ctx: AppContext = Depends(get_ctx),
     identity: Identity = Depends(get_identity),
-) -> dict:
-    if body.stream:
-        # 契约里 stream 是 M3 的能力：现在就明确报不支持，避免前端以为拿到了流
-        raise ApiError(
-            "invalid_request", "stream=true 尚未实现（M3 提供 SSE 流式）"
-        )
-
+):
     # 灰度版本选择：按 question 哈希确定性分桶（同一问题永远走同一版本）
     active = select_index_version(await ctx.store.list_ready_versions(), body.question)
     if active is None:
@@ -49,15 +55,37 @@ async def answer(
         departments=(identity.department,) if identity.department else (),
         max_classification=identity.clearance,
     )
+    top_k = body.top_k or DEFAULT_RETRIEVAL_OPTIONS.top_k
+
+    if body.stream:
+        # 预检放在建流之前：超预算时返回真 422（而不是"先 200 再在流里报错"）
+        try:
+            ctx.answer.preflight(body.question, top_k=top_k)
+        except BudgetExceeded as err:
+            raise ApiError("budget_exceeded", str(err), err.detail) from err
+        return StreamingResponse(
+            _sse(ctx, body, version=active.version, top_k=top_k, filters=filters),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # 反向代理别缓冲：否则流式会退化成"攒完一起发"
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
         outcome = await ctx.answer.answer(
             body.question,
             version=active.version,
-            top_k=body.top_k or DEFAULT_RETRIEVAL_OPTIONS.top_k,
+            top_k=top_k,
             filters=filters,
+            rewrite=body.rewrite,
         )
     except ModelUnavailableError as err:
         raise ApiError("model_unavailable", str(err)) from err
+    except BudgetExceeded as err:
+        # 超预算是一等拒绝（契约 §0.5：422 budget_exceeded），detail 说明超的是哪道上限
+        raise ApiError("budget_exceeded", str(err), err.detail) from err
 
     return {
         "answer_id": outcome.answer_id,
@@ -67,10 +95,31 @@ async def answer(
         "verdict": outcome.verdict,
         "citations": [context_to_dict(c) for c in outcome.citations],
         "refusal": outcome.refusal,
-        "verification": verification_to_dict(outcome.verification),
+        # M3 起由 QA 图的 verify 节点序列化（同一 serializer 的产物，线上字节不变）
+        "verification": outcome.verification,
         "evidence_snapshot": outcome.evidence_snapshot,
         "cost": outcome.cost,
     }
+
+
+async def _sse(
+    ctx: AppContext,
+    body: AnswerRequest,
+    *,
+    version: str,
+    top_k: int,
+    filters: Filters,
+) -> AsyncIterator[str]:
+    """图事件 → SSE 帧（逻辑全在服务层，路由只做格式转换）。"""
+    async for payload in ctx.answer.answer_stream(
+        body.question,
+        version=version,
+        top_k=top_k,
+        filters=filters,
+        rewrite=body.rewrite,
+    ):
+        yield sse_frame(payload["event"], payload["data"])
+    yield DONE_FRAME
 
 
 @router.get("/answer/{answer_id}/trace")

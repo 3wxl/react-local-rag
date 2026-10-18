@@ -164,11 +164,17 @@ def test_invalid_request_is_400(client: TestClient) -> None:
     assert response.status_code in (400, 422)
 
 
-def test_stream_not_silently_ignored(client: TestClient) -> None:
-    response = client.post(
-        "/v1/answer", json={"question": "年假制度是怎么规定的？", "stream": True}
-    )
-    assert response.status_code == 400, "stream=true 必须明确报不支持"
+def test_stream_is_event_stream(client: TestClient) -> None:
+    """M3 起 stream=true 返回 SSE（事件顺序与 final 等价性由 tests/test_sse_stream.py 钉住）。"""
+    with client.stream(
+        "POST", "/v1/answer", json={"question": "年假制度是怎么规定的？", "stream": True}
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = "".join(response.iter_text())
+    assert "event: node" in body
+    assert "event: final" in body
+    assert body.rstrip().endswith("data: [DONE]")
 
 
 def test_eval_run_lifecycle(client: TestClient) -> None:

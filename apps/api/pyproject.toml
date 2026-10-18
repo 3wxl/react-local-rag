@@ -17,13 +17,16 @@ dependencies = [
     # 文档解析（PDF 用 pypdfium2 而非 PyMuPDF：BSD/Apache 许可，避免 AGPL）
     "pypdfium2>=4.30",
     "python-docx>=1.1",
+    # 编排（M3 起为主路径，不再是可选 extra）：三张图 + 检查点持久化。
+    # 钉到锁文件已有版本，避免解析漂移；升级走单独 PR 并跑全量测试。
+    "langgraph==1.2.14",
+    # 检查点落 SQLite（AsyncSqliteSaver）：与 Postgres 存储后端共用，见 app/graphs/checkpointer.py
+    "langgraph-checkpoint-sqlite>=2.0",
 ]
 
 [project.optional-dependencies]
 # Postgres + pgvector 生产路径（默认走本地 SQLite，见 app/store）
 pg = ["asyncpg>=0.29", "pgvector>=0.3"]
-# M3 起用：LangGraph 编排（M1 不装，保持安装轻量）
-agent = ["langgraph>=0.2"]
 
 [dependency-groups]
 dev = [

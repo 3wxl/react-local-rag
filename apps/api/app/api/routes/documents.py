@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel, Field
 
+from ...graphs.ingest_graph import invoke_ingest, upload_seed
 from ...services.ingest_service import MAX_FILE_MB
 from ...store import TaskRecord
 from ..deps import AppContext, get_ctx
@@ -76,25 +77,39 @@ async def upload_document(
         await ctx.store.update_task(task_id, status="running")
         try:
             # 归属由**身份**决定，不由请求方声明（否则等于让调用方自己发权限）
-            result = await ctx.ingest.ingest_path(
-                target,
-                doc_name=file.filename,
-                tenant_id=identity.tenant_id,
-                department=identity.department,
-                classification=identity.clearance if identity.department else 0,
+            final = await invoke_ingest(
+                ctx.ingest_graph,
+                upload_seed(
+                    task_id=task_id,
+                    path=str(target),
+                    doc_name=file.filename or "",
+                    acl={
+                        "tenant_id": identity.tenant_id,
+                        "department": identity.department,
+                        "classification": identity.clearance if identity.department else 0,
+                    },
+                ),
+                thread_id=task_id,
+                doc_count=1,
+                settings=ctx.settings,
             )
+            failed = final.get("failed") or []
+            if failed:
+                # 单文档失败（图把失败隔离进了 failed[]）：任务状态如实置 failed
+                raise RuntimeError(str(failed[0].get("error", "摄取失败")))
+            result = (final.get("results") or [{}])[0]
             await ctx.store.update_task(
                 task_id,
                 status="succeeded",
                 progress={
-                    "doc_id": result.doc_id,
-                    "doc_name": result.doc_name,
-                    "chunks": result.chunk_count,
-                    "deduped": result.deduped,
-                    "index_version": result.index_version,
-                    "latency_ms": result.latency_ms,
+                    "doc_id": result.get("doc_id"),
+                    "doc_name": result.get("doc_name"),
+                    "chunks": result.get("chunk_count"),
+                    "deduped": result.get("deduped"),
+                    "index_version": result.get("index_version"),
+                    "latency_ms": result.get("latency_ms"),
                 },
-                checkpoint={"done": [result.doc_id]},
+                checkpoint={"done": [result.get("doc_id")]},
             )
         except Exception as err:  # noqa: BLE001 —— 失败要落到任务状态里，前端才看得到原因
             await ctx.store.update_task(task_id, status="failed", error=str(err))

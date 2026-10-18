@@ -61,9 +61,16 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { useAgentSettings } from "./agent/useAgentSettings";
 import {
   ServerError,
-  askServer,
+  askServerStream,
+  getAgentTrace,
+  getAnswerTrace,
+  mapTraceNodesToAgentSteps,
+  resumeAgentStream,
+  runAgentStream,
   uploadDocument,
   waitForTask,
+  type ServerStreamHandlers,
+  type TraceNode,
 } from "./server/client";
 import { WarningIcon } from "./components/icons";
 
@@ -500,43 +507,123 @@ function App() {
       const historyTurns = buildPromptHistory(prevMessages, prevMarker);
 
       // ── 服务器模式（apps/api）──
-      // 检索 / 生成 / 逐句校验都在服务端完成，这里只负责把结果映射成
-      // 与本地模式同一批类型（ContextRef / VerificationResult），UI 一行都不用改。
+      // 检索 / 生成 / 逐句校验都在服务端完成（M3 起走 LangGraph + SSE），这里只负责把
+      // 事件映射成与本地模式同一批类型（ContextRef / VerificationResult / AgentStep），
+      // UI 一行都不用改。M3 新增：步骤链实时渲染、轨迹回放、预算拒绝提示、HITL 审批。
       if (agentSettings.agentMode === "server-rag") {
-        patchMessage(convId, assistantMsg.id, { status: "retrieving" });
-        let result;
+        const liveSteps: AgentStep[] = [];
+        const onNode = (node: TraceNode) => {
+          // 步骤链实时追加（轨迹回放时用服务端返回的完整 nodes 覆盖）
+          liveSteps.push(mapTraceNodesToAgentSteps([node])[0]);
+          patchMessage(convId, assistantMsg.id, {
+            status:
+              node.name === "generate" || node.name === "synthesize"
+                ? "generating"
+                : node.name === "verify"
+                  ? "verifying"
+                  : "retrieving",
+            agentSteps: [...liveSteps],
+          });
+        };
+        const onToken = (delta: string) => {
+          patchMessage(convId, assistantMsg.id, { status: "generating" });
+          appendToMessage(convId, assistantMsg.id, "content", delta);
+        };
+        const streamHandlers: ServerStreamHandlers = {
+          onNode,
+          onToken,
+          rewrite: agentSettings.enableServerRewrite,
+        };
+
         try {
+          if (agentSettings.enableServerAgent) {
+            // 服务端 Agent（/v1/agent/run）：工具循环 + 可能挂起等人工审批
+            const tAgent = startTimer("agent-iterate");
+            const run = await runAgentStream(
+              agentSettings.serverBaseUrl,
+              text,
+              topK,
+              {
+                ...streamHandlers,
+                onInterrupt: (pending) => {
+                  patchMessage(convId, assistantMsg.id, {
+                    status: "awaiting-approval",
+                    hitl: {
+                      runId: pending.run_id ?? "",
+                      tool: pending.tool,
+                      argsPreview: pending.args_preview,
+                      reason: pending.reason,
+                    },
+                  });
+                },
+              },
+            );
+            tAgent.done({ steps: run.steps, tools: run.toolCalls.length });
+            if (run.status === "interrupted") {
+              // 挂起：等用户在卡片上批准/驳回（见 handleHitlDecision）
+              patchMessage(convId, assistantMsg.id, {
+                status: "awaiting-approval",
+                traceId: run.runId,
+              });
+              return;
+            }
+            patchMessage(convId, assistantMsg.id, {
+              status: "done",
+              content: run.answer,
+              context: run.contexts.map((c) => c.content).join("\n\n"),
+              contexts: run.contexts,
+              verification: run.verification ?? undefined,
+              traceId: run.runId,
+              cost: run.cost,
+              answerSource: "server-rag",
+              agentSteps: mapTraceNodesToAgentSteps(run.traceNodes),
+            });
+            return;
+          }
+
+          patchMessage(convId, assistantMsg.id, { status: "retrieving" });
           const tSearch = startTimer("search");
-          result = await askServer(agentSettings.serverBaseUrl, text, topK);
+          const result = await askServerStream(
+            agentSettings.serverBaseUrl,
+            text,
+            topK,
+            streamHandlers,
+          );
           tSearch.done({
             topK,
             hitCount: result.contexts.length,
             mode: "server",
           });
+          patchMessage(convId, assistantMsg.id, {
+            status: "done",
+            // final.answer 为准（token 流是未去思考标签的原始文本）
+            content: result.answer,
+            context: result.contexts.map((c) => c.content).join("\n\n"),
+            contexts: result.contexts,
+            verification: result.verification,
+            traceId: result.answerId,
+            cost: result.cost,
+          });
+          return;
         } catch (err) {
           // 服务端错误码 → 可执行提示（而不是把 500 甩给用户）
           const code = err instanceof ServerError ? err.code : "";
+          const detail = err instanceof Error ? err.message : String(err);
           const hint =
             code === "index_not_ready"
               ? "服务端还没有任何文档：切到服务器模式后先上传文档，或在服务端执行摄取。"
               : code === "model_unavailable"
                 ? "服务端未就绪（模型不可用）：检查 apps/api 的模型路径或改用 Ollama/假模型通道。"
-                : "";
-          const detail = err instanceof Error ? err.message : String(err);
+                : code === "budget_exceeded"
+                  ? "本请求超出服务端预算被拒绝：可调低 Top-K，或在服务端调大 REQUEST_TOKEN_BUDGET / REQUEST_COST_LIMIT_USD。"
+                  : "";
           patchMessage(convId, assistantMsg.id, {
             status: "error",
+            errorCode: code || undefined,
             error: hint ? `${detail} ${hint}` : detail,
           });
           return;
         }
-        patchMessage(convId, assistantMsg.id, {
-          status: "done",
-          content: result.answer,
-          context: result.contexts.map((c) => c.content).join("\n\n"),
-          contexts: result.contexts,
-          verification: result.verification,
-        });
-        return;
       }
 
       // ── Agent 模式分支 ──
@@ -1090,6 +1177,113 @@ function App() {
     createConversation,
   ]);
 
+  /* ---------- 服务端 Agent：HITL 审批 ---------- */
+  /**
+   * 人工审批（批准/驳回）后继续同一 run：走 `/v1/agent/{id}/resume` 的流式续跑，
+   * 事件处理与首次运行完全一致（node/token/interrupt/final）。
+   */
+  const handleHitlDecision = useCallback(
+    async (messageId: string, approved: boolean) => {
+      const convId = activeId;
+      if (!convId) return;
+      const message = conversationsRef.current
+        .find((c) => c.id === convId)
+        ?.messages.find((m) => m.id === messageId);
+      const hitl = message?.hitl;
+      if (!hitl?.runId) return;
+
+      setBusy(true);
+      patchMessage(convId, messageId, {
+        status: "generating",
+        hitl: undefined,
+        content: "",
+      });
+      const steps: AgentStep[] = [];
+      try {
+        const run = await resumeAgentStream(
+          agentSettings.serverBaseUrl,
+          hitl.runId,
+          approved,
+          {
+            onNode: (node) => {
+              steps.push(mapTraceNodesToAgentSteps([node])[0]);
+              patchMessage(convId, messageId, { agentSteps: [...steps] });
+            },
+            onToken: (delta) =>
+              appendToMessage(convId, messageId, "content", delta),
+            onInterrupt: (pending) => {
+              patchMessage(convId, messageId, {
+                status: "awaiting-approval",
+                hitl: {
+                  runId: pending.run_id ?? hitl.runId,
+                  tool: pending.tool,
+                  argsPreview: pending.args_preview,
+                  reason: pending.reason,
+                },
+              });
+            },
+          },
+        );
+        if (run.status === "interrupted") return; // 又一轮审批：卡片已由 onInterrupt 挂上
+        patchMessage(convId, messageId, {
+          status: "done",
+          content: run.answer,
+          context: run.contexts.map((c) => c.content).join("\n\n"),
+          contexts: run.contexts,
+          verification: run.verification ?? undefined,
+          traceId: run.runId,
+          cost: run.cost,
+          agentSteps: mapTraceNodesToAgentSteps(run.traceNodes),
+        });
+      } catch (err) {
+        const code = err instanceof ServerError ? err.code : "";
+        patchMessage(convId, messageId, {
+          status: "error",
+          errorCode: code || undefined,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      activeId,
+      agentSettings.serverBaseUrl,
+      appendToMessage,
+      patchMessage,
+    ],
+  );
+
+  /* ---------- 轨迹回放（M3） ---------- */
+  /**
+   * 按 traceId 拉取完整节点轨迹并渲染成步骤链（懒加载：点"查看轨迹"才请求）。
+   * traceId 前缀区分两类 run（契约里 ans_* 是问答、run_* 是 Agent run）。
+   */
+  const handleLoadTrace = useCallback(
+    async (messageId: string) => {
+      const convId = activeId;
+      if (!convId) return;
+      const message = conversationsRef.current
+        .find((c) => c.id === convId)
+        ?.messages.find((m) => m.id === messageId);
+      const traceId = message?.traceId;
+      if (!traceId) return;
+      try {
+        const trace = traceId.startsWith("run_")
+          ? await getAgentTrace(agentSettings.serverBaseUrl, traceId)
+          : await getAnswerTrace(agentSettings.serverBaseUrl, traceId);
+        patchMessage(convId, messageId, {
+          agentSteps: mapTraceNodesToAgentSteps(trace.nodes),
+          traceLoaded: true,
+        });
+      } catch (err) {
+        // 轨迹拉取失败不该把整条回答标成失败：只记日志（回答本身仍有效）
+        console.error("轨迹加载失败", err);
+      }
+    },
+    [activeId, agentSettings.serverBaseUrl, patchMessage],
+  );
+
   /* ---------- 停止生成 ---------- */
   const handleStop = useCallback(() => {
     currentHandleRef.current?.cancel();
@@ -1202,6 +1396,8 @@ function App() {
             busy={busy}
             loadProgress={loadProgress}
             onDropFile={handleDropFile}
+            onHitlDecision={handleHitlDecision}
+            onLoadTrace={handleLoadTrace}
           />
         )}
 
